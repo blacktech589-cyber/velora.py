@@ -85,9 +85,10 @@ def get_model():
     if os.path.exists(MODEL_FILE):
         try: return joblib.load(MODEL_FILE)
         except: pass
-    return MLPClassifier(hidden_layer_sizes=(500, 250, 125), max_iter=1000)
+    return MLPClassifier(hidden_layer_sizes=(500, 250, 125), max_iter=1000, warm_start=True)
 
 model = get_model()
+model_initialized = False
 
 # --- ANALİZ VE STRATEJİ ÖĞRENME MOTORU ---
 def analyze(asset):
@@ -105,7 +106,7 @@ def analyze(asset):
     features = np.array([[df['rsi'].iloc[-1]/100, 0.5, 0.5]])
 
     # Modelin öğrenmiş olduğu "kendi stratejisi"
-    prob = int(model.predict_proba(features).max() * 100) if hasattr(model, "coefs_") else 50
+    prob = int(model.predict_proba(features).max() * 100) if hasattr(model, "coefs_") and model.coefs_ else 50
 
     # Hem senin kuralın hem de modelin yüksek olasılık onayı
     if up and prob >= 70: return asset, "BUY", prob, df['rsi'].iloc[-1]
@@ -132,19 +133,30 @@ if st.session_state.running:
         results = [{'Asset': r[0], 'Signal': r[1], 'Prob': r[2], 'RSI': round(r[3], 1)} for r in raw_res]
 
         # MODELİN KENDİ KENDİNE ÖĞRENMESİ (Reinforcement Learning)
-        X_train = np.array([[r['RSI']/100, 0.5, 0.5] for r in results])
-        y_train = np.array([1 if r['Signal'] == 'BUY' else (0 if r['Signal'] == 'SELL' else 0) for r in results])
-
-        if not hasattr(model, "classes_"): model.fit(X_train, y_train)
-        else: model.partial_fit(X_train, y_train, classes=np.array([0, 1]))
-        joblib.dump(model, MODEL_FILE)
-
-        # CSV'YE KAYIT
         df_active = pd.DataFrame(results)[pd.DataFrame(results)['Signal'] != 'WAIT'].copy()
+        
         if not df_active.empty:
-            df_active['Timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            X_train = np.array([[r['RSI']/100, 0.5, 0.5] for _, r in df_active.iterrows()]])
+            y_train = np.array([1 if r['Signal'] == 'BUY' else 0 for _, r in df_active.iterrows()])
+            
+            global model_initialized
+            
+            # İlk fit işlemi
+            if not model_initialized:
+                model.fit(X_train, y_train)
+                model_initialized = True
+            else:
+                # Eğer en az 2 sınıf varsa partial_fit yap
+                if len(np.unique(y_train)) > 1:
+                    model.partial_fit(X_train, y_train, classes=np.array([0, 1]))
+                else:
+                    # Tek sınıf varsa uyarla
+                    st.warning(f"⚠️ Tek sınıf ({y_train[0]}) ile öğrenme. Çeşitli sinyaller bekleniyor...")
+            
+            joblib.dump(model, MODEL_FILE)
             
             # CSV'ye ekle
+            df_active['Timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             df_active.to_csv(CSV_FILE, mode='a', index=False, header=not os.path.exists(CSV_FILE))
             
             # EXCEL'E KAYIT
@@ -160,12 +172,14 @@ if st.session_state.running:
             with col1:
                 if os.path.exists(CSV_FILE):
                     with open(CSV_FILE, 'rb') as f:
-                        st.download_button("📥 CSV İndir", f, EXCEL_FILE, "text/csv")
+                        st.download_button("📥 CSV İndir", f, CSV_FILE, "text/csv")
             
             with col2:
                 if os.path.exists(EXCEL_FILE):
                     with open(EXCEL_FILE, 'rb') as f:
                         st.download_button("📊 Excel İndir", f, EXCEL_FILE, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        else:
+            st.info("⏳ Bu turda WAIT sinyali alındı. Bekle...")
 
         time.sleep(2)
         st.rerun()
