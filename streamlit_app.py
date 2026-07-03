@@ -126,10 +126,11 @@ def get_models():
             random_state=42
         ),
         'gb': GradientBoostingClassifier(
-            n_estimators=100,
+            n_estimators=50,
             max_depth=5,
             learning_rate=0.01,
-            random_state=42
+            random_state=42,
+            init='zero'
         )
     }
     return models
@@ -233,16 +234,6 @@ def analyze_volatility(prices):
         regime = "SIDEWAYS"
     
     return volatility, regime
-
-# --- KORELASYON ANALIZI (Zeka Level 2) ---
-def adaptive_learning_boost(signal_history):
-    """Başarılı sinyallerden öğren (Zeka Level 4)"""
-    if len(signal_history) < 5:
-        return 0
-    
-    # Son 5 sinyalden kaç tanesi başarılı?
-    success_rate = sum(signal_history[-5:]) / 5
-    return int(success_rate * 20)  # 0-20 boost
 
 # --- ENSEMBLE PREDICTION (Zeka Level 5) ---
 def ensemble_predict(X_scaled):
@@ -469,7 +460,7 @@ if st.session_state.running:
             st.session_state.piyasa_durumu = "⚪ NEUTRAL"
         
         if not df_active.empty:
-            # Model Eğitimi
+            # Model Eğitimi - FIX: GradientBoosting sınıf problemi çözüldü
             X_train_raw = np.array([
                 [r['RSI']/100, np.random.uniform(0.3, 0.7), np.random.uniform(-0.1, 0.1), 
                  np.random.uniform(0.2, 0.8), np.random.uniform(0, 1)] 
@@ -478,20 +469,30 @@ if st.session_state.running:
             X_train = scaler.fit_transform(X_train_raw)
             y_train = np.array([1 if r['Signal'] == 'BUY' else 0 for _, r in df_active.iterrows()])
             
-            # Ensemble Eğitimi
-            if not st.session_state.models_initialized:
-                models['mlp'].fit(X_train, y_train)
-                models['rf'].fit(X_train, y_train)
-                models['gb'].fit(X_train, y_train)
-                st.session_state.models_initialized = True
-            else:
-                if len(np.unique(y_train)) > 1:
-                    models['mlp'].partial_fit(X_train, y_train, classes=np.array([0, 1]))
-                    models['rf'].partial_fit(X_train, y_train, classes=np.array([0, 1]))
-                    models['gb'].fit(X_train, y_train)
-            
-            joblib.dump(models, ENSEMBLE_FILE)
-            joblib.dump(scaler, SCALER_FILE)
+            # Ensemble Eğitimi - GradientBoosting için tam fit kullan
+            try:
+                if not st.session_state.models_initialized:
+                    models['mlp'].fit(X_train, y_train)
+                    models['rf'].fit(X_train, y_train)
+                    # GradientBoosting: warm_start=False olduğu için fit ile başla
+                    if len(np.unique(y_train)) > 1:
+                        models['gb'].fit(X_train, y_train)
+                    st.session_state.models_initialized = True
+                else:
+                    if len(np.unique(y_train)) > 1:
+                        models['mlp'].partial_fit(X_train, y_train, classes=np.array([0, 1]))
+                        models['rf'].fit(X_train, y_train)  # RandomForest warm_start
+                        # GradientBoosting yeni fit (warm_start desteklemez)
+                        models['gb'] = GradientBoostingClassifier(
+                            n_estimators=50, max_depth=5, learning_rate=0.01, 
+                            random_state=42, init='zero'
+                        )
+                        models['gb'].fit(X_train, y_train)
+                
+                joblib.dump(models, ENSEMBLE_FILE)
+                joblib.dump(scaler, SCALER_FILE)
+            except Exception as e:
+                st.warning(f"⚠️ Model eğitimi başarısız: {str(e)}")
             
             # Sinyaller
             buy_signals = len(df_active[df_active['Signal'] == 'BUY'])
