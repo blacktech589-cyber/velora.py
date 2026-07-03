@@ -136,7 +136,7 @@ if st.session_state.running:
         df_active = pd.DataFrame(results)[pd.DataFrame(results)['Signal'] != 'WAIT'].copy()
         
         if not df_active.empty:
-            X_train = np.array([[r['RSI']/100, 0.5, 0.5] for _, r in df_active.iterrows()]])
+            X_train = np.array([[r['RSI']/100, 0.5, 0.5] for _, r in df_active.iterrows()])
             y_train = np.array([1 if r['Signal'] == 'BUY' else 0 for _, r in df_active.iterrows()])
             
             global model_initialized
