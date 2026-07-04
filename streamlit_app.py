@@ -537,7 +537,7 @@ class NewsAnalyzer:
                 "language": "en",
                 "sortBy": "publishedAt",
                 "pageSize": 10,
-                "apiKey": self.api_key
+                "apiKey": self.api_key,
             }
             r = requests.get(url, params=params, timeout=NEWS_TIMEOUT_SEC)
             if r.status_code != 200:
@@ -547,6 +547,38 @@ class NewsAnalyzer:
             return [f"{a.get('title','')} {a.get('description','')}" for a in arts]
         except Exception:
             return []
+
+
+# ==============================
+# PROTECTION ENGINE
+# ==============================
+class ProtectionEngine:
+    def __init__(self):
+        self.enabled = PROTECTION_MODE
+        self.min_conf = MIN_CONFIDENCE_TO_TRADE
+        self.high_vol_threshold = HIGH_VOL_THRESHOLD
+
+    def evaluate(self, signal, confidence, volatility=0.0, news_score=0.0):
+        conf = float(confidence)
+        conf = max(0.0, min(100.0, conf))
+
+        # High volatility penalty
+        if volatility is not None and volatility > self.high_vol_threshold:
+            conf -= 8
+
+        # News-direction penalty
+        if signal == "BUY" and news_score < -0.25:
+            conf -= 6
+        if signal == "SELL" and news_score > 0.25:
+            conf -= 6
+
+        conf = max(55.0, min(99.0, conf))
+
+        if self.enabled and conf < self.min_conf:
+            return "NO-TRADE", conf, "Protection filter"
+
+        return signal, conf, ""
+
 
 # ==============================
 # RSI REGIME ENSEMBLE (700F)
@@ -1015,29 +1047,48 @@ def load_model_bundle(model):
 st.set_page_config(layout="wide", page_title="Velora AI - RSI/EMA15 700F", initial_sidebar_state="expanded")
 st.title("🚀 VELORA AI - RSI/EMA15 700 Features")
 st.markdown("**Live market data | Binomo screen optional | 1m candles where available | protection mode | news-aware ensemble | 12-4 reversal confirmation**")
-st.caption(f"Protection Mode: {'ON' if PROTECTION_MODE else 'OFF'} | Min Conf: {MIN_CONFIDENCE_TO_TRADE} | Vol Limit: {HIGH_VOL_THRESHOLD} | Interval: {PRICE_INTERVAL} | Binomo Screen: {'ON' if USE_BINOMO_SCREEN else 'OFF'}")
+st.caption(
+    f"Protection Mode: {'ON' if PROTECTION_MODE else 'OFF'} | "
+    f"Min Conf: {MIN_CONFIDENCE_TO_TRADE} | Vol Limit: {HIGH_VOL_THRESHOLD} | "
+    f"Interval: {PRICE_INTERVAL} | Binomo Screen: {'ON' if USE_BINOMO_SCREEN else 'OFF'}"
+)
 st.markdown("---")
 
 if "model" not in st.session_state:
     st.session_state.model = RSIRegimeEnsemble()
+
+if "comparator" not in st.session_state:
     st.session_state.comparator = StrategyComparator()
+
 if "news_analyzer" not in st.session_state:
     st.session_state.news_analyzer = NewsAnalyzer(api_key=NEWS_API_KEY)
+
+# ProtectionEngine yoksa uygulama düşmesin
 if "protector" not in st.session_state:
-    st.session_state.protector = ProtectionEngine()
+    try:
+        st.session_state.protector = ProtectionEngine()
+    except NameError:
+        st.session_state.protector = None
+        st.warning("ProtectionEngine tanımlı değil. Protection devre dışı başlatıldı.")
 
 if "last_refresh" not in st.session_state:
     st.session_state.last_refresh = datetime.now() - timedelta(seconds=SCAN_INTERVAL_SEC)
+
 if "running" not in st.session_state:
     st.session_state.running = False
+
 if "total_signals" not in st.session_state:
     st.session_state.total_signals = {"BUY": 0, "SELL": 0, "NO-TRADE": 0}
+
 if "avg_confidence" not in st.session_state:
-    st.session_state.avg_confidence = 0
+    st.session_state.avg_confidence = 0.0
+
 if "total_rounds" not in st.session_state:
     st.session_state.total_rounds = 0
+
 if "prefetched_results" not in st.session_state:
     st.session_state.prefetched_results = None
+
 if "prefetch_time" not in st.session_state:
     st.session_state.prefetch_time = None
 
@@ -1047,8 +1098,7 @@ if not getattr(st.session_state.model, "trained", False):
             X_train, y_train = generate_training_data_rsi_enhanced(1400)
             st.session_state.model.train(X_train, y_train)
         except Exception as e:
-            st.error(f"Training error: {str(e)}")
-
+            st.error(f"Training error: {e}")
 m1, m2, m3, m4, m5, m6 = st.columns(6)
 with m1: st.metric("📊 Assets", len(ALL_ASSETS))
 with m2: st.metric("🟢 BUY", st.session_state.total_signals["BUY"])
