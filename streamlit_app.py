@@ -932,7 +932,7 @@ if st.session_state.running:
                             for model_name, model in self.models.items():
                                 futures.append()
                                     executor.submit(self._train_single_model, model_name, model, X, y)
-                                )
+                                }
                                 for future in as_completed(futures):
                                     try:
                                         result = future.result()
