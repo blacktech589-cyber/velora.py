@@ -916,7 +916,7 @@ with ThreadPoolExecutor(max_workers=8) as executor:
             asset,
             st.session_state.model,
             current_time,
-            if "comparator" not in st.session_state:
+            if ("comparator" not in st.session_state:
         st.session_state.comparator = None
         ): asset
         for asset in assets
