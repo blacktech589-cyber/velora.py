@@ -1,114 +1,142 @@
+# ==============================
+# SYSTEM & ERROR HANDLING
+# ==============================
+import sys
+import traceback
+import warnings
+warnings.filterwarnings("ignore")
+
+def log_exception(exc_type, exc_value, exc_traceback):
+    with open("hata_log.txt", "w", encoding="utf-8") as f:
+        traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
+
+sys.excepthook = log_exception
+
+# ==============================
+# CORE LIBRARIES
+# ==============================
 import streamlit as st
 import pandas as pd
 import numpy as np
+import time
+import os
+from datetime import datetime, timedelta
 
-from sklearn.model_selection import train_test_split
+# ==============================
+# SKLEARN IMPORTS
+# ==============================
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score
-from xgboost import XGBClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
 
-# -------------------------------------------------
-# Yardımcı fonksiyonlar
-# -------------------------------------------------
+# ==============================
+# SAFE XGBOOST IMPORT (CRITICAL)
+# ==============================
+XGB_AVAILABLE = False
+XGBClassifier = None
 
-def color_signal(val):
-    if val == "BUY":
-        return "background-color: #c6f6d5; color: black"
-    elif val == "SELL":
-        return "background-color: #fed7d7; color: black"
-    return ""
+try:
+    from xgboost import XGBClassifier
+    XGB_AVAILABLE = True
+except Exception:
+    XGB_AVAILABLE = False
 
-# -------------------------------------------------
-# Model Sınıfı (Streamlit Cloud uyumlu)
-# -------------------------------------------------
-
+# ==============================
+# MODEL CLASS
+# ==============================
 class UltraIntelligentEnsembleModel:
     def __init__(self):
-        self.models = {}
-        self._initialize_models()
+        self.model = None
+        self.scaler = StandardScaler()
+        self._initialize_model()
 
-    def _initialize_models(self):
-        # ⚠️ Streamlit Cloud uyumlu XGBoost
-        self.models["xgb"] = XGBClassifier(
-            n_estimators=300,
-            max_depth=6,
-            learning_rate=0.05,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            objective="binary:logistic",
-            random_state=42
-        )
+    def _initialize_model(self):
+        if XGB_AVAILABLE:
+            self.model = XGBClassifier(
+                n_estimators=200,
+                max_depth=6,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                objective="binary:logistic",
+                random_state=42,
+                n_jobs=-1
+            )
+        else:
+            self.model = RandomForestClassifier(
+                n_estimators=200,
+                max_depth=10,
+                random_state=42,
+                n_jobs=-1
+            )
 
     def train(self, X, y):
+        X_scaled = self.scaler.fit_transform(X)
+        self.model.fit(X_scaled, y)
+
+    def predict(self, X):
+        X_scaled = self.scaler.transform(X)
+        preds = self.model.predict(X_scaled)
+        return preds
+
+# ==============================
+# STREAMLIT UI
+# ==============================
+st.set_page_config(
+    page_title="Velora AI",
+    layout="wide"
+)
+
+st.title("🚀 Velora AI – Cloud Safe Trading Engine")
+
+st.markdown("""
+Bu uygulama **Streamlit Cloud uyumludur**.  
+XGBoost yoksa otomatik olarak **RandomForest** kullanır.
+""")
+
+# ==============================
+# SESSION STATE
+# ==============================
+if "model" not in st.session_state:
+    st.session_state.model = UltraIntelligentEnsembleModel()
+
+# ==============================
+# DATA INPUT
+# ==============================
+uploaded_file = st.file_uploader("📂 CSV veri yükle", type=["csv"])
+
+if uploaded_file:
+    df = pd.read_csv(uploaded_file)
+    st.dataframe(df.head())
+
+    if "target" not in df.columns:
+        st.error("❌ CSV dosyasında 'target' kolonu yok")
+    else:
+        X = df.drop(columns=["target"])
+        y = df["target"]
+
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.2, random_state=42
         )
 
-        model = self.models["xgb"]
-        model.fit(X_train, y_train)
+        if st.button("🤖 Modeli Eğit"):
+            with st.spinner("Model eğitiliyor..."):
+                st.session_state.model.train(X_train, y_train)
 
-        preds = model.predict(X_test)
-        return accuracy_score(y_test, preds)
+            preds = st.session_state.model.predict(X_test)
+            acc = accuracy_score(y_test, preds)
 
-    def predict(self, X):
-        model = self.models["xgb"]
-        preds = model.predict(X)
+            st.success(f"✅ Eğitim tamamlandı | Accuracy: {acc:.4f}")
 
-        return ["BUY" if p == 1 else "SELL" for p in preds]
+            signal = ["BUY" if p == 1 else "SELL" for p in preds[:10]]
+            st.write("📊 Örnek Sinyaller:", signal)
 
-# -------------------------------------------------
-# Streamlit App
-# -------------------------------------------------
-
-st.set_page_config(page_title="Velora AI", layout="wide")
-st.title("🚀 Velora AI – Streamlit Cloud Stable Build")
-
-# Session state model (HATA BURADA ÇÖZÜLDÜ)
-if "model" not in st.session_state:
-    st.session_state.model = UltraIntelligentEnsembleModel()
-
-# -------------------------------------------------
-# Örnek veri (senin gerçek verinle değiştirilebilir)
-# -------------------------------------------------
-
-np.random.seed(42)
-
-df = pd.DataFrame({
-    "feature_1": np.random.randn(50),
-    "feature_2": np.random.randn(50),
-    "target": np.random.randint(0, 2, 50)
-})
-
-X = df[["feature_1", "feature_2"]]
-y = df["target"]
-
-# -------------------------------------------------
-# Model eğitimi
-# -------------------------------------------------
-
-if st.button("Modeli Eğit"):
-    acc = st.session_state.model.train(X, y)
-    st.success(f"Model eğitildi ✅ | Accuracy: {acc:.2f}")
-
-# -------------------------------------------------
-# Tahmin ve tablo
-# -------------------------------------------------
-
-signals = st.session_state.model.predict(X)
-
-top_df = pd.DataFrame({
-    "Feature 1": df["feature_1"],
-    "Feature 2": df["feature_2"],
-    "Signal": signals
-})
-
-# ✅ Pandas 2.x FIX (applymap yerine map)
-styled_df = top_df.style.map(
-    color_signal,
-    subset=["Signal"]
-)
-
-st.subheader("📊 Sinyal Tablosu")
-st.dataframe(styled_df, use_container_width=True)
+# ==============================
+# FOOTER
+# ==============================
+st.markdown("---")
+st.caption("Velora AI • Streamlit Cloud Safe • 2026")
 # Data Generation
 from sklearn.datasets import make_classification
 
