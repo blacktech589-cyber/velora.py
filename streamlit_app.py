@@ -905,67 +905,74 @@ if st.session_state.running:
             results = []
             from concurrent.futures import ThreadPoolExecutor, as_completed
             futures = {
-                executor.submit(advanced_analyze, asset, st.session_state.model, current_time, st.session_state.comparator): asset
-                for asset in ALL_ASSETS
-            }
-            results = []
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = []
-                for model_name, model in self.models.items():
-                    futures.append(
-                        executor.submit(self._train_single_model, model_name, model, X, y)
-                    )
-                    for future in as_completed(futures):
-                        try:
-                            result = future.result()
-                            if result is not None:
-                                results.append(result)
-                        except Exception:
-                            pass
-            
-            if results:
-                df_results = pd.DataFrame(results)
-                
-                buy_count = len(df_results[df_results['Signal'] == 'BUY'])
-                sell_count = len(df_results[df_results['Signal'] == 'SELL'])
-                
-                st.session_state.total_signals['BUY'] += buy_count
-                st.session_state.total_signals['SELL'] += sell_count
-                st.session_state.avg_confidence = int(df_results['Confidence'].mean())
-                st.session_state.last_refresh = datetime.now()
-                
-                save_to_excel_advanced(results)
-                df_results.to_csv(CSV_FILE, mode='a', index=False, 
-                                  header=not os.path.exists(CSV_FILE), encoding='utf-8')
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.success(f"✅ {len(results)} Sinyal")
-                with col2:
-                    st.info(f"🟢 {buy_count} BUY")
-                with col3:
-                    st.warning(f"🔴 {sell_count} SELL")
-                
-                st.markdown("---")
-                st.subheader("🏆 En İyi Sinyaller (20 Model + 5 Strateji)")
-                
-                top_df = df_results.nlargest(25, 'Confidence')[[
-                    'Asset', 'Signal', 'Confidence', 'DL_Models', 'Strategy_Match', 
-                    'Trend', 'Momentum', 'Channel', 'Source'
-                ]].copy()
-                
-                def color_signal(val):
-                    if val == 'BUY':
-                        return 'background-color: #92D050; color: black; font-weight: bold'
-                    elif val == 'SELL':
-                        return 'background-color: #FF4444; color: white; font-weight: bold'
-                    return ''
-                
-                styled_df = top_df.style.applymap(color_signal, subset=['Signal'])
-                st.dataframe(styled_df, use_container_width=True, hide_index=True)
-                
-                st.markdown("---")
-                
-                # BUY
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+            results = {}
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = {
+                    executor.submit()
+                        advanced_analyze,
+                    asset,
+                    st.session_state.model,
+                    current_time,
+                    st.session_state.comparator
+                    ): asset
+                for asset in assets
+                }
+                for future in as_completed(futures):
+                    asset = futures[future]
+                    try:
+                        results[asset] = future.result()
+                    except Exception as e:
+                        results[asset] = None
+                        for asset in ALL_ASSETS
+                        }
+                        results = []
+                        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                            futures = []
+                            for model_name, model in self.models.items():
+                                futures.append()
+                                    executor.submit(self._train_single_model, model_name, model, X, y)
+                                )
+                                for future in as_completed(futures):
+                                    try:
+                                        result = future.result()
+                                        if result is not None:
+                                            results.append(result)
+                                    except Exception:
+                                        pass
+                                        if results:
+                                            df_results = pd.DataFrame(results)
+                                            buy_count = len(df_results[df_results['Signal'] == 'BUY'])
+                                            sell_count = len(df_results[df_results['Signal'] == 'SELL'])
+                                            st.session_state.total_signals['BUY'] += buy_count
+                                            st.session_state.total_signals['SELL'] += sell_count
+                                            st.session_state.avg_confidence = int(df_results['Confidence'].mean())
+                                            st.session_state.last_refresh = datetime.now()
+                                            save_to_excel_advanced(results)
+                                            df_results.to_csv(CSV_FILE, mode='a', index=False, 
+                                                              header=not os.path.exists(CSV_FILE), encoding='utf-8')
+                                            col1, col2, col3 = st.columns(3)
+                                            with col1:
+                                                st.success(f"✅ {len(results)} Sinyal")
+                                                with col2:
+                                                    st.info(f"🟢 {buy_count} BUY")
+                                                    with col3:
+                                                        st.warning(f"🔴 {sell_count} SELL")
+                                                        st.markdown("---")
+                                                        st.subheader("🏆 En İyi Sinyaller (20 Model + 5 Strateji)")
+                                                        top_df = df_results.nlargest(25, 'Confidence')[[
+                                                            'Asset', 'Signal', 'Confidence', 'DL_Models', 'Strategy_Match', 
+                                                            'Trend', 'Momentum', 'Channel', 'Source']].copy()
+                                                        def color_signal(val):
+                                                            if val == 'BUY':
+                                                                return 'background-color: #92D050; color: black; font-weight: bold'
+                                                            elif val == 'SELL':
+                                                                return 'background-color: #FF4444; color: white; font-weight: bold'
+                                                                return ''
+                                                                styled_df = top_df.style.applymap(color_signal, subset=['Signal'])
+                                                                st.dataframe(styled_df, use_container_width=True, hide_index=True)
+                                                                st.markdown("---")
+                                                                # BUY
                 buy_df = df_results[df_results['Signal'] == 'BUY'].sort_values('Confidence', ascending=False)
                 if not buy_df.empty:
                     st.subheader(f"🟢 BUY SİNYALLERİ ({len(buy_df)})")
@@ -973,18 +980,16 @@ if st.session_state.running:
                         col1, col2, col3, col4, col5 = st.columns(5)
                         with col1:
                             st.write(f"**{row['Asset']}**")
-                        with col2:
-                            st.metric("Güven", f"{row['Confidence']}%", label_visibility="collapsed")
-                        with col3:
-                            st.metric("DL-Models", f"{row['DL_Models']}", label_visibility="collapsed")
-                        with col4:
-                            st.metric("Strat.Uyum", f"{row['Strategy_Match']}/5", label_visibility="collapsed")
-                        with col5:
-                            st.write(f"<small>{row['Trend']} | {row['Momentum']}</small>", unsafe_allow_html=True)
-                
-                st.markdown("---")
-                
-                # SELL
+                            with col2:
+                                st.metric("Güven", f"{row['Confidence']}%", label_visibility="collapsed")
+                                with col3:
+                                    st.metric("DL-Models", f"{row['DL_Models']}", label_visibility="collapsed")
+                                    with col4:
+                                        st.metric("Strat.Uyum", f"{row['Strategy_Match']}/5", label_visibility="collapsed")
+                                        with col5:
+                                            st.write(f"<small>{row['Trend']} | {row['Momentum']}</small>", unsafe_allow_html=True)
+                                            st.markdown("---")
+                                            # SELL
                 sell_df = df_results[df_results['Signal'] == 'SELL'].sort_values('Confidence', ascending=False)
                 if not sell_df.empty:
                     st.subheader(f"🔴 SELL SİNYALLERİ ({len(sell_df)})")
@@ -992,35 +997,29 @@ if st.session_state.running:
                         col1, col2, col3, col4, col5 = st.columns(5)
                         with col1:
                             st.write(f"**{row['Asset']}**")
-                        with col2:
-                            st.metric("Güven", f"{row['Confidence']}%", label_visibility="collapsed")
-                        with col3:
-                            st.metric("DL-Models", f"{row['DL_Models']}", label_visibility="collapsed")
-                        with col4:
-                            st.metric("Strat.Uyum", f"{row['Strategy_Match']}/5", label_visibility="collapsed")
-                        with col5:
-                            st.write(f"<small>{row['Trend']} | {row['Momentum']}</small>", unsafe_allow_html=True)
-                
-                st.markdown("---")
-                st.success(f"⚡ Saniye Bazlı Tarama: {st.session_state.total_rounds} Tur Tamamlandı")
-        
-        time.sleep(0.5)
-        st.rerun()
-    else:
-        remaining = 1 - time_since_refresh
-        progress = time_since_refresh / 1
-        
-        st.progress(min(progress, 1.0))
-        st.info(f"⏱️ Sonraki tarama: {remaining:.1f} saniye içinde...")
-        
-        time.sleep(0.1)
-        st.rerun()
-
-else:
-    st.info("👇 **BAŞLAT** butonuna basarak Ultra-Zeki AI analizini başlatın")
-    
-    with st.expander("ℹ️ SISTEM ÖZELLİKLERİ", expanded=True):
-        st.markdown("")
+                            with col2:
+                                st.metric("Güven", f"{row['Confidence']}%", label_visibility="collapsed")
+                                with col3:
+                                    st.metric("DL-Models", f"{row['DL_Models']}", label_visibility="collapsed")
+                                    with col4:
+                                        st.metric("Strat.Uyum", f"{row['Strategy_Match']}/5", label_visibility="collapsed")
+                                        with col5:
+                                            st.write(f"<small>{row['Trend']} | {row['Momentum']}</small>", unsafe_allow_html=True)
+                                            st.markdown("---")
+                                            st.success(f"⚡ Saniye Bazlı Tarama: {st.session_state.total_rounds} Tur Tamamlandı")
+                                            time.sleep(0.5)
+                                            st.rerun()
+                else:
+                    remaining = 1 - time_since_refresh
+                    progress = time_since_refresh / 1
+                    st.progress(min(progress, 1.0))
+                    st.info(f"⏱️ Sonraki tarama: {remaining:.1f} saniye içinde...")
+                    time.sleep(0.1)
+                    st.rerun()
+                else:
+                    st.info("👇 **BAŞLAT** butonuna basarak Ultra-Zeki AI analizini başlatın")
+                    with st.expander("ℹ️ SISTEM ÖZELLİKLERİ", expanded=True):
+                        st.markdown("")
 
 
 
