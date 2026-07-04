@@ -15,6 +15,7 @@ from typing import List, Optional
 try:
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
@@ -23,10 +24,12 @@ except Exception:
     SELENIUM_AVAILABLE = False
 
 
-BINOMO_URL = os.getenv("BINOMO_URL", "")
+BINOMO_URL = os.getenv("BINOMO_URL", "https://binomo.com/trading")
 BINOMO_EMAIL = os.getenv("BINOMO_EMAIL", "")
 BINOMO_PASSWORD = os.getenv("BINOMO_PASSWORD", "")
-SELENIUM_HEADLESS = os.getenv("SELENIUM_HEADLESS", "true").lower() == "true"
+SELENIUM_HEADLESS = os.getenv("SELENIUM_HEADLESS", "false").lower() == "true"
+CHROME_DEBUGGER_ADDRESS = os.getenv("CHROME_DEBUGGER_ADDRESS", "127.0.0.1:9222")
+CHROMEDRIVER_PATH = os.getenv("CHROMEDRIVER_PATH", "")
 
 
 @dataclass
@@ -55,7 +58,25 @@ class BinomoSeleniumCollector:
         options.add_argument("--window-size=1600,1200")
         options.add_argument("--disable-gpu")
 
-        self.driver = webdriver.Chrome(options=options)
+        if CHROMEDRIVER_PATH:
+            service = Service(CHROMEDRIVER_PATH)
+            self.driver = webdriver.Chrome(service=service, options=options)
+        else:
+            self.driver = webdriver.Chrome(options=options)
+        return self.driver
+
+    def attach_to_existing_chrome(self):
+        if not SELENIUM_AVAILABLE:
+            raise RuntimeError("selenium yüklü değil")
+
+        options = Options()
+        options.add_experimental_option("debuggerAddress", CHROME_DEBUGGER_ADDRESS)
+
+        if CHROMEDRIVER_PATH:
+            service = Service(CHROMEDRIVER_PATH)
+            self.driver = webdriver.Chrome(service=service, options=options)
+        else:
+            self.driver = webdriver.Chrome(options=options)
         return self.driver
 
     def stop(self):
@@ -74,84 +95,51 @@ class BinomoSeleniumCollector:
         self.driver.get(self.base_url)
         time.sleep(3)
 
-    def login_if_needed(self):
-        """Gerekirse login akışı eklenir.
-
-        Kullanıcı kendi selectorlerini burada düzenlemelidir.
-        """
+    def use_existing_or_open_platform(self):
         if not self.driver:
-            raise RuntimeError("driver başlatılmadı")
+            self.attach_to_existing_chrome()
 
-        if not BINOMO_EMAIL or not BINOMO_PASSWORD:
-            return
+        current = ""
+        try:
+            current = self.driver.current_url or ""
+        except Exception:
+            current = ""
 
-        # TODO: Gerçek Binomo selectorleri ile güncelle
-        possible_email = [
-            (By.CSS_SELECTOR, "input[type='email']"),
-            (By.NAME, "email"),
-        ]
-        possible_password = [
-            (By.CSS_SELECTOR, "input[type='password']"),
-            (By.NAME, "password"),
-        ]
-        possible_submit = [
-            (By.CSS_SELECTOR, "button[type='submit']"),
-            (By.XPATH, "//button[contains(., 'Login') or contains(., 'Sign in')]")
-        ]
+        if "binomo.com" not in current:
+            self.driver.get(self.base_url)
+            time.sleep(3)
 
-        for by, selector in possible_email:
-            try:
-                elem = WebDriverWait(self.driver, 3).until(EC.presence_of_element_located((by, selector)))
-                elem.clear()
-                elem.send_keys(BINOMO_EMAIL)
-                break
-            except Exception:
-                continue
-
-        for by, selector in possible_password:
-            try:
-                elem = WebDriverWait(self.driver, 3).until(EC.presence_of_element_located((by, selector)))
-                elem.clear()
-                elem.send_keys(BINOMO_PASSWORD)
-                break
-            except Exception:
-                continue
-
-        for by, selector in possible_submit:
-            try:
-                btn = WebDriverWait(self.driver, 3).until(EC.element_to_be_clickable((by, selector)))
-                btn.click()
-                time.sleep(3)
-                break
-            except Exception:
-                continue
+    def login_if_needed(self):
+        """Manuel giriş önerilir. Otomatik login varsayılan değildir."""
+        return
 
     def select_asset(self, asset_name: str):
-        """Asset seçimi için düzenlenebilir iskelet."""
         if not self.driver:
             raise RuntimeError("driver başlatılmadı")
 
-        # TODO: gerçek selectorlerle güncelle
         search_candidates = [
             (By.CSS_SELECTOR, "input[placeholder*='Search']"),
             (By.CSS_SELECTOR, "input[type='search']"),
+            (By.CSS_SELECTOR, "input"),
         ]
 
         for by, selector in search_candidates:
             try:
-                search = WebDriverWait(self.driver, 3).until(EC.presence_of_element_located((by, selector)))
-                search.clear()
-                search.send_keys(asset_name)
-                time.sleep(1)
-                break
+                elems = self.driver.find_elements(by, selector)
+                for search in elems:
+                    try:
+                        if not search.is_displayed():
+                            continue
+                        search.clear()
+                        search.send_keys(asset_name)
+                        time.sleep(1)
+                        return
+                    except Exception:
+                        continue
             except Exception:
                 continue
 
     def read_visible_price_points(self, asset_name: str, limit: int = 120) -> BinomoReadResult:
-        """DOM üzerinden görünür fiyat değerlerini toplamaya çalışır.
-
-        Not: Bu genel iskelettir. Sayfaya göre selectorleri özelleştirmek gerekir.
-        """
         if not self.driver:
             raise RuntimeError("driver başlatılmadı")
 
@@ -161,6 +149,10 @@ class BinomoSeleniumCollector:
             "[data-price]",
             ".chart-price",
             ".candle-price",
+            ".assets-price",
+            ".trading-price",
+            "span",
+            "div",
         ]
 
         found_values: List[float] = []
@@ -170,6 +162,8 @@ class BinomoSeleniumCollector:
                 values = []
                 for el in elements:
                     raw = (el.text or "").strip().replace(",", "")
+                    if not raw:
+                        continue
                     try:
                         values.append(float(raw))
                     except Exception:
@@ -199,8 +193,7 @@ class BinomoSeleniumCollector:
 def fetch_binomo_prices(asset_name: str, limit: int = 120) -> BinomoReadResult:
     collector = BinomoSeleniumCollector(headless=SELENIUM_HEADLESS)
     try:
-        collector.start()
-        collector.open_platform()
+        collector.use_existing_or_open_platform()
         collector.login_if_needed()
         collector.select_asset(asset_name)
         return collector.read_visible_price_points(asset_name, limit=limit)
