@@ -909,6 +909,10 @@ if st.session_state.running:
 results = []
 
 current_time = datetime.now()
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+results = {}
+
 with ThreadPoolExecutor(max_workers=8) as executor:
     futures = {
         executor.submit(
@@ -916,14 +920,17 @@ with ThreadPoolExecutor(max_workers=8) as executor:
             asset,
             st.session_state.model,
             current_time,
-            if ("comparator" not in st.session_state:
-        st.session_state.comparator = None
+            st.session_state.comparator
         ): asset
         for asset in assets
     }
-    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-results = {}
+    for future in as_completed(futures):
+        asset = futures[future]
+        try:
+            results[asset] = future.result()
+        except Exception as e:
+            results[asset] = None
 
 with ThreadPoolExecutor(max_workers=8) as executor:
     futures = {
