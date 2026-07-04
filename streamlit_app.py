@@ -965,39 +965,38 @@ with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 results.append(result)
         except Exception as e:
             print(f"Model eğitimi hatası: {e}")
-                                        if results:
-                                            df_results = pd.DataFrame(results)
-                                            buy_count = len(df_results[df_results['Signal'] == 'BUY'])
-                                            sell_count = len(df_results[df_results['Signal'] == 'SELL'])
-                                            st.session_state.total_signals['BUY'] += buy_count
-                                            st.session_state.total_signals['SELL'] += sell_count
-                                            st.session_state.avg_confidence = int(df_results['Confidence'].mean())
-                                            st.session_state.last_refresh = datetime.now()
-                                            save_to_excel_advanced(results)
-                                            df_results.to_csv(CSV_FILE, mode='a', index=False, 
-                                                              header=not os.path.exists(CSV_FILE), encoding='utf-8')
-                                            col1, col2, col3 = st.columns(3)
-                                            with col1:
-                                                st.success(f"✅ {len(results)} Sinyal")
-                                                with col2:
-                                                    st.info(f"🟢 {buy_count} BUY")
-                                                    with col3:
-                                                        st.warning(f"🔴 {sell_count} SELL")
-                                                        st.markdown("---")
-                                                        st.subheader("🏆 En İyi Sinyaller (20 Model + 5 Strateji)")
-                                                        top_df = df_results.nlargest(25, 'Confidence')[[
-                                                            'Asset', 'Signal', 'Confidence', 'DL_Models', 'Strategy_Match', 
-                                                            'Trend', 'Momentum', 'Channel', 'Source']].copy()
-                                                        def color_signal(val):
-                                                            if val == 'BUY':
-                                                                return 'background-color: #92D050; color: black; font-weight: bold'
-                                                            elif val == 'SELL':
-                                                                return 'background-color: #FF4444; color: white; font-weight: bold'
-                                                                return ''
-                                                                styled_df = top_df.style.applymap(color_signal, subset=['Signal'])
-                                                                st.dataframe(styled_df, use_container_width=True, hide_index=True)
-                                                                st.markdown("---")
-                                                                # BUY
+            if results:
+                df_results = pd.DataFrame(results)
+                buy_count = len(df_results[df_results['Signal'] == 'BUY'])
+                sell_count = len(df_results[df_results['Signal'] == 'SELL'])
+                st.session_state.total_signals['BUY'] += buy_count
+                st.session_state.total_signals['SELL'] += sell_count
+                st.session_state.avg_confidence = int(df_results['Confidence'].mean())
+                st.session_state.last_refresh = datetime.now()
+                save_to_excel_advanced(results)
+                df_results.to_csv(CSV_FILE, mode='a', index=False, 
+                                  header=not os.path.exists(CSV_FILE), encoding='utf-8')
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.success(f"✅ {len(results)} Sinyal")
+                    with col2:
+                        st.info(f"🟢 {buy_count} BUY")
+                        with col3:
+                            st.warning(f"🔴 {sell_count} SELL")
+                            st.markdown("---")
+                            st.subheader("🏆 En İyi Sinyaller (20 Model + 5 Strateji)")
+                            top_df = df_results.nlargest(25, 'Confidence','Asset', 'Signal', 'Confidence', 'DL_Models', 'Strategy_Match', 
+                                                         'Trend', 'Momentum', 'Channel', 'Source']].copy()
+                            def color_signal(val):
+                                if val == 'BUY':
+                                    return 'background-color: #92D050; color: black; font-weight: bold'
+                                elif val == 'SELL':
+                                    return 'background-color: #FF4444; color: white; font-weight: bold'
+                                    return ''
+                                    styled_df = top_df.style.applymap(color_signal, subset=['Signal'])
+                                    st.dataframe(styled_df, use_container_width=True, hide_index=True)
+                                    st.markdown("---")
+                                                            
                 buy_df = df_results[df_results['Signal'] == 'BUY'].sort_values('Confidence', ascending=False)
                 if not buy_df.empty:
                     st.subheader(f"🟢 BUY SİNYALLERİ ({len(buy_df)})")
