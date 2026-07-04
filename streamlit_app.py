@@ -532,7 +532,13 @@ class NewsAnalyzer:
             return []
         try:
             url = "https://newsapi.org/v2/everything"
-            params = {"q": query, "language": "en", "sortBy": "publishedAt", "pageSize": 10, "apiKey": self.api_key}
+            params = {
+                "q": query,
+                "language": "en",
+                "sortBy": "publishedAt",
+                "pageSize": 10,
+                "apiKey": self.api_key
+            }
             r = requests.get(url, params=params, timeout=NEWS_TIMEOUT_SEC)
             if r.status_code != 200:
                 return []
@@ -541,16 +547,6 @@ class NewsAnalyzer:
             return [f"{a.get('title','')} {a.get('description','')}" for a in arts]
         except Exception:
             return []
-                    if raw_signal and news_score < -0.25:
-            conf -= 6
-        if (not raw_signal) and news_score > 0.25:
-            conf -= 6
-
-        conf = max(55, min(99, conf))
-        if PROTECTION_MODE and conf < MIN_CONFIDENCE_TO_TRADE:
-            return "NO-TRADE", conf, "Protection filter"
-
-        return ("BUY" if raw_signal else "SELL"), conf, ""
 
 # ==============================
 # RSI REGIME ENSEMBLE (700F)
