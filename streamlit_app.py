@@ -985,8 +985,13 @@ with ThreadPoolExecutor(max_workers=max_workers) as executor:
                             st.warning(f"🔴 {sell_count} SELL")
                             st.markdown("---")
                             st.subheader("🏆 En İyi Sinyaller (20 Model + 5 Strateji)")
-                            top_df = df_results.nlargest(25, 'Confidence','Asset', 'Signal', 'Confidence', 'DL_Models', 'Strategy_Match', 
-                                                         'Trend', 'Momentum', 'Channel', 'Source']].copy()
+                            top_df = (
+                                df_results
+                                .nlargest(25, 'Confidence')
+                                [['Asset', 'Signal', 'Confidence', 'DL_Models', 'Strategy_Match',
+                                  'Trend', 'Momentum', 'Channel', 'Source']]
+                                .copy()
+                                )
                             def color_signal(val):
                                 if val == 'BUY':
                                     return 'background-color: #92D050; color: black; font-weight: bold'
