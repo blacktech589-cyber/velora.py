@@ -49,14 +49,16 @@ NEWS_TIMEOUT_SEC = 6
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
 
 # ==============================
-# CONFIRMATION CONFIG (7-13 + INDICATORS)
+# CONFIRMATION CONFIG (4-15 + INDICATORS)
+# BUY = düşüşten sonra al
+# SELL = yükselişten sonra sat
 # ==============================
-CONFIRM_WINDOW_FAST = 7
-CONFIRM_WINDOW_SLOW = 13
-MIN_FAST_COUNT = 5
-MIN_SLOW_DOMINANCE = 0.50
-RSI_BUY_MAX = 65
-RSI_SELL_MIN = 35
+CONFIRM_WINDOW_FAST = 4
+CONFIRM_WINDOW_SLOW = 15
+MIN_FAST_COUNT = 3
+MIN_SLOW_DOMINANCE = 0.53
+RSI_BUY_MAX = 45
+RSI_SELL_MIN = 55
 ATR_MIN_RATIO = 0.001
 ATR_MAX_RATIO = 0.080
 EMA_STACK_REQUIRED = False
@@ -468,9 +470,9 @@ class ProtectionEngine:
             if conf < MIN_CONFIDENCE_TO_TRADE:
                 return "NO-TRADE", conf, "High volatility regime"
 
-        if raw_signal and rsi14 >= 82 and ema15_delta < 0:
+        if raw_signal and rsi14 >= 50 and ema15_delta > 0:
             conf -= 8
-        if (not raw_signal) and rsi14 <= 18 and ema15_delta > 0:
+        if (not raw_signal) and rsi14 <= 50 and ema15_delta < 0:
             conf -= 8
 
         if raw_signal and news_score < -0.25:
@@ -527,10 +529,10 @@ class RSIRegimeEnsemble:
         self.model_weights = {k: 1.0 / n for k in self.models.keys()}
 
     def _regime_boost(self, rsi_value):
-        if rsi_value < 30:
-            return {"momentum": 0.8, "reversion": 1.2}
-        if rsi_value > 70:
-            return {"momentum": 1.2, "reversion": 0.8}
+        if rsi_value < 35:
+            return {"momentum": 0.9, "reversion": 1.15}
+        if rsi_value > 65:
+            return {"momentum": 1.15, "reversion": 0.9}
         return {"momentum": 1.0, "reversion": 1.0}
 
     def _compute_feature_importance(self):
@@ -629,6 +631,8 @@ class RSIRegimeEnsemble:
         total_w = 0.0
         confs = []
         used = 0
+        buy_votes = 0
+        sell_votes = 0
 
         for name, model in self.models.items():
             try:
@@ -639,6 +643,11 @@ class RSIRegimeEnsemble:
                     p_buy = float(model.predict_proba(xs)[0][1])
                 else:
                     p_buy = float(model.predict(xs)[0])
+
+                if p_buy >= 0.5:
+                    buy_votes += 1
+                else:
+                    sell_votes += 1
 
                 weighted_vote += w * p_buy
                 total_w += w
@@ -652,7 +661,8 @@ class RSIRegimeEnsemble:
 
         final_prob = weighted_vote / total_w
         final_signal = final_prob >= 0.5
-        conf = int(70 + min(29, np.mean(confs) * 29))
+        agreement = max(buy_votes, sell_votes) / max(used, 1)
+        conf = int(68 + min(31, ((np.mean(confs) * 0.65) + (agreement * 0.35)) * 31))
         return final_signal, conf, used
 
 # ==============================
@@ -723,21 +733,21 @@ def candle_indicator_confirmation(prices, core, raw_signal, gen):
     macd, macd_sig, macd_hist = gen.calculate_macd(p)
 
     if raw_signal is True:
-        candle_ok = (up_fast >= MIN_FAST_COUNT) and (up_dom >= MIN_SLOW_DOMINANCE)
+        candle_ok = (dn_fast >= MIN_FAST_COUNT) and (dn_dom >= MIN_SLOW_DOMINANCE)
         rsi_ok = (rsi14 <= RSI_BUY_MAX)
         atr_ok = (ATR_MIN_RATIO <= atr_ratio <= ATR_MAX_RATIO)
-        ema_ok = (ema7 > ema15 > ema30) if EMA_STACK_REQUIRED else True
-        macd_ok = (macd > macd_sig and macd_hist >= 0) if MACD_CONFIRM_REQUIRED else True
+        ema_ok = (ema7 <= ema15 or ema15 <= ema30) if EMA_STACK_REQUIRED else True
+        macd_ok = (macd <= macd_sig or macd_hist <= 0) if MACD_CONFIRM_REQUIRED else True
         ok = candle_ok and rsi_ok and atr_ok and ema_ok and macd_ok
-        reason = "" if ok else "BUY confirmation failed (7-13/RSI/ATR/EMA/MACD)"
+        reason = "" if ok else "BUY confirmation failed (4-15 düşüş + RSI/ATR/DL)"
     else:
-        candle_ok = (dn_fast >= MIN_FAST_COUNT) and (dn_dom >= MIN_SLOW_DOMINANCE)
+        candle_ok = (up_fast >= MIN_FAST_COUNT) and (up_dom >= MIN_SLOW_DOMINANCE)
         rsi_ok = (rsi14 >= RSI_SELL_MIN)
         atr_ok = (ATR_MIN_RATIO <= atr_ratio <= ATR_MAX_RATIO)
-        ema_ok = (ema7 < ema15 < ema30) if EMA_STACK_REQUIRED else True
-        macd_ok = (macd < macd_sig and macd_hist <= 0) if MACD_CONFIRM_REQUIRED else True
+        ema_ok = (ema7 >= ema15 or ema15 >= ema30) if EMA_STACK_REQUIRED else True
+        macd_ok = (macd >= macd_sig or macd_hist >= 0) if MACD_CONFIRM_REQUIRED else True
         ok = candle_ok and rsi_ok and atr_ok and ema_ok and macd_ok
-        reason = "" if ok else "SELL confirmation failed (7-13/RSI/ATR/EMA/MACD)"
+        reason = "" if ok else "SELL confirmation failed (4-15 yükseliş + RSI/ATR/DL)"
 
     details = {
         "up_fast": up_fast, "dn_fast": dn_fast,
@@ -762,7 +772,7 @@ def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protect
 
         strategies = comparator.analyze_strategies(prices, asset)
         strategy_agreement = sum(1 for s in strategies.values() if (s == "BUY") == signal)
-        confidence = max(62, min(99, int(confidence + strategy_agreement)))
+        confidence = max(62, min(99, int(confidence + max(0, strategy_agreement - 1))))
 
         news_score, headlines = news_analyzer.score_asset_news(asset)
 
@@ -771,18 +781,7 @@ def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protect
         )
 
         if not confirm_ok:
-            fallback_conf = max(68, min(confidence, 76))
-            final_signal, final_conf, blocked_reason = protector.apply(
-                raw_signal=signal,
-                confidence=fallback_conf,
-                rsi14=core["rsi14"],
-                ema15_delta=core["ema15_delta"],
-                atr_ratio=core["atr_ratio"],
-                news_score=news_score,
-                asset=asset
-            )
-            if final_signal == "NO-TRADE":
-                blocked_reason = confirm_reason
+            final_signal, final_conf, blocked_reason = "NO-TRADE", min(confidence, 76), confirm_reason
         else:
             final_signal, final_conf, blocked_reason = protector.apply(
                 raw_signal=signal,
@@ -809,14 +808,14 @@ def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protect
             "ATR_Ratio": round(core["atr_ratio"], 6),
             "News_Score": round(news_score, 3),
             "Blocked_Reason": blocked_reason if blocked_reason else "",
-            "Confirm_7_13": "OK" if confirm_ok else "SOFT-BLOCK",
+            "Confirm_4_15": "OK" if confirm_ok else "BLOCK",
             "Confirm_Detail": (
-                f"u7:{confirm_details.get('up_fast',0)} d7:{confirm_details.get('dn_fast',0)} | "
-                f"u13:{confirm_details.get('up_slow',0)} d13:{confirm_details.get('dn_slow',0)} | "
+                f"u4:{confirm_details.get('up_fast',0)} d4:{confirm_details.get('dn_fast',0)} | "
+                f"u15:{confirm_details.get('up_slow',0)} d15:{confirm_details.get('dn_slow',0)} | "
                 f"RSI:{confirm_details.get('rsi14',0)} ATR:{confirm_details.get('atr_ratio',0)}"
             ),
             "News_Headlines": " | ".join(headlines[:2]) if headlines else "",
-            "Source": f"🧠 RSI+EMA15 700F Ensemble ({model_count}) + Protection + News + 7-13 Confirm",
+            "Source": f"🧠 RSI+EMA15 700F Ensemble ({model_count}) + Protection + News + 4-15 Reversal Confirm",
             "Timestamp": datetime.now().strftime("%H:%M:%S")
         }
     except Exception:
@@ -911,10 +910,10 @@ def generate_training_data_rsi_enhanced(n=1400):
         ema_delta = (prices[-1] - ema15) / (ema15 + 1e-9)
         atr_ratio = atr14 / (prices[-1] + 1e-9)
 
-        if rsi14 < 35 and ema_delta > -0.03 and atr_ratio < 0.06:
-            y = np.random.choice([1, 0], p=[0.76, 0.24])
-        elif rsi14 > 65 and ema_delta < 0.03 and atr_ratio < 0.06:
-            y = np.random.choice([0, 1], p=[0.76, 0.24])
+        if rsi14 < 42 and ema_delta < 0.0 and atr_ratio < 0.06:
+            y = np.random.choice([1, 0], p=[0.77, 0.23])
+        elif rsi14 > 58 and ema_delta > 0.0 and atr_ratio < 0.06:
+            y = np.random.choice([0, 1], p=[0.77, 0.23])
         else:
             y = np.random.choice([0, 1], p=[0.50, 0.50])
 
@@ -959,7 +958,7 @@ def load_model_bundle(model):
 # ==============================
 st.set_page_config(layout="wide", page_title="Velora AI - RSI/EMA15 700F", initial_sidebar_state="expanded")
 st.title("🚀 VELORA AI - RSI/EMA15 700 Features")
-st.markdown("**45s refresh | 7s precompute | protection mode | news-aware ensemble | 7-13 confirmation**")
+st.markdown("**45s refresh | 7s precompute | protection mode | news-aware ensemble | 4-15 reversal confirmation**")
 st.caption(f"Protection Mode: {'ON' if PROTECTION_MODE else 'OFF'} | Min Conf: {MIN_CONFIDENCE_TO_TRADE} | Vol Limit: {HIGH_VOL_THRESHOLD}")
 st.markdown("---")
 
@@ -1121,9 +1120,9 @@ if st.session_state.running:
 
             st.markdown("---")
             st.subheader("🏆 Top Signals (Confidence)")
-            top_df = df.nlargest(20, "Confidence")[
-                ["Asset", "Signal", "Confidence", "DL_Models", "RSI14", "ATR_Ratio", "Confirm_7_13", "Blocked_Reason"]
-            ].copy()
+            top_df = df.nlargest(20, "Confidence")[[
+                "Asset", "Signal", "Confidence", "DL_Models", "RSI14", "ATR_Ratio", "Confirm_4_15", "Blocked_Reason"
+            ]].copy()
             st.dataframe(top_df, use_container_width=True, hide_index=True)
 
             st.markdown("---")
