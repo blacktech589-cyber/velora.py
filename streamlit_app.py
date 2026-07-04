@@ -54,16 +54,26 @@ except Exception:
     layers = None
 
 
-APP_TITLE = "Binomo 1M Algo - Deep Learning Streamlit"
-SCAN_SECONDS = 60
+APP_TITLE = "Velora Enterprise 1M Intelligence"
+SCAN_SECONDS = 90
 MIN_CANDLES = 80
 MAX_CANDLES = 500
+TRAINING_CANDLES = 9000
+LONG_TRAINING_CANDLES = 35040
 DEFAULT_MIN_CONF = 68
 DEFAULT_MAX_ATR = 0.008
 EXPORT_FILE = Path("binomo_1m_signals.xlsx")
+AUDIT_FILE = Path("velora_audit_log.jsonl")
+CONFIG_FILE = Path("velora_enterprise_config.json")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+RISK_PROFILES = {
+    "Conservative": {"min_conf": 76, "max_atr": 0.0055, "allow_news_conflict": False},
+    "Balanced": {"min_conf": 68, "max_atr": 0.0080, "allow_news_conflict": True},
+    "Aggressive": {"min_conf": 60, "max_atr": 0.0140, "allow_news_conflict": True},
+}
 
 BINANCE_SYMBOLS = {
     "BTCUSDT": "BTCUSDT",
@@ -108,10 +118,13 @@ class SignalResult:
     news_score: float
     telegram_score: float
     data_source: str
+    model_probability: float
+    risk_status: str
+    action: str
     timestamp: str
 
 
-def normalize_candles(df: pd.DataFrame) -> pd.DataFrame:
+def normalize_candles(df: pd.DataFrame, max_rows: int = MAX_CANDLES) -> pd.DataFrame:
     """Mum verisini standart OHLCV formatina getirir."""
     if df is None or df.empty:
         return pd.DataFrame()
@@ -149,7 +162,7 @@ def normalize_candles(df: pd.DataFrame) -> pd.DataFrame:
 
     out["time"] = pd.to_datetime(out["time"], errors="coerce")
     out = out.dropna(subset=["open", "high", "low", "close"])
-    out = out.sort_values("time").tail(MAX_CANDLES).reset_index(drop=True)
+    out = out.sort_values("time").tail(max_rows).reset_index(drop=True)
     return out[["time", "open", "high", "low", "close", "volume"]]
 
 
@@ -190,9 +203,41 @@ def fetch_binance_candles(symbol: str, limit: int = MAX_CANDLES) -> pd.DataFrame
     return normalize_candles(pd.DataFrame(rows))
 
 
-def fetch_yahoo_candles(symbol: str, limit: int = MAX_CANDLES) -> pd.DataFrame:
+def fetch_binance_history(symbol: str, interval: str = "1h", limit: int = TRAINING_CANDLES) -> pd.DataFrame:
+    url = "https://api.binance.com/api/v3/klines"
+    rows = []
+    end_time = None
+    while len(rows) < limit:
+        params = {"symbol": symbol.upper().strip(), "interval": interval, "limit": min(1000, limit - len(rows))}
+        if end_time is not None:
+            params["endTime"] = end_time
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        chunk = r.json()
+        if not chunk:
+            break
+        rows = chunk + rows
+        end_time = int(chunk[0][0]) - 1
+        if len(chunk) < 1000:
+            break
+        time.sleep(0.05)
+    parsed = [
+        {
+            "time": pd.to_datetime(int(item[0]), unit="ms"),
+            "open": float(item[1]),
+            "high": float(item[2]),
+            "low": float(item[3]),
+            "close": float(item[4]),
+            "volume": float(item[5]),
+        }
+        for item in rows[-limit:]
+    ]
+    return normalize_candles(pd.DataFrame(parsed), max_rows=limit)
+
+
+def fetch_yahoo_candles(symbol: str, limit: int = MAX_CANDLES, interval: str = "1m", range_value: str = "1d") -> pd.DataFrame:
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    params = {"interval": "1m", "range": "1d", "includePrePost": "false"}
+    params = {"interval": interval, "range": range_value, "includePrePost": "false"}
     headers = {"User-Agent": "Mozilla/5.0"}
     r = requests.get(url, params=params, headers=headers, timeout=8)
     r.raise_for_status()
@@ -218,7 +263,29 @@ def fetch_yahoo_candles(symbol: str, limit: int = MAX_CANDLES) -> pd.DataFrame:
             )
         except Exception:
             pass
-    return normalize_candles(pd.DataFrame(rows).tail(limit))
+    return normalize_candles(pd.DataFrame(rows).tail(limit), max_rows=limit)
+
+
+def fetch_yahoo_history(symbol: str, limit: int = TRAINING_CANDLES) -> pd.DataFrame:
+    for interval, range_value in [("1h", "1y"), ("1d", "2y")]:
+        try:
+            df = fetch_yahoo_candles(symbol, limit=limit, interval=interval, range_value=range_value)
+            if len(df) >= MIN_CANDLES:
+                return df
+        except Exception:
+            pass
+    return pd.DataFrame()
+
+
+def fetch_yahoo_long_history(symbol: str, limit: int = LONG_TRAINING_CANDLES) -> pd.DataFrame:
+    for interval, range_value in [("1d", "5y"), ("1wk", "10y")]:
+        try:
+            df = fetch_yahoo_candles(symbol, limit=limit, interval=interval, range_value=range_value)
+            if len(df) >= MIN_CANDLES:
+                return df
+        except Exception:
+            pass
+    return pd.DataFrame()
 
 
 def fetch_market_candles(source: str, asset: str, endpoint: str = "") -> tuple[pd.DataFrame, str]:
@@ -229,10 +296,55 @@ def fetch_market_candles(source: str, asset: str, endpoint: str = "") -> tuple[p
     if source == "binance":
         symbol = BINANCE_SYMBOLS.get(asset_key, asset_key.replace("/", ""))
         return fetch_binance_candles(symbol), f"Binance {symbol} 1m"
+    if source == "binance 1y":
+        symbol = BINANCE_SYMBOLS.get(asset_key, asset_key.replace("/", ""))
+        hist = fetch_binance_history(symbol)
+        live = fetch_binance_candles(symbol)
+        return normalize_candles(pd.concat([hist, live], ignore_index=True).drop_duplicates(subset=["time"], keep="last"), max_rows=TRAINING_CANDLES + MAX_CANDLES), f"Binance {symbol} 1Y+1m"
+    if source == "binance 4y":
+        symbol = BINANCE_SYMBOLS.get(asset_key, asset_key.replace("/", ""))
+        hist = fetch_binance_history(symbol, interval="1h", limit=LONG_TRAINING_CANDLES)
+        live = fetch_binance_candles(symbol)
+        return normalize_candles(pd.concat([hist, live], ignore_index=True).drop_duplicates(subset=["time"], keep="last"), max_rows=LONG_TRAINING_CANDLES + MAX_CANDLES), f"Binance {symbol} 4Y+1m"
     if source == "yahoo":
         symbol = YAHOO_SYMBOLS.get(asset.upper().strip(), asset.strip())
         return fetch_yahoo_candles(symbol), f"Yahoo {symbol} 1m"
+    if source == "yahoo 1y":
+        symbol = YAHOO_SYMBOLS.get(asset.upper().strip(), asset.strip())
+        hist = fetch_yahoo_history(symbol)
+        live = fetch_yahoo_candles(symbol)
+        return normalize_candles(pd.concat([hist, live], ignore_index=True).drop_duplicates(subset=["time"], keep="last"), max_rows=TRAINING_CANDLES + MAX_CANDLES), f"Yahoo {symbol} 1Y+1m"
+    if source == "yahoo 4y":
+        symbol = YAHOO_SYMBOLS.get(asset.upper().strip(), asset.strip())
+        hist = fetch_yahoo_long_history(symbol)
+        live = fetch_yahoo_candles(symbol)
+        return normalize_candles(pd.concat([hist, live], ignore_index=True).drop_duplicates(subset=["time"], keep="last"), max_rows=LONG_TRAINING_CANDLES + MAX_CANDLES), f"Yahoo {symbol} 4Y+1m"
     return pd.DataFrame(), "No source"
+
+
+def refresh_candles_for_scan(existing: pd.DataFrame, source: str, asset: str, endpoint: str = "") -> tuple[pd.DataFrame, str]:
+    """90 sn taramada 1Y/4Y seti korur, yeni 1m veriyi ekler."""
+    if existing is None or existing.empty:
+        return fetch_market_candles(source, asset, endpoint)
+
+    source_key = source.lower()
+    if source_key.startswith("yahoo"):
+        symbol = YAHOO_SYMBOLS.get(asset.upper().strip(), asset.strip())
+        live = fetch_yahoo_candles(symbol)
+        merged = pd.concat([existing, live], ignore_index=True).drop_duplicates(subset=["time"], keep="last")
+        limit = LONG_TRAINING_CANDLES + MAX_CANDLES if "4y" in source_key else TRAINING_CANDLES + MAX_CANDLES
+        return normalize_candles(merged, max_rows=limit), f"Yahoo {symbol} history+live"
+    if source_key.startswith("binance"):
+        symbol = BINANCE_SYMBOLS.get(asset.upper().strip(), asset.upper().strip().replace("/", ""))
+        live = fetch_binance_candles(symbol)
+        merged = pd.concat([existing, live], ignore_index=True).drop_duplicates(subset=["time"], keep="last")
+        limit = LONG_TRAINING_CANDLES + MAX_CANDLES if "4y" in source_key else TRAINING_CANDLES + MAX_CANDLES
+        return normalize_candles(merged, max_rows=limit), f"Binance {symbol} history+live"
+    if source_key == "binomo/http" and endpoint.strip():
+        live = fetch_http_candles(endpoint)
+        merged = pd.concat([existing, live], ignore_index=True).drop_duplicates(subset=["time"], keep="last")
+        return normalize_candles(merged, max_rows=LONG_TRAINING_CANDLES + MAX_CANDLES), "Binomo/HTTP history+live"
+    return existing, "CSV"
 
 
 def text_sentiment_score(texts: list[str]) -> float:
@@ -753,7 +865,7 @@ def generate_signal(
     data_source: str = "",
 ) -> SignalResult:
     if len(candles) < 30:
-        return SignalResult(asset, "NO-TRADE", 0, "Yetersiz mum verisi", 0, 50, 0, 0, 0, 0, 0, "Yetersiz veri", 0, 0, 0, data_source, now_str())
+        return SignalResult(asset, "NO-TRADE", 0, "Yetersiz mum verisi", 0, 50, 0, 0, 0, 0, 0, "Yetersiz veri", 0, 0, 0, data_source, 0.5, "NO_DATA", "WAIT", now_str())
 
     df = normalize_candles(candles)
     scores = rule_scores(df)
@@ -762,8 +874,10 @@ def generate_signal(
 
     if model_up is None:
         model_vote = 0.0
+        model_probability = 0.5
     else:
         model_vote = (model_up - 0.5) * 2
+        model_probability = float(model_up)
 
     raw = (
         0.38 * scores["trend_score"]
@@ -803,6 +917,18 @@ def generate_signal(
         confidence = min(confidence, 62)
         reason = "RSI asiri satim bolgesinde SELL engellendi"
 
+    risk_status = "OK"
+    if len(df) < MIN_CANDLES:
+        risk_status = "LOW_DATA"
+    elif scores["atr_ratio"] > max_atr_ratio:
+        risk_status = "HIGH_VOL"
+    elif abs(news_score) > 0.35 and np.sign(news_score) != np.sign(raw):
+        risk_status = "NEWS_CONFLICT"
+    elif abs(telegram_score) > 0.35 and np.sign(telegram_score) != np.sign(raw):
+        risk_status = "TELEGRAM_CONFLICT"
+
+    action = enterprise_action(signal, confidence, risk_status)
+
     return SignalResult(
         asset=asset,
         signal=signal,
@@ -820,12 +946,66 @@ def generate_signal(
         news_score=float(news_score),
         telegram_score=float(telegram_score),
         data_source=data_source,
+        model_probability=model_probability,
+        risk_status=risk_status,
+        action=action,
         timestamp=now_str(),
     )
 
 
 def now_str() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def audit_event(event: str, payload: dict) -> None:
+    record = {"time": now_str(), "event": event, "payload": payload}
+    try:
+        with AUDIT_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def save_enterprise_config(config: dict) -> None:
+    try:
+        CONFIG_FILE.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        audit_event("config_saved", config)
+    except Exception:
+        pass
+
+
+def load_enterprise_config() -> dict:
+    try:
+        if CONFIG_FILE.exists():
+            return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def health_report(model: OneMinuteModel, candles: pd.DataFrame, data_source: str) -> dict:
+    return {
+        "Data source": data_source or "Not loaded",
+        "Candles": int(len(candles)),
+        "Sklearn": "OK" if RandomForestClassifier is not None else "Missing",
+        "MLP": "OK" if MLPClassifier is not None else "Missing",
+        "TensorFlow": "OK" if keras is not None else "Optional missing",
+        "Classic model": "Trained" if getattr(model, "trained", False) else "Not trained",
+        "Deep MLP": "Trained" if getattr(model, "deep_trained", False) else "Not trained",
+        "Keras": "Trained" if getattr(model, "keras_trained", False) else "Not trained",
+        "Excel": str(EXPORT_FILE.resolve()),
+        "Audit": str(AUDIT_FILE.resolve()),
+    }
+
+
+def enterprise_action(signal: str, confidence: int, risk_status: str) -> str:
+    if signal == "NO-TRADE":
+        return "WAIT"
+    if risk_status != "OK":
+        return "REVIEW"
+    if confidence >= 82:
+        return "PRIORITY_SIGNAL"
+    return "STANDARD_SIGNAL"
 
 
 def result_to_dict(r: SignalResult) -> dict:
@@ -847,17 +1027,29 @@ def result_to_dict(r: SignalResult) -> dict:
         "News_Score": round(r.news_score, 4),
         "Telegram_Score": round(r.telegram_score, 4),
         "Data_Source": r.data_source,
+        "Model_Probability": round(r.model_probability, 4),
+        "Risk_Status": r.risk_status,
+        "Action": r.action,
     }
 
 
-def append_excel(row: dict) -> None:
+def append_excel(row: dict, strategies: Optional[pd.DataFrame] = None, health: Optional[dict] = None) -> None:
     new = pd.DataFrame([row])
     if EXPORT_FILE.exists():
-        old = pd.read_excel(EXPORT_FILE)
+        try:
+            old = pd.read_excel(EXPORT_FILE, sheet_name="Signals")
+        except Exception:
+            old = pd.read_excel(EXPORT_FILE)
         out = pd.concat([old, new], ignore_index=True).tail(1000)
     else:
         out = new
-    out.to_excel(EXPORT_FILE, index=False)
+    with pd.ExcelWriter(EXPORT_FILE, engine="openpyxl") as writer:
+        out.to_excel(writer, sheet_name="Signals", index=False)
+        if strategies is not None and not strategies.empty:
+            strategies.to_excel(writer, sheet_name="Strategies", index=False)
+        if health is not None:
+            pd.DataFrame([health]).to_excel(writer, sheet_name="Health", index=False)
+    audit_event("excel_saved", {"file": str(EXPORT_FILE), "asset": row.get("Asset"), "signal": row.get("Signal")})
 
 
 def render_signal_badge(signal: str) -> None:
@@ -927,11 +1119,13 @@ def main() -> None:
         st.session_state.telegram_texts = []
     if "data_source" not in st.session_state:
         st.session_state.data_source = ""
+    if "did_initial_load" not in st.session_state:
+        st.session_state.did_initial_load = False
 
     with st.sidebar:
         st.header("Ayarlar")
         asset = st.text_input("Varlik adi", value="EUR/USD")
-        source = st.selectbox("Veri kaynagi", ["Binomo/HTTP", "Binance", "Yahoo", "CSV"], index=2)
+        source = st.selectbox("Veri kaynagi", ["Yahoo 4Y", "Yahoo 1Y", "Yahoo", "Binance 4Y", "Binance 1Y", "Binance", "Binomo/HTTP", "CSV"], index=0)
         min_conf = st.slider("Minimum guven", 50, 95, DEFAULT_MIN_CONF)
         max_atr = st.number_input("Maks ATR orani", min_value=0.0001, max_value=0.2, value=DEFAULT_MAX_ATR, step=0.0005, format="%.4f")
         endpoint = st.text_input("Binomo/HTTP mum endpoint", value="")
@@ -945,7 +1139,7 @@ def main() -> None:
         telegram_bridge = st.text_input("Telegram bridge endpoint", value="")
         use_telegram = st.toggle("Telegram cek", value=False)
         st.divider()
-        auto = st.toggle("60 saniyede otomatik tara", value=False)
+        auto = st.toggle("90 saniyede otomatik tara", value=False)
 
         load_btn = st.button("Veriyi Yukle / Yenile", use_container_width=True)
         train_btn = st.button("Modeli Egit", use_container_width=True)
@@ -960,8 +1154,19 @@ def main() -> None:
         try:
             st.session_state.candles, st.session_state.data_source = fetch_market_candles(source, asset, endpoint)
             st.success(f"{st.session_state.data_source} okundu: {len(st.session_state.candles)} mum")
+            audit_event("data_loaded", {"source": st.session_state.data_source, "candles": len(st.session_state.candles)})
         except Exception as exc:
             st.error(f"Veri okunamadi: {exc}")
+
+    if not st.session_state.did_initial_load and source != "CSV" and st.session_state.candles.empty:
+        try:
+            with st.spinner("Ilk veri seti yukleniyor..."):
+                st.session_state.candles, st.session_state.data_source = fetch_market_candles(source, asset, endpoint)
+            st.session_state.did_initial_load = True
+            audit_event("initial_data_loaded", {"source": st.session_state.data_source, "candles": len(st.session_state.candles)})
+        except Exception as exc:
+            st.session_state.did_initial_load = True
+            st.warning(f"Ilk veri yuklenemedi: {exc}")
 
     candles = st.session_state.candles
 
@@ -972,6 +1177,12 @@ def main() -> None:
     should_auto_scan = auto and (time.time() - st.session_state.last_scan >= SCAN_SECONDS)
     if scan_btn or should_auto_scan:
         st.session_state.last_scan = time.time()
+        if source != "CSV":
+            try:
+                st.session_state.candles, st.session_state.data_source = refresh_candles_for_scan(st.session_state.candles, source, asset, endpoint)
+                candles = st.session_state.candles
+            except Exception as exc:
+                st.warning(f"Yeni veri cekilemedi, mevcut veriyle devam: {exc}")
         news_score, headlines = fetch_news(asset, news_api_key) if use_news else (0.0, [])
         telegram_texts = fetch_telegram_texts(telegram_token, telegram_chat_id, telegram_bridge) if use_telegram else []
         telegram_score = text_sentiment_score(telegram_texts)
@@ -990,7 +1201,16 @@ def main() -> None:
         row = result_to_dict(result)
         st.session_state.history.insert(0, row)
         try:
-            append_excel(row)
+            strategy_state = backtest_strategy_weights(candles) if not candles.empty else {"weights": {}, "latest_votes": {}}
+            strategy_rows = [
+                {
+                    "Strategy": name,
+                    "Weight": round(float(weight), 4),
+                    "Latest_Vote": round(float(strategy_state.get("latest_votes", {}).get(name, 0)), 2),
+                }
+                for name, weight in sorted(strategy_state.get("weights", {}).items(), key=lambda x: x[1], reverse=True)
+            ]
+            append_excel(row, pd.DataFrame(strategy_rows), health_report(st.session_state.model, candles, st.session_state.data_source))
         except Exception as exc:
             st.warning(f"Excel yazilamadi: {exc}")
 
