@@ -929,8 +929,7 @@ if st.session_state.running:
                 
                 save_to_excel_advanced(results)
                 df_results.to_csv(CSV_FILE, mode='a', index=False, 
-                                 header=not os.path.exists(CSV_FILE), encoding='utf-8')
-                
+                                  header=not os.path.exists(CSV_FILE), encoding='utf-8')
                 col1, col2, col3 = st.columns(3)
                 with col1:
                     st.success(f"✅ {len(results)} Sinyal")
