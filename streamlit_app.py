@@ -50,7 +50,7 @@ SCAN_INTERVAL_SEC = 45
 PREDICTION_LEAD_SEC = 7
 
 PROTECTION_MODE = True
-MIN_CONFIDENCE_TO_TRADE = 70
+MIN_CONFIDENCE_TO_TRADE = 64
 HIGH_VOL_THRESHOLD = 0.060
 NEWS_TIMEOUT_SEC = 6
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
@@ -60,12 +60,12 @@ PRICE_LIMIT = 120
 USE_BINOMO_SCREEN = os.getenv("USE_BINOMO_SCREEN", "false").lower() == "true"
 
 # ==============================
-# CONFIRMATION CONFIG (12 + 4 CANDLE)
-# BUY = 12 düşüş + 4 düşüş
-# SELL = 12 yükseliş + 4 yükseliş
+# CONFIRMATION CONFIG (10 + 4 CANDLE)
+# SELL = 10 düşüş + 4 yükseliş (veya üzeri)
+# BUY  = 10 yükseliş + 4 düşüş (veya üzeri)
 # ==============================
 CONFIRM_WINDOW_FAST = 4
-CONFIRM_WINDOW_SLOW = 12
+CONFIRM_WINDOW_SLOW = 10
 
 # ==============================
 # MODEL STORAGE
@@ -551,7 +551,6 @@ class NewsAnalyzer:
                     pass
             if vals:
                 return float(np.clip(np.mean(vals), -1.0, 1.0))
-        # fallback lexicon
         pos_words = ["up", "rise", "gain", "bull", "beat", "growth", "surge", "strong"]
         neg_words = ["down", "fall", "drop", "bear", "miss", "weak", "risk", "crash"]
         s = " ".join(texts).lower()
@@ -565,7 +564,6 @@ class NewsAnalyzer:
         key = f"{asset}_{datetime.now().strftime('%Y-%m-%d_%H:%M')}"
         if key in self.cache:
             return self.cache[key]
-
         q = self._asset_query(asset)
         texts = self._fetch_news_newsapi(q)
         score = self._score_texts(texts)
@@ -588,20 +586,20 @@ class ProtectionEngine:
         conf = max(0.0, min(100.0, conf))
 
         if volatility is not None and volatility > self.high_vol_threshold:
-            conf -= 8
+            conf -= 6
 
         if signal_text == "BUY" and news_score < -0.25:
-            conf -= 6
+            conf -= 4
         if signal_text == "SELL" and news_score > 0.25:
-            conf -= 6
+            conf -= 4
 
-        conf = max(55.0, min(99.0, conf))
+        conf = max(50.0, min(99.0, conf))
+
         if self.enabled and conf < self.min_conf:
             return "NO-TRADE", conf, "Protection filter"
 
         return signal_text, conf, ""
 
-    # advanced_analyze içinde çağrılan yöntem
     def apply(self, raw_signal, confidence, rsi14, ema15_delta, atr_ratio, news_score, asset):
         signal_text = "BUY" if bool(raw_signal) else "SELL"
         final_signal, final_conf, reason = self.evaluate(
@@ -610,11 +608,8 @@ class ProtectionEngine:
             volatility=atr_ratio,
             news_score=news_score
         )
-
-        # Basit ek kural: aşırı atr -> no-trade
         if self.enabled and atr_ratio > 0.12:
             return "NO-TRADE", max(55.0, min(final_conf, 75.0)), "Extreme ATR"
-
         return final_signal, final_conf, reason
 
 # ==============================
@@ -841,30 +836,34 @@ def candle_indicator_confirmation(prices, core, raw_signal, gen):
     p = np.array(prices, dtype=np.float64)
     d = np.diff(p)
 
-    if len(d) < CONFIRM_WINDOW_SLOW:
+    need = max(CONFIRM_WINDOW_FAST, CONFIRM_WINDOW_SLOW)
+    if len(d) < need:
         return False, "Not enough candles", {}
 
-    fast = d[-CONFIRM_WINDOW_FAST:]
-    slow = d[-CONFIRM_WINDOW_SLOW:]
+    fast = d[-CONFIRM_WINDOW_FAST:]   # son 4
+    slow = d[-CONFIRM_WINDOW_SLOW:]   # son 10
 
     up_fast = int(np.sum(fast > 0))
     dn_fast = int(np.sum(fast < 0))
-
     up_slow = int(np.sum(slow > 0))
     dn_slow = int(np.sum(slow < 0))
-    slow_len = max(len(slow), 1)
 
+    slow_len = max(len(slow), 1)
     up_dom = up_slow / slow_len
     dn_dom = dn_slow / slow_len
 
+    # BUY: 10 yükseliş trend + 4'te düşüş pullback
+    # SELL: 10 düşüş trend + 4'te yükseliş pullback
     if raw_signal is True:  # BUY adayı
-        candle_ok = (dn_fast >= 4) and (dn_slow == 12)
-        ok = candle_ok
-        reason = "" if ok else "BUY confirmation failed (12 düşüş + 4 düşüş gerekli)"
+        slow_ok = up_dom >= 0.70
+        fast_ok = dn_fast >= 3
+        ok = slow_ok and fast_ok
+        reason = "" if ok else "BUY confirmation weak (10Y trend + 4D pullback yetersiz)"
     else:  # SELL adayı
-        candle_ok = (up_fast >= 4) and (up_slow == 12)
-        ok = candle_ok
-        reason = "" if ok else "SELL confirmation failed (12 yükseliş + 4 yükseliş gerekli)"
+        slow_ok = dn_dom >= 0.70
+        fast_ok = up_fast >= 3
+        ok = slow_ok and fast_ok
+        reason = "" if ok else "SELL confirmation weak (10D trend + 4Y pullback yetersiz)"
 
     details = {
         "up_fast": up_fast, "dn_fast": dn_fast,
@@ -899,7 +898,18 @@ def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protect
         )
 
         if not confirm_ok:
-            final_signal, final_conf, blocked_reason = "NO-TRADE", min(confidence, 76), confirm_reason
+            downgraded_conf = max(58, int(confidence - 10))
+            tentative_signal = "BUY" if bool(signal_bool) else "SELL"
+
+            final_signal, final_conf, blocked_reason = protector.evaluate(
+                signal_text=tentative_signal,
+                confidence=downgraded_conf,
+                volatility=core["atr_ratio"],
+                news_score=news_score
+            )
+
+            if blocked_reason == "":
+                blocked_reason = f"WeakConfirm: {confirm_reason}"
         else:
             final_signal, final_conf, blocked_reason = protector.apply(
                 raw_signal=signal_bool,
@@ -911,7 +921,6 @@ def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protect
                 asset=asset
             )
 
-        # Güvence: bool asla dönmesin
         if isinstance(final_signal, bool):
             final_signal = "BUY" if final_signal else "SELL"
 
@@ -930,17 +939,17 @@ def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protect
             "ATR_Ratio": round(core["atr_ratio"], 6),
             "News_Score": round(news_score, 3),
             "Blocked_Reason": blocked_reason if blocked_reason else "",
-            "Confirm_4_15": "OK" if confirm_ok else "BLOCK",
+            "Confirm_4_15": "OK" if confirm_ok else "WEAK",
             "Confirm_Detail": (
                 f"u4:{confirm_details.get('up_fast',0)} d4:{confirm_details.get('dn_fast',0)} | "
-                f"u12:{confirm_details.get('up_slow',0)} d12:{confirm_details.get('dn_slow',0)} | "
+                f"u10:{confirm_details.get('up_slow',0)} d10:{confirm_details.get('dn_slow',0)} | "
                 f"RSI:{confirm_details.get('rsi14',0)} ATR:{confirm_details.get('atr_ratio',0)}"
             ),
             "Market_Source": market_source,
             "Price_Count": int(len(prices)),
             "Last_Price": round(float(prices[-1]), 6),
             "News_Headlines": " | ".join(headlines[:2]) if headlines else "",
-            "Source": f"🧠 RSI+EMA15 700F Ensemble ({model_count}) + Protection + News + 12-4 Reversal Confirm",
+            "Source": f"🧠 RSI+EMA15 700F Ensemble ({model_count}) + Protection + News + 10-4 Pullback Confirm",
             "Timestamp": datetime.now().strftime("%H:%M:%S")
         }
     except Exception:
@@ -1083,7 +1092,7 @@ def load_model_bundle(model):
 # ==============================
 st.set_page_config(layout="wide", page_title="Velora AI - RSI/EMA15 700F", initial_sidebar_state="expanded")
 st.title("🚀 VELORA AI - RSI/EMA15 700 Features")
-st.markdown("**Live market data | Binomo screen optional | 1m candles where available | protection mode | news-aware ensemble | 12-4 reversal confirmation**")
+st.markdown("**Live market data | Binomo screen optional | 1m candles where available | protection mode | news-aware ensemble | 10-4 pullback confirmation**")
 st.caption(
     f"Protection Mode: {'ON' if PROTECTION_MODE else 'OFF'} | "
     f"Min Conf: {MIN_CONFIDENCE_TO_TRADE} | Vol Limit: {HIGH_VOL_THRESHOLD} | "
