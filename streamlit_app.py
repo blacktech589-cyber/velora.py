@@ -27,7 +27,6 @@ import numpy as np
 import time
 import os
 import requests
-from collections import deque
 
 # Optional sentiment
 try:
@@ -67,14 +66,6 @@ USE_BINOMO_SCREEN = os.getenv("USE_BINOMO_SCREEN", "false").lower() == "true"
 # ==============================
 CONFIRM_WINDOW_FAST = 4
 CONFIRM_WINDOW_SLOW = 12
-MIN_FAST_COUNT = 4
-MIN_SLOW_DOMINANCE = 1.0
-RSI_BUY_MAX = 45
-RSI_SELL_MIN = 55
-ATR_MIN_RATIO = 0.001
-ATR_MAX_RATIO = 0.080
-EMA_STACK_REQUIRED = False
-MACD_CONFIRM_REQUIRED = False
 
 # ==============================
 # MODEL STORAGE
@@ -548,6 +539,40 @@ class NewsAnalyzer:
         except Exception:
             return []
 
+    def _score_texts(self, texts):
+        if not texts:
+            return 0.0
+        if TEXTBLOB_AVAILABLE:
+            vals = []
+            for t in texts:
+                try:
+                    vals.append(float(TextBlob(t).sentiment.polarity))
+                except Exception:
+                    pass
+            if vals:
+                return float(np.clip(np.mean(vals), -1.0, 1.0))
+        # fallback lexicon
+        pos_words = ["up", "rise", "gain", "bull", "beat", "growth", "surge", "strong"]
+        neg_words = ["down", "fall", "drop", "bear", "miss", "weak", "risk", "crash"]
+        s = " ".join(texts).lower()
+        p = sum(s.count(w) for w in pos_words)
+        n = sum(s.count(w) for w in neg_words)
+        if p + n == 0:
+            return 0.0
+        return float(np.clip((p - n) / (p + n), -1.0, 1.0))
+
+    def score_asset_news(self, asset):
+        key = f"{asset}_{datetime.now().strftime('%Y-%m-%d_%H:%M')}"
+        if key in self.cache:
+            return self.cache[key]
+
+        q = self._asset_query(asset)
+        texts = self._fetch_news_newsapi(q)
+        score = self._score_texts(texts)
+        headlines = texts[:5] if texts else []
+        out = (score, headlines)
+        self.cache[key] = out
+        return out
 
 # ==============================
 # PROTECTION ENGINE
@@ -558,27 +583,39 @@ class ProtectionEngine:
         self.min_conf = MIN_CONFIDENCE_TO_TRADE
         self.high_vol_threshold = HIGH_VOL_THRESHOLD
 
-    def evaluate(self, signal, confidence, volatility=0.0, news_score=0.0):
+    def evaluate(self, signal_text, confidence, volatility=0.0, news_score=0.0):
         conf = float(confidence)
         conf = max(0.0, min(100.0, conf))
 
-        # High volatility penalty
         if volatility is not None and volatility > self.high_vol_threshold:
             conf -= 8
 
-        # News-direction penalty
-        if signal == "BUY" and news_score < -0.25:
+        if signal_text == "BUY" and news_score < -0.25:
             conf -= 6
-        if signal == "SELL" and news_score > 0.25:
+        if signal_text == "SELL" and news_score > 0.25:
             conf -= 6
 
         conf = max(55.0, min(99.0, conf))
-
         if self.enabled and conf < self.min_conf:
             return "NO-TRADE", conf, "Protection filter"
 
-        return signal, conf, ""
+        return signal_text, conf, ""
 
+    # advanced_analyze içinde çağrılan yöntem
+    def apply(self, raw_signal, confidence, rsi14, ema15_delta, atr_ratio, news_score, asset):
+        signal_text = "BUY" if bool(raw_signal) else "SELL"
+        final_signal, final_conf, reason = self.evaluate(
+            signal_text=signal_text,
+            confidence=confidence,
+            volatility=atr_ratio,
+            news_score=news_score
+        )
+
+        # Basit ek kural: aşırı atr -> no-trade
+        if self.enabled and atr_ratio > 0.12:
+            return "NO-TRADE", max(55.0, min(final_conf, 75.0)), "Extreme ATR"
+
+        return final_signal, final_conf, reason
 
 # ==============================
 # RSI REGIME ENSEMBLE (700F)
@@ -807,9 +844,8 @@ def candle_indicator_confirmation(prices, core, raw_signal, gen):
     if len(d) < CONFIRM_WINDOW_SLOW:
         return False, "Not enough candles", {}
 
-    # Son 4 ve son 12 kapanış farkları
-    fast = d[-CONFIRM_WINDOW_FAST:]   # 4 mum
-    slow = d[-CONFIRM_WINDOW_SLOW:]   # 12 mum
+    fast = d[-CONFIRM_WINDOW_FAST:]
+    slow = d[-CONFIRM_WINDOW_SLOW:]
 
     up_fast = int(np.sum(fast > 0))
     dn_fast = int(np.sum(fast < 0))
@@ -821,9 +857,6 @@ def candle_indicator_confirmation(prices, core, raw_signal, gen):
     up_dom = up_slow / slow_len
     dn_dom = dn_slow / slow_len
 
-    # Yalnızca mum kuralı:
-    # BUY: 12 düşüş + 4 düşüş
-    # SELL: 12 yükseliş + 4 yükseliş
     if raw_signal is True:  # BUY adayı
         candle_ok = (dn_fast >= 4) and (dn_slow == 12)
         ok = candle_ok
@@ -850,26 +883,26 @@ def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protect
         features = gen.calculate_ultra_700_features(prices)
         core = rsi_ema15_core(prices, gen)
 
-        signal, confidence, model_count = model.predict(features, rsi_value=core["rsi14"])
-        if signal is None:
-            signal = np.random.choice([True, False], p=[0.5, 0.5])
+        signal_bool, confidence, model_count = model.predict(features, rsi_value=core["rsi14"])
+        if signal_bool is None:
+            signal_bool = np.random.choice([True, False], p=[0.5, 0.5])
             confidence = 72
 
         strategies = comparator.analyze_strategies(prices, asset)
-        strategy_agreement = sum(1 for s in strategies.values() if (s == "BUY") == signal)
+        strategy_agreement = sum(1 for s in strategies.values() if (s == "BUY") == bool(signal_bool))
         confidence = max(62, min(99, int(confidence + max(0, strategy_agreement - 1))))
 
         news_score, headlines = news_analyzer.score_asset_news(asset)
 
         confirm_ok, confirm_reason, confirm_details = candle_indicator_confirmation(
-            prices=prices, core=core, raw_signal=signal, gen=gen
+            prices=prices, core=core, raw_signal=signal_bool, gen=gen
         )
 
         if not confirm_ok:
             final_signal, final_conf, blocked_reason = "NO-TRADE", min(confidence, 76), confirm_reason
         else:
             final_signal, final_conf, blocked_reason = protector.apply(
-                raw_signal=signal,
+                raw_signal=signal_bool,
                 confidence=confidence,
                 rsi14=core["rsi14"],
                 ema15_delta=core["ema15_delta"],
@@ -878,10 +911,14 @@ def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protect
                 asset=asset
             )
 
+        # Güvence: bool asla dönmesin
+        if isinstance(final_signal, bool):
+            final_signal = "BUY" if final_signal else "SELL"
+
         return {
             "Asset": asset,
             "Signal": final_signal,
-            "Confidence": final_conf,
+            "Confidence": int(final_conf),
             "DL_Models": model_count,
             "Strategy_Match": strategy_agreement,
             "Trend": strategies.get("Trend", "BUY"),
@@ -1063,13 +1100,8 @@ if "comparator" not in st.session_state:
 if "news_analyzer" not in st.session_state:
     st.session_state.news_analyzer = NewsAnalyzer(api_key=NEWS_API_KEY)
 
-# ProtectionEngine yoksa uygulama düşmesin
 if "protector" not in st.session_state:
-    try:
-        st.session_state.protector = ProtectionEngine()
-    except NameError:
-        st.session_state.protector = None
-        st.warning("ProtectionEngine tanımlı değil. Protection devre dışı başlatıldı.")
+    st.session_state.protector = ProtectionEngine()
 
 if "last_refresh" not in st.session_state:
     st.session_state.last_refresh = datetime.now() - timedelta(seconds=SCAN_INTERVAL_SEC)
@@ -1099,6 +1131,7 @@ if not getattr(st.session_state.model, "trained", False):
             st.session_state.model.train(X_train, y_train)
         except Exception as e:
             st.error(f"Training error: {e}")
+
 m1, m2, m3, m4, m5, m6 = st.columns(6)
 with m1: st.metric("📊 Assets", len(ALL_ASSETS))
 with m2: st.metric("🟢 BUY", st.session_state.total_signals["BUY"])
@@ -1254,21 +1287,3 @@ if st.session_state.running:
         st.rerun()
 else:
     st.info("👇 Click START to begin real-time analysis.")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
