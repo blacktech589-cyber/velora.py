@@ -942,7 +942,7 @@ with ThreadPoolExecutor(max_workers=8) as executor:
         except Exception as e:
             print(f"Hata ({asset}): {e}")
             results[asset] = None
-                from concurrent.futures import ThreadPoolExecutor, as_completed
+            from concurrent.futures import ThreadPoolExecutor, as_completed
 
 results = []
 
