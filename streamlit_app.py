@@ -1038,18 +1038,23 @@ with ThreadPoolExecutor(max_workers=max_workers) as executor:
                                             st.success(f"⚡ Saniye Bazlı Tarama: {st.session_state.total_rounds} Tur Tamamlandı")
                                             time.sleep(0.5)
                                             st.rerun()
-                                            if is_running:
-                                                elif time_since_refresh < 1:
-                                                    remaining = 1 - time_since_refresh
-                                                    progress = time_since_refresh
-                                                    st.progress(min(progress, 1.0))
-                                                    st.info(f"⏱️ Sonraki tarama: {remaining:.1f} saniye içinde...")
-                                                    time.sleep(0.1)
-                                                    st.rerun()
-                                            else:
-                                        st.info("👇 **BAŞLAT** butonuna basarak Ultra-Zeki AI analizini başlatın")
-                                    with st.expander("ℹ️ SISTEM ÖZELLİKLERİ", expanded=True):
-                                        st.markdown("")
+                                           if st.session_state.get("is_running", False):
+    # analiz çalışıyor
+    st.info("🔄 Analiz çalışıyor...")
+
+elif time_since_refresh < 1:
+    remaining = 1 - time_since_refresh
+    progress = time_since_refresh
+
+    st.progress(min(progress, 1.0))
+    st.info(f"⏱️ Sonraki tarama: {remaining:.1f} saniye içinde...")
+    time.sleep(0.1)
+    st.rerun()
+
+else:
+    st.info("👇 **BAŞLAT** butonuna basarak Ultra-Zeki AI analizini başlatın")
+    with st.expander("ℹ️ SISTEM ÖZELLİKLERİ", expanded=True):
+        st.markdown("")
 
 
 
