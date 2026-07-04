@@ -754,7 +754,10 @@ if st.session_state.running:
                         return 'background-color: #FF4444; color: white; font-weight: bold'
                     return ''
                 
-                styled_df = top_df.style.applymap(color_signal, subset=['Signal'])
+                styled_df = top_df.style.apply(
+                    lambda col: col.map(color_signal),
+                    subset=['Signal']
+                            )
                 st.dataframe(styled_df, use_container_width=True, hide_index=True)
                 
                 st.markdown("---")
