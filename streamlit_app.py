@@ -35,7 +35,11 @@ try:
     XGB_OK = True
 except Exception as e:
     XGB_OK = False
-from lightgbm import LGBMClassifier
+try:
+    from lightgbm import LGBMClassifier
+    LGBM_OK = True
+except Exception:
+    LGBM_OK = False
 
 # Data Generation
 from sklearn.datasets import make_classification
