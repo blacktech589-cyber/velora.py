@@ -46,6 +46,31 @@ NEWS_TIMEOUT_SEC = 6
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
 
 # ==============================
+# CONSERVATIVE RISK PROFILE
+# ==============================
+# Set CONSERVATIVE_MODE = True to apply the conservative risk profile.
+# Conservative behavior: higher confidence threshold, tighter RSI bands,
+# EMA(7) confirmation required, MUM(3-9) direction gating enabled,
+# and deep-learning filter active with elevated threshold.
+CONSERVATIVE_MODE = True
+
+CONSERVATIVE_CONFIG = {
+    # Minimum ensemble confidence required before issuing a signal
+    "min_confidence": 82,
+    # RSI overbought level (tighter than default 78)
+    "rsi_overbought": 72,
+    # RSI oversold level (tighter than default 22)
+    "rsi_oversold": 28,
+    # DL confirmation model confidence threshold (0-1)
+    # Conservative profile demands ≥65 % DL confidence
+    "dl_confidence_threshold": 0.65,
+    # Enable MUM(3,9) directional gating:  rising → SELL bias, falling → BUY bias
+    "mum_confirmation": True,
+    # Require EMA(7) trend to agree with signal direction
+    "ema7_confirmation": True,
+}
+
+# ==============================
 # SKLEARN IMPORTS
 # ==============================
 from sklearn.preprocessing import StandardScaler
@@ -137,6 +162,36 @@ class SignalGenerator:
         signal = series.ewm(span=9, adjust=False).mean().iloc[-1]
         hist = macd - signal
         return float(macd), float(signal), float(hist)
+
+    def calculate_mum(self, prices, fast=3, slow=9):
+        """MUM spread: EMA(fast) − EMA(slow).  Positive → upward momentum."""
+        ema_fast = self.calculate_ema(prices, fast)
+        ema_slow = self.calculate_ema(prices, slow)
+        return float(ema_fast - ema_slow)
+
+    def calculate_mum_signal(self, prices, fast=3, slow=9):
+        """
+        MUM(fast, slow) directional signal rule:
+          • MUM spread rising  (current > previous) → SELL bias
+          • MUM spread falling (current < previous) → BUY  bias
+          • No change                               → NEUTRAL
+
+        Returns
+        -------
+        signal    : str   – "SELL", "BUY", or "NEUTRAL"
+        current   : float – current MUM spread value
+        direction : float – change in MUM spread (current − previous)
+        """
+        if len(prices) < slow + 2:
+            return "NEUTRAL", 0.0, 0.0
+        current_mum = self.calculate_mum(prices, fast, slow)
+        prev_mum = self.calculate_mum(prices[:-1], fast, slow)
+        direction = current_mum - prev_mum
+        if direction > 0:
+            return "SELL", current_mum, direction
+        if direction < 0:
+            return "BUY", current_mum, direction
+        return "NEUTRAL", current_mum, direction
 
     def calculate_bollinger_bands(self, prices, period=20, std_dev=2):
         series = pd.Series(prices)
@@ -387,22 +442,52 @@ class ProtectionEngine:
         self.vol_window[asset].append(float(atr_ratio))
         return float(np.mean(self.vol_window[asset])) if len(self.vol_window[asset]) else float(atr_ratio)
 
-    def apply(self, raw_signal, confidence, rsi14, ema15_delta, atr_ratio, news_score, asset="global"):
+    def apply(self, raw_signal, confidence, rsi14, ema15_delta, atr_ratio, news_score,
+              asset="global", ema7_delta=0.0, mum_signal="NEUTRAL"):
         conf = int(confidence)
 
-        if PROTECTION_MODE and conf < MIN_CONFIDENCE_TO_TRADE:
+        # Determine effective thresholds (conservative vs default)
+        if CONSERVATIVE_MODE:
+            min_conf = CONSERVATIVE_CONFIG["min_confidence"]
+            rsi_overbought = CONSERVATIVE_CONFIG["rsi_overbought"]
+            rsi_oversold = CONSERVATIVE_CONFIG["rsi_oversold"]
+        else:
+            min_conf = MIN_CONFIDENCE_TO_TRADE
+            rsi_overbought = 78
+            rsi_oversold = 22
+
+        if PROTECTION_MODE and conf < min_conf:
             return "NO-TRADE", conf, "Low confidence"
 
         vol_regime = self._get_vol_regime(asset, atr_ratio)
         if PROTECTION_MODE and vol_regime > HIGH_VOL_THRESHOLD:
             conf = max(50, conf - 10)
-            if conf < MIN_CONFIDENCE_TO_TRADE:
+            if conf < min_conf:
                 return "NO-TRADE", conf, "High volatility regime"
 
-        if raw_signal and rsi14 >= 78 and ema15_delta < 0:
+        # RSI extremes penalty (conservative thresholds)
+        if raw_signal and rsi14 >= rsi_overbought and ema15_delta < 0:
             conf -= 12
-        if (not raw_signal) and rsi14 <= 22 and ema15_delta > 0:
+        if (not raw_signal) and rsi14 <= rsi_oversold and ema15_delta > 0:
             conf -= 12
+
+        # EMA(7) trend confirmation (conservative mode only)
+        if CONSERVATIVE_MODE and CONSERVATIVE_CONFIG.get("ema7_confirmation"):
+            # BUY signal should have price above EMA(7) (ema7_delta > 0)
+            # SELL signal should have price below EMA(7) (ema7_delta < 0)
+            if raw_signal and ema7_delta < 0:
+                conf -= 8
+            if (not raw_signal) and ema7_delta > 0:
+                conf -= 8
+
+        # MUM(3-9) directional confirmation (conservative mode only)
+        if CONSERVATIVE_MODE and CONSERVATIVE_CONFIG.get("mum_confirmation"):
+            # If MUM says SELL but we have a BUY signal → conflict → penalise
+            if raw_signal and mum_signal == "SELL":
+                conf -= 8
+            # If MUM says BUY but we have a SELL signal → conflict → penalise
+            if (not raw_signal) and mum_signal == "BUY":
+                conf -= 8
 
         if raw_signal and news_score < -0.15:
             conf -= 10
@@ -410,10 +495,108 @@ class ProtectionEngine:
             conf -= 10
 
         conf = max(50, min(99, conf))
-        if PROTECTION_MODE and conf < MIN_CONFIDENCE_TO_TRADE:
+        if PROTECTION_MODE and conf < min_conf:
             return "NO-TRADE", conf, "Protection filter"
 
         return ("BUY" if raw_signal else "SELL"), conf, ""
+
+# ==============================
+# DL CONFIRMATION FILTER
+# ==============================
+class DLConfirmationFilter:
+    """
+    Deep-learning confirmation stage between raw signal and execution.
+
+    Conservative profile behavior
+    ------------------------------
+    • Requires higher confidence (≥ ``threshold``) before allowing a trade.
+    • If model confidence is below threshold the trade is skipped.
+
+    Modularity
+    ----------
+    • ``_predict_stub`` is a deterministic fallback that uses RSI and MUM(3-9)
+      heuristics.  It is intentionally lightweight and safe.
+    • TODO: replace ``_predict_stub`` with a real trained DL model, e.g.:
+        - Load a ``torch.nn.Module`` from a checkpoint file
+        - Load a ``keras`` model via ``tf.keras.models.load_model(path)``
+        - Call a REST inference endpoint
+      The interface is:  (raw_signal, features, rsi14, mum_signal) → float [0, 1]
+    """
+
+    def __init__(self, threshold: float = 0.60):
+        # TODO: load real DL model here, e.g.
+        #   self.model = torch.load("dl_model.pt")
+        self.threshold = float(threshold)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def confirm(self, raw_signal: bool, features, rsi14: float = 50.0,
+                mum_signal: str = "NEUTRAL"):
+        """
+        Parameters
+        ----------
+        raw_signal : bool   – True = BUY, False = SELL
+        features   : array  – 400-dim feature vector (used by real DL model)
+        rsi14      : float  – current RSI(14) value
+        mum_signal : str    – "BUY", "SELL", or "NEUTRAL" from calculate_mum_signal
+
+        Returns
+        -------
+        confirmed : bool  – whether to allow execution
+        confidence: float – model confidence score [0, 1]
+        reason    : str   – human-readable gate reason (empty when confirmed)
+        """
+        confidence = self._predict_stub(raw_signal, rsi14, mum_signal)
+        if confidence < self.threshold:
+            return False, confidence, (
+                f"DL confidence {confidence:.2f} below threshold {self.threshold:.2f}"
+            )
+        return True, confidence, ""
+
+    # ------------------------------------------------------------------
+    # Stub implementation (deterministic fallback)
+    # ------------------------------------------------------------------
+    def _predict_stub(self, raw_signal: bool, rsi14: float,
+                      mum_signal: str) -> float:
+        """
+        Deterministic, model-free confidence estimator.
+
+        Rules (safe, conservative defaults):
+        • Base score: 0.60 (neutral)
+        • RSI in favour of signal:  +0.10
+        • RSI against signal:       −0.10
+        • MUM aligns with signal:   +0.08
+        • MUM conflicts with signal:−0.08
+
+        TODO: Replace this method with real DL model inference once a
+              trained model is available.
+        """
+        score = 0.60
+
+        # RSI-based adjustment
+        if raw_signal:          # BUY signal
+            if rsi14 < 35:
+                score += 0.10   # oversold → supports BUY
+            elif rsi14 > 65:
+                score -= 0.10   # overbought → weakens BUY
+        else:                   # SELL signal
+            if rsi14 > 65:
+                score += 0.10   # overbought → supports SELL
+            elif rsi14 < 35:
+                score -= 0.10   # oversold → weakens SELL
+
+        # MUM(3-9) directional alignment
+        if raw_signal and mum_signal == "BUY":
+            score += 0.08       # spread falling aligns with BUY
+        elif (not raw_signal) and mum_signal == "SELL":
+            score += 0.08       # spread rising aligns with SELL
+        elif raw_signal and mum_signal == "SELL":
+            score -= 0.08       # conflict
+        elif (not raw_signal) and mum_signal == "BUY":
+            score -= 0.08       # conflict
+
+        return float(np.clip(score, 0.0, 1.0))
 
 # ==============================
 # RSI REGIME ENSEMBLE
@@ -605,8 +788,20 @@ class StrategyComparator:
                 results['Channel'] = "BUY"
 
             results['Volatility'] = "BUY" if (np.std(np.diff(prices[-14:])) > 0) else "SELL" if len(prices) > 14 else "BUY"
+
+            # MUM(3-9) strategy: spread rising → SELL, spread falling → BUY
+            if len(prices) >= 11:
+                gen_tmp = SignalGenerator("_cmp_", None)
+                mum_sig, _, _ = gen_tmp.calculate_mum_signal(prices, fast=3, slow=9)
+                if mum_sig in ("BUY", "SELL"):
+                    results['MUM39'] = mum_sig
+                else:
+                    results['MUM39'] = "BUY"
+            else:
+                results['MUM39'] = "BUY"
         except Exception:
-            results = {'Trend': "BUY", 'MeanRev': "BUY", 'Momentum': "BUY", 'Channel': "BUY", 'Volatility': "BUY"}
+            results = {'Trend': "BUY", 'MeanRev': "BUY", 'Momentum': "BUY",
+                       'Channel': "BUY", 'Volatility': "BUY", 'MUM39': "BUY"}
         return results
 
 # ==============================
@@ -623,17 +818,22 @@ def rsi_ema15_core(prices, gen):
     return {
         "rsi14": float(rsi14),
         "ema15_delta": float((close - ema15) / (ema15 + 1e-9)),
+        "ema7_delta": float((close - ema7) / (ema7 + 1e-9)),
         "atr_ratio": float(atr14 / (close + 1e-9)),
         "trend_stack": float(np.sign(ema7 - ema15) + np.sign(ema15 - ema30)),
     }
 
-def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protector):
+def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protector,
+                     dl_filter=None):
     try:
         gen = SignalGenerator(asset, time_seed)
         prices = gen.generate_realistic_prices(120)
 
         features = gen.calculate_ultra_400_features(prices)
         core = rsi_ema15_core(prices, gen)
+
+        # MUM(3-9) directional signal
+        mum_signal, mum_value, mum_direction = gen.calculate_mum_signal(prices, fast=3, slow=9)
 
         signal, confidence, model_count = model.predict(features, rsi_value=core["rsi14"])
         if signal is None:
@@ -646,6 +846,41 @@ def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protect
 
         news_score, headlines = news_analyzer.score_asset_news(asset)
 
+        # DL confirmation filter (conservative gating)
+        dl_confirmed = True
+        dl_conf_score = 1.0
+        dl_block_reason = ""
+        if dl_filter is not None:
+            dl_confirmed, dl_conf_score, dl_block_reason = dl_filter.confirm(
+                raw_signal=signal,
+                features=features,
+                rsi14=core["rsi14"],
+                mum_signal=mum_signal,
+            )
+        if not dl_confirmed:
+            return {
+                "Asset": asset,
+                "Signal": "NO-TRADE",
+                "Confidence": int(dl_conf_score * 100),
+                "DL_Models": model_count,
+                "Strategy_Match": strategy_agreement,
+                "Trend": strategies.get("Trend", "BUY"),
+                "MeanRev": strategies.get("MeanRev", "BUY"),
+                "Momentum": strategies.get("Momentum", "BUY"),
+                "Channel": strategies.get("Channel", "BUY"),
+                "MUM39": mum_signal,
+                "MUM_Value": round(mum_value, 6),
+                "RSI14": round(core["rsi14"], 2),
+                "EMA15_Delta": round(core["ema15_delta"], 6),
+                "EMA7_Delta": round(core["ema7_delta"], 6),
+                "ATR_Ratio": round(core["atr_ratio"], 6),
+                "News_Score": round(news_score, 3),
+                "Blocked_Reason": dl_block_reason,
+                "News_Headlines": " | ".join(headlines[:2]) if headlines else "",
+                "Source": f"🧠 RSI+EMA15 400F Ensemble ({model_count}) + DL Filter + Protection + News",
+                "Timestamp": datetime.now().strftime("%H:%M:%S")
+            }
+
         final_signal, final_conf, blocked_reason = protector.apply(
             raw_signal=signal,
             confidence=confidence,
@@ -653,7 +888,9 @@ def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protect
             ema15_delta=core["ema15_delta"],
             atr_ratio=core["atr_ratio"],
             news_score=news_score,
-            asset=asset
+            asset=asset,
+            ema7_delta=core["ema7_delta"],
+            mum_signal=mum_signal,
         )
 
         return {
@@ -666,13 +903,16 @@ def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protect
             "MeanRev": strategies.get("MeanRev", "BUY"),
             "Momentum": strategies.get("Momentum", "BUY"),
             "Channel": strategies.get("Channel", "BUY"),
+            "MUM39": mum_signal,
+            "MUM_Value": round(mum_value, 6),
             "RSI14": round(core["rsi14"], 2),
             "EMA15_Delta": round(core["ema15_delta"], 6),
+            "EMA7_Delta": round(core["ema7_delta"], 6),
             "ATR_Ratio": round(core["atr_ratio"], 6),
             "News_Score": round(news_score, 3),
             "Blocked_Reason": blocked_reason if blocked_reason else "",
             "News_Headlines": " | ".join(headlines[:2]) if headlines else "",
-            "Source": f"🧠 RSI+EMA15 400F Ensemble ({model_count}) + Protection + News",
+            "Source": f"🧠 RSI+EMA15 400F Ensemble ({model_count}) + DL Filter + Protection + News",
             "Timestamp": datetime.now().strftime("%H:%M:%S")
         }
     except Exception:
@@ -757,18 +997,34 @@ def save_to_excel(results):
 # ==============================
 def generate_training_data_rsi_enhanced(n=650):
     X_data, y_data = [], []
+
+    # Use conservative RSI thresholds when conservative mode is active
+    rsi_low = CONSERVATIVE_CONFIG["rsi_oversold"] if CONSERVATIVE_MODE else 30
+    rsi_high = CONSERVATIVE_CONFIG["rsi_overbought"] if CONSERVATIVE_MODE else 70
+
     for i in range(n):
         gen = SignalGenerator(f"train_{i}", datetime.now().strftime("%Y-%m-%d"))
         prices = gen.generate_realistic_prices(120)
         features = gen.calculate_ultra_400_features(prices)
         rsi14 = gen.calculate_rsi(prices, 14)
+        ema7 = gen.calculate_ema(prices, 7)
         ema15 = gen.calculate_ema(prices, 15)
         ema_delta = (prices[-1] - ema15) / (ema15 + 1e-9)
+        ema7_delta = (prices[-1] - ema7) / (ema7 + 1e-9)
+        mum_signal, _, _ = gen.calculate_mum_signal(prices, fast=3, slow=9)
 
-        if rsi14 < 30 and ema_delta > -0.02:
-            y = np.random.choice([1, 0], p=[0.72, 0.28])
-        elif rsi14 > 70 and ema_delta < 0.02:
-            y = np.random.choice([0, 1], p=[0.72, 0.28])
+        # Conservative labelling: require MUM + EMA(7) agreement for higher confidence
+        if rsi14 < rsi_low and ema_delta > -0.02:
+            base_p = 0.72
+            # MUM/EMA(7) alignment boosts confidence in conservative mode
+            if CONSERVATIVE_MODE and mum_signal == "BUY" and ema7_delta < 0:
+                base_p = min(0.82, base_p + 0.10)
+            y = np.random.choice([1, 0], p=[base_p, 1 - base_p])
+        elif rsi14 > rsi_high and ema_delta < 0.02:
+            base_p = 0.72
+            if CONSERVATIVE_MODE and mum_signal == "SELL" and ema7_delta > 0:
+                base_p = min(0.82, base_p + 0.10)
+            y = np.random.choice([0, 1], p=[base_p, 1 - base_p])
         else:
             y = np.random.choice([0, 1], p=[0.48, 0.52])
 
@@ -783,7 +1039,14 @@ def generate_training_data_rsi_enhanced(n=650):
 st.set_page_config(layout="wide", page_title="Velora AI - RSI/EMA15 400F", initial_sidebar_state="expanded")
 st.title("🚀 VELORA AI - RSI/EMA15 400 Features")
 st.markdown("**45s refresh | 7s precompute | protection mode | news-aware ensemble**")
-st.caption(f"Protection Mode: {'ON' if PROTECTION_MODE else 'OFF'} | Min Conf: {MIN_CONFIDENCE_TO_TRADE} | Vol Limit: {HIGH_VOL_THRESHOLD}")
+_eff_min_conf = CONSERVATIVE_CONFIG["min_confidence"] if CONSERVATIVE_MODE else MIN_CONFIDENCE_TO_TRADE
+st.caption(
+    f"Protection Mode: {'ON' if PROTECTION_MODE else 'OFF'} | "
+    f"Conservative: {'ON' if CONSERVATIVE_MODE else 'OFF'} | "
+    f"Min Conf: {_eff_min_conf} | "
+    f"Vol Limit: {HIGH_VOL_THRESHOLD} | "
+    f"DL Threshold: {CONSERVATIVE_CONFIG['dl_confidence_threshold'] if CONSERVATIVE_MODE else 0.60:.2f}"
+)
 st.markdown("---")
 
 if "model" not in st.session_state:
@@ -793,6 +1056,11 @@ if "news_analyzer" not in st.session_state:
     st.session_state.news_analyzer = NewsAnalyzer(api_key=NEWS_API_KEY)
 if "protector" not in st.session_state:
     st.session_state.protector = ProtectionEngine()
+if "dl_filter" not in st.session_state:
+    _dl_threshold = (
+        CONSERVATIVE_CONFIG["dl_confidence_threshold"] if CONSERVATIVE_MODE else 0.60
+    )
+    st.session_state.dl_filter = DLConfirmationFilter(threshold=_dl_threshold)
 
 if "last_refresh" not in st.session_state:
     st.session_state.last_refresh = datetime.now() - timedelta(seconds=SCAN_INTERVAL_SEC)
@@ -855,7 +1123,8 @@ with c3:
 
 st.markdown("---")
 
-def run_analysis_round(model, comparator, current_time, news_analyzer, protector):
+def run_analysis_round(model, comparator, current_time, news_analyzer, protector,
+                       dl_filter=None):
     results = []
     with ThreadPoolExecutor(max_workers=6) as executor:
         futures = {
@@ -866,7 +1135,8 @@ def run_analysis_round(model, comparator, current_time, news_analyzer, protector
                 current_time,
                 comparator,
                 news_analyzer,
-                protector
+                protector,
+                dl_filter,
             ): asset
             for asset in ALL_ASSETS
         }
@@ -891,7 +1161,8 @@ if st.session_state.running:
                 st.session_state.comparator,
                 prefetch_time,
                 st.session_state.news_analyzer,
-                st.session_state.protector
+                st.session_state.protector,
+                st.session_state.dl_filter,
             )
             st.session_state.prefetch_time = prefetch_time
 
@@ -907,7 +1178,8 @@ if st.session_state.running:
                     st.session_state.comparator,
                     seed,
                     st.session_state.news_analyzer,
-                    st.session_state.protector
+                    st.session_state.protector,
+                    st.session_state.dl_filter,
                 )
 
         if results:
@@ -934,7 +1206,8 @@ if st.session_state.running:
             st.markdown("---")
             st.subheader("🏆 Top Signals (Confidence)")
             top_df = df.nlargest(20, "Confidence")[
-                ["Asset", "Signal", "Confidence", "DL_Models", "RSI14", "EMA15_Delta", "News_Score", "Blocked_Reason"]
+                ["Asset", "Signal", "Confidence", "DL_Models", "MUM39", "RSI14",
+                 "EMA7_Delta", "EMA15_Delta", "News_Score", "Blocked_Reason"]
             ].copy()
             st.dataframe(top_df, use_container_width=True, hide_index=True)
 
