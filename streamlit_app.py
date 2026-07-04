@@ -30,7 +30,11 @@ from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-from xgboost import XGBClassifier
+try:
+    from xgboost import XGBClassifier
+    XGB_OK = True
+except Exception as e:
+    XGB_OK = False
 from lightgbm import LGBMClassifier
 
 # Data Generation
