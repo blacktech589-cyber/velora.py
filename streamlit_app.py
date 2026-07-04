@@ -33,9 +33,8 @@ from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 try:
     from xgboost import XGBClassifier
     XGB_OK = True
-except Exception as e:
+except Exception:
     XGB_OK = False
-try:
     from lightgbm import LGBMClassifier
     LGBM_OK = True
 except Exception:
