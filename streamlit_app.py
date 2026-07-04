@@ -903,21 +903,29 @@ if st.session_state.running:
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         with st.spinner(f"🔄 TUR {st.session_state.total_rounds}: {len(ALL_ASSETS)} Varlık Taraniyor (20 Model, 1000+ Özellik, 5 Strateji)"):
-            results = []
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            futures = {
-               results == {}
-            with ThreadPoolExecutor(max_workers=8) as executor:
-                futures = {
-                    executor.submit(
-                        advanced_analyze,
-                        asset,
-                        st.session_state.model,
-                        current_time,
-                        st.session_state.comparator
-                    ): asset
-                    for asset in assets
-                }
+         from concurrent.futures import ThreadPoolExecutor, as_completed
+
+results = []
+
+with ThreadPoolExecutor(max_workers=8) as executor:
+    futures = {
+        executor.submit(
+            advanced_analyze,
+            asset,
+            st.session_state.model,
+            current_time,
+            st.session_state.comparator
+        ): asset
+        for asset in assets
+    }
+
+    for future in as_completed(futures):
+        asset = futures[future]
+        try:
+            result = future.result()
+            results.append(result)
+        except Exception as e:
+            print(f"Hata ({asset}): {e}")
                 for future in as_completed(futures):
                     asset = futures[future]
                     try:
