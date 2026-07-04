@@ -906,7 +906,7 @@ if st.session_state.running:
             results = []
             from concurrent.futures import ThreadPoolExecutor, as_completed
             futures = {
-               results = {}
+               results == {}
             with ThreadPoolExecutor(max_workers=8) as executor:
                 futures = {
                     executor.submit(
