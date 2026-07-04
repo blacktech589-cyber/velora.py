@@ -843,10 +843,11 @@ def generate_training_data():
     return X_data, y_data
 
 # Train
-if not st.session_state.model.trained:
-    with st.spinner("🔧 Ultra-Zeki Model Eğitiliyor... (20 Model, 1000+ Özellik)"):
-        X_train, y_train = generate_training_data()
-        st.session_state.model.train(X_train, y_train)
+    if not getattr(st.session_state.model, "trained", False):
+        st.warning("⚠️ Model henüz eğitilmedi")
+        with st.spinner("🔧 Ultra-Zeki Model Eğitiliyor... (20 Model, 1000+ Özellik)"):
+            X_train, y_train = generate_training_data()
+            st.session_state.model.train(X_train, y_train)
 
 # Metrics
 col1, col2, col3, col4, col5, col6 = st.columns(6)
