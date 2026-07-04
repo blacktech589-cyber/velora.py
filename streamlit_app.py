@@ -1,75 +1,114 @@
-import sys
-import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import warnings
-warnings.filterwarnings('ignore')
-
-# ===============================
-# ERROR LOGGING
-# ===============================
-def log_exception(exc_type, exc_value, exc_traceback):
-    with open("hata_log.txt", "w", encoding="utf-8") as f:
-        traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
-
-sys.excepthook = log_exception
-
-# ===============================
-# CORE LIBRARIES
-# ===============================
 import streamlit as st
 import pandas as pd
 import numpy as np
-import time
-import os
-import joblib
-from datetime import datetime, timedelta
-import hashlib
 
-from sklearn.metrics import accuracy_score, precision_score, recall_score
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+from xgboost import XGBClassifier
 
-# ===============================
-# SKLEARN MODELS & TOOLS
-# ===============================
-from sklearn.preprocessing import (
-    StandardScaler, MinMaxScaler, RobustScaler, PolynomialFeatures
+# -------------------------------------------------
+# Yardımcı fonksiyonlar
+# -------------------------------------------------
+
+def color_signal(val):
+    if val == "BUY":
+        return "background-color: #c6f6d5; color: black"
+    elif val == "SELL":
+        return "background-color: #fed7d7; color: black"
+    return ""
+
+# -------------------------------------------------
+# Model Sınıfı (Streamlit Cloud uyumlu)
+# -------------------------------------------------
+
+class UltraIntelligentEnsembleModel:
+    def __init__(self):
+        self.models = {}
+        self._initialize_models()
+
+    def _initialize_models(self):
+        # ⚠️ Streamlit Cloud uyumlu XGBoost
+        self.models["xgb"] = XGBClassifier(
+            n_estimators=300,
+            max_depth=6,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            objective="binary:logistic",
+            random_state=42
+        )
+
+    def train(self, X, y):
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42
+        )
+
+        model = self.models["xgb"]
+        model.fit(X_train, y_train)
+
+        preds = model.predict(X_test)
+        return accuracy_score(y_test, preds)
+
+    def predict(self, X):
+        model = self.models["xgb"]
+        preds = model.predict(X)
+
+        return ["BUY" if p == 1 else "SELL" for p in preds]
+
+# -------------------------------------------------
+# Streamlit App
+# -------------------------------------------------
+
+st.set_page_config(page_title="Velora AI", layout="wide")
+st.title("🚀 Velora AI – Streamlit Cloud Stable Build")
+
+# Session state model (HATA BURADA ÇÖZÜLDÜ)
+if "model" not in st.session_state:
+    st.session_state.model = UltraIntelligentEnsembleModel()
+
+# -------------------------------------------------
+# Örnek veri (senin gerçek verinle değiştirilebilir)
+# -------------------------------------------------
+
+np.random.seed(42)
+
+df = pd.DataFrame({
+    "feature_1": np.random.randn(50),
+    "feature_2": np.random.randn(50),
+    "target": np.random.randint(0, 2, 50)
+})
+
+X = df[["feature_1", "feature_2"]]
+y = df["target"]
+
+# -------------------------------------------------
+# Model eğitimi
+# -------------------------------------------------
+
+if st.button("Modeli Eğit"):
+    acc = st.session_state.model.train(X, y)
+    st.success(f"Model eğitildi ✅ | Accuracy: {acc:.2f}")
+
+# -------------------------------------------------
+# Tahmin ve tablo
+# -------------------------------------------------
+
+signals = st.session_state.model.predict(X)
+
+top_df = pd.DataFrame({
+    "Feature 1": df["feature_1"],
+    "Feature 2": df["feature_2"],
+    "Signal": signals
+})
+
+# ✅ Pandas 2.x FIX (applymap yerine map)
+styled_df = top_df.style.map(
+    color_signal,
+    subset=["Signal"]
 )
 
-from sklearn.ensemble import (
-    RandomForestClassifier,
-    GradientBoostingClassifier,
-    AdaBoostClassifier,
-    ExtraTreesClassifier,
-    VotingClassifier,
-    StackingClassifier,
-    HistGradientBoostingClassifier  # Cloud-safe alternatif
-)
-
-from sklearn.neural_network import MLPClassifier
-from sklearn.svm import SVC
-from sklearn.decomposition import PCA
-from sklearn.linear_model import LogisticRegression
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-
-# ===============================
-# OPTIONAL ML LIBRARIES (CLOUD SAFE)
-# ===============================
-
-# --- XGBoost ---
-try:
-    from xgboost import XGBClassifier
-    XGB_OK = True
-except Exception:
-    XGBClassifier = None
-    XGB_OK = False
-
-# --- LightGBM ---
-try:
-    from lightgbm import LGBMClassifier
-    LGBM_OK = True
-except Exception:
-    LGBMClassifier = None
-    LGBM_OK = False
+st.subheader("📊 Sinyal Tablosu")
+st.dataframe(styled_df, use_container_width=True)
 # Data Generation
 from sklearn.datasets import make_classification
 
