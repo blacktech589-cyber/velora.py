@@ -40,7 +40,7 @@ SCAN_INTERVAL_SEC = 45
 PREDICTION_LEAD_SEC = 7
 
 PROTECTION_MODE = True
-MIN_CONFIDENCE_TO_TRADE = 78
+MIN_CONFIDENCE_TO_TRADE = 90
 HIGH_VOL_THRESHOLD = 0.045
 NEWS_TIMEOUT_SEC = 6
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
@@ -50,10 +50,14 @@ NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
 # ==============================
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.ensemble import (
+    RandomForestClassifier, GradientBoostingClassifier,
+    ExtraTreesClassifier, AdaBoostClassifier, HistGradientBoostingClassifier,
+)
 from sklearn.neural_network import MLPClassifier
 from sklearn.svm import SVC
 from sklearn.neighbors import KNeighborsClassifier
+from sklearn.linear_model import LogisticRegression
 
 # ==============================
 # SAFE XGBOOST & LGBM IMPORT
@@ -149,6 +153,96 @@ class SignalGenerator:
         lower = sma - std_dev * std
         pos = (prices[-1] - lower) / (upper - lower) if (upper - lower) != 0 else 0.5
         return float(sma), float(upper), float(lower), float(pos)
+
+    def calculate_stochastic(self, prices, k_period=14, d_period=3):
+        """Stochastic Oscillator – returns (%K, %D)."""
+        if len(prices) < k_period + d_period:
+            return 50.0, 50.0
+        k_vals = []
+        for i in range(d_period):
+            end = len(prices) - i
+            seg = prices[end - k_period: end]
+            high = np.max(seg); low = np.min(seg)
+            k_vals.append(100.0 * (seg[-1] - low) / (high - low + 1e-9))
+        return float(k_vals[0]), float(np.mean(k_vals))
+
+    def calculate_williams_r(self, prices, period=14):
+        """Williams %R."""
+        if len(prices) < period:
+            return -50.0
+        seg = prices[-period:]
+        high = np.max(seg); low = np.min(seg)
+        return float(-100.0 * (high - prices[-1]) / (high - low + 1e-9))
+
+    def calculate_cci(self, prices, period=20):
+        """Commodity Channel Index."""
+        if len(prices) < period:
+            return 0.0
+        seg = prices[-period:]
+        mean_p = np.mean(seg)
+        mean_dev = np.mean(np.abs(seg - mean_p))
+        return float((prices[-1] - mean_p) / (0.015 * mean_dev + 1e-9))
+
+    def calculate_adx(self, prices, period=14):
+        """Simplified ADX (directional movement strength)."""
+        if len(prices) < period + 1:
+            return 25.0
+        diffs = np.diff(prices[-(period + 1):])
+        pos_dm = float(np.sum(diffs[diffs > 0]))
+        neg_dm = float(np.sum(np.abs(diffs[diffs < 0])))
+        total = pos_dm + neg_dm
+        if total == 0:
+            return 0.0
+        di_plus = 100.0 * pos_dm / total
+        di_minus = 100.0 * neg_dm / total
+        return float(100.0 * abs(di_plus - di_minus) / (di_plus + di_minus + 1e-9))
+
+    def calculate_roc(self, prices, period=10):
+        """Rate of Change (%)."""
+        if len(prices) < period + 1:
+            return 0.0
+        return float(100.0 * (prices[-1] - prices[-period - 1]) / (prices[-period - 1] + 1e-9))
+
+    def calculate_aroon(self, prices, period=25):
+        """Aroon Up / Down."""
+        if len(prices) < period + 1:
+            return 50.0, 50.0
+        seg = prices[-(period + 1):]
+        high_idx = int(np.argmax(seg))
+        low_idx  = int(np.argmin(seg))
+        aroon_up   = 100.0 * high_idx / period
+        aroon_down = 100.0 * low_idx  / period
+        return float(aroon_up), float(aroon_down)
+
+    def calculate_donchian(self, prices, period=20):
+        """Donchian Channel – returns (upper, lower, position 0-1)."""
+        if len(prices) < period:
+            return float(prices[-1]), float(prices[-1]), 0.5
+        seg = prices[-period:]
+        upper = float(np.max(seg)); lower = float(np.min(seg))
+        pos = (prices[-1] - lower) / (upper - lower + 1e-9)
+        return upper, lower, float(pos)
+
+    def calculate_dpo(self, prices, period=20):
+        """Detrended Price Oscillator."""
+        offset = period // 2 + 1
+        if len(prices) < period + offset:
+            return 0.0
+        sma = float(np.mean(prices[-(period + offset): -offset]))
+        return float(prices[-1] - sma)
+
+    def calculate_stochastic_rsi(self, prices, rsi_period=14, stoch_period=14):
+        """Stochastic RSI (0-1)."""
+        if len(prices) < rsi_period + stoch_period:
+            return 0.5
+        rsi_vals = []
+        for i in range(stoch_period):
+            end = len(prices) - i
+            seg = prices[max(0, end - rsi_period - 1): end]
+            rsi_vals.append(self.calculate_rsi(seg, min(rsi_period, max(1, len(seg) - 1))))
+        rsi_arr = np.array(rsi_vals, dtype=np.float64)
+        high = np.max(rsi_arr); low = np.min(rsi_arr)
+        return float((rsi_vals[0] - low) / (high - low + 1e-9))
 
     def calculate_ultra_400_features(self, prices):
         eps = 1e-9
@@ -280,10 +374,103 @@ class SignalGenerator:
         feats = np.nan_to_num(feats, nan=0.0, posinf=0.1, neginf=-0.1)
         feats = np.clip(feats, -10, 10)
 
-        if len(feats) < 400:
-            feats = np.concatenate([feats, np.zeros(400 - len(feats), dtype=np.float32)])
-        elif len(feats) > 400:
-            feats = feats[:400]
+        # ==============================
+        # EXTENDED INDICATOR FEATURES
+        # ==============================
+        ext = []
+
+        # Stochastic (14,3)
+        stoch_k, stoch_d = self.calculate_stochastic(p, 14, 3)
+        ext.extend([stoch_k / 100.0, stoch_d / 100.0, (stoch_k - stoch_d) / 100.0])
+
+        # Williams %R
+        wr14 = self.calculate_williams_r(p, 14)
+        ext.append((wr14 + 50.0) / 100.0)
+
+        # CCI
+        cci20 = self.calculate_cci(p, 20)
+        ext.append(float(np.clip(cci20 / 200.0, -1.0, 1.0)))
+
+        # ADX
+        adx14 = self.calculate_adx(p, 14)
+        ext.append(adx14 / 100.0)
+
+        # ROC multi-period
+        for roc_p in [5, 10, 20, 30]:
+            ext.append(float(np.clip(self.calculate_roc(p, roc_p) / 20.0, -1.0, 1.0)))
+
+        # Aroon (25)
+        aroon_up25, aroon_down25 = self.calculate_aroon(p, 25)
+        ext.extend([aroon_up25 / 100.0, aroon_down25 / 100.0, (aroon_up25 - aroon_down25) / 100.0])
+
+        # Aroon (14)
+        aroon_up14, aroon_down14 = self.calculate_aroon(p, 14)
+        ext.extend([aroon_up14 / 100.0, aroon_down14 / 100.0])
+
+        # Donchian channels (10, 20, 50)
+        for don_p in [10, 20, 50]:
+            _, _, don_pos = self.calculate_donchian(p, don_p)
+            ext.append(don_pos)
+
+        # DPO (10, 20)
+        for dpo_p in [10, 20]:
+            dpo_v = self.calculate_dpo(p, dpo_p)
+            ext.append(float(np.clip(dpo_v / (p[-1] + eps) * 10.0, -1.0, 1.0)))
+
+        # Stochastic RSI
+        stoch_rsi = self.calculate_stochastic_rsi(p, 14, 14)
+        ext.append(stoch_rsi)
+
+        # Multi-period Stochastic
+        for sk_p in [5, 9, 21]:
+            sk, sd = self.calculate_stochastic(p, sk_p, 3)
+            ext.extend([sk / 100.0, sd / 100.0])
+
+        # Multi-period Williams %R
+        for wr_p in [7, 21]:
+            ext.append((self.calculate_williams_r(p, wr_p) + 50.0) / 100.0)
+
+        # Multi-period CCI
+        for cci_p in [10, 40]:
+            ext.append(float(np.clip(self.calculate_cci(p, cci_p) / 200.0, -1.0, 1.0)))
+
+        # Multi-period ADX
+        for adx_p in [7, 21]:
+            ext.append(self.calculate_adx(p, adx_p) / 100.0)
+
+        # Cross-indicator confluence signals
+        rsi_sig  = 1.0 if rsi14 < 35 else (-1.0 if rsi14 > 65 else 0.0)
+        macd_sig = 1.0 if macd_hist > 0 else -1.0
+        bb_sig   = 1.0 if bb_pos20 < 0.2 else (-1.0 if bb_pos20 > 0.8 else 0.0)
+        sk_sig   = 1.0 if stoch_k < 20 else (-1.0 if stoch_k > 80 else 0.0)
+        cci_sig  = 1.0 if cci20 < -100 else (-1.0 if cci20 > 100 else 0.0)
+        wr_sig   = 1.0 if wr14 < -80 else (-1.0 if wr14 > -20 else 0.0)
+        ar_sig   = 1.0 if aroon_up25 > aroon_down25 else -1.0
+        roc_sig  = 1.0 if self.calculate_roc(p, 10) > 0 else -1.0
+
+        confluence = np.array([rsi_sig, macd_sig, bb_sig, sk_sig, cci_sig, wr_sig, ar_sig, roc_sig])
+        ext.extend([
+            float(np.mean(confluence)),
+            float(np.sum(confluence > 0) / len(confluence)),
+            float(np.sum(confluence < 0) / len(confluence)),
+            adx14 / 100.0,
+            float((adx14 / 100.0) * np.mean(confluence)),
+        ])
+
+        # ADX × each signal
+        for sig in [rsi_sig, macd_sig, bb_sig, sk_sig]:
+            ext.append(sig * adx14 / 100.0)
+
+        ext = np.array(ext, dtype=np.float32)
+        ext = np.nan_to_num(ext, nan=0.0, posinf=0.1, neginf=-0.1)
+        ext = np.clip(ext, -10.0, 10.0)
+
+        feats = np.concatenate([feats, ext])
+
+        if len(feats) < 650:
+            feats = np.concatenate([feats, np.zeros(650 - len(feats), dtype=np.float32)])
+        elif len(feats) > 650:
+            feats = feats[:650]
 
         return feats
 
@@ -424,7 +611,7 @@ class RSIRegimeEnsemble:
         self.trained = False
         self.models = {}
         self.model_weights = {}
-        self.feature_importance_ = np.zeros(400, dtype=np.float64)
+        self.feature_importance_ = np.zeros(650, dtype=np.float64)
         self._build_model_pool()
 
     def _build_model_pool(self):
@@ -434,11 +621,22 @@ class RSIRegimeEnsemble:
             "mlp_3": MLPClassifier(hidden_layer_sizes=(256, 128), max_iter=500, random_state=44, early_stopping=True),
             "mlp_4": MLPClassifier(hidden_layer_sizes=(128, 128, 64), max_iter=500, random_state=45, early_stopping=True),
             "mlp_5": MLPClassifier(hidden_layer_sizes=(32, 16), max_iter=300, random_state=46, early_stopping=True),
+            "mlp_6": MLPClassifier(hidden_layer_sizes=(200, 100, 50), max_iter=600, random_state=47, early_stopping=True),
+            "mlp_7": MLPClassifier(hidden_layer_sizes=(64, 64, 64), max_iter=500, random_state=48, early_stopping=True),
             "rf_1": RandomForestClassifier(n_estimators=250, max_depth=10, random_state=42, n_jobs=-1),
             "rf_2": RandomForestClassifier(n_estimators=300, max_depth=12, random_state=43, n_jobs=-1),
+            "et_1": ExtraTreesClassifier(n_estimators=250, max_depth=10, random_state=42, n_jobs=-1),
+            "et_2": ExtraTreesClassifier(n_estimators=300, max_depth=None, random_state=43, n_jobs=-1),
             "gb_1": GradientBoostingClassifier(n_estimators=250, learning_rate=0.03, max_depth=4, random_state=42),
+            "gb_2": GradientBoostingClassifier(n_estimators=200, learning_rate=0.05, max_depth=3, random_state=43),
+            "hgb_1": HistGradientBoostingClassifier(max_iter=300, learning_rate=0.03, max_depth=6, random_state=42),
+            "hgb_2": HistGradientBoostingClassifier(max_iter=200, learning_rate=0.05, max_depth=4, random_state=43),
+            "ada_1": AdaBoostClassifier(n_estimators=200, learning_rate=0.05, random_state=42),
             "svm_1": SVC(C=1.2, kernel="rbf", gamma="scale", probability=True, random_state=42),
+            "svm_2": SVC(C=2.0, kernel="rbf", gamma="auto",  probability=True, random_state=43),
             "knn_1": KNeighborsClassifier(n_neighbors=7, weights="distance"),
+            "knn_2": KNeighborsClassifier(n_neighbors=15, weights="distance"),
+            "lr_1":  LogisticRegression(C=1.0, max_iter=500, random_state=42, n_jobs=-1),
         }
 
         if XGB_AVAILABLE:
@@ -447,11 +645,21 @@ class RSIRegimeEnsemble:
                 subsample=0.85, colsample_bytree=0.85, random_state=42,
                 n_jobs=-1, verbosity=0
             )
+            self.models["xgb_2"] = XGBClassifier(
+                n_estimators=200, max_depth=4, learning_rate=0.05,
+                subsample=0.8, colsample_bytree=0.8, random_state=43,
+                n_jobs=-1, verbosity=0
+            )
         if LGBM_AVAILABLE:
             self.models["lgb_1"] = LGBMClassifier(
                 n_estimators=300, max_depth=6, learning_rate=0.03,
                 num_leaves=40, subsample=0.85, colsample_bytree=0.85,
                 random_state=42, n_jobs=-1, verbose=-1
+            )
+            self.models["lgb_2"] = LGBMClassifier(
+                n_estimators=200, max_depth=4, learning_rate=0.05,
+                num_leaves=31, subsample=0.8, colsample_bytree=0.8,
+                random_state=43, n_jobs=-1, verbose=-1
             )
 
         n = max(1, len(self.models))
@@ -478,7 +686,7 @@ class RSIRegimeEnsemble:
                 else:
                     continue
 
-                if imp.shape[0] != 400:
+                if imp.shape[0] != 650:
                     continue
 
                 imp = np.nan_to_num(imp, nan=0.0, posinf=0.0, neginf=0.0)
@@ -491,7 +699,7 @@ class RSIRegimeEnsemble:
                 continue
 
         if len(importances) == 0:
-            self.feature_importance_ = np.zeros(400, dtype=np.float64)
+            self.feature_importance_ = np.zeros(650, dtype=np.float64)
             return
 
         W = np.array(mweights, dtype=np.float64)
@@ -518,7 +726,7 @@ class RSIRegimeEnsemble:
         X = np.nan_to_num(X, nan=0.0, posinf=0.1, neginf=-0.1)
         X = np.clip(X, -10, 10)
 
-        if X.ndim != 2 or X.shape[1] != 400:
+        if X.ndim != 2 or X.shape[1] != 650:
             return
 
         Xs = self.scaler.fit_transform(X)
@@ -550,7 +758,7 @@ class RSIRegimeEnsemble:
         x = np.nan_to_num(x, nan=0.0, posinf=0.1, neginf=-0.1)
         x = np.clip(x, -10, 10)
 
-        if x.shape[1] != 400:
+        if x.shape[1] != 650:
             return None, 50, 0
 
         xs = self.scaler.transform(x)
@@ -592,21 +800,107 @@ class RSIRegimeEnsemble:
 class StrategyComparator:
     def analyze_strategies(self, prices, asset):
         results = {}
+        gen = SignalGenerator(asset)
         try:
-            results['Trend'] = "BUY" if (prices[-1] - prices[-28] > 0) else "SELL" if len(prices) > 28 else "BUY"
-            results['MeanRev'] = "BUY" if (prices[-1] < np.mean(prices[-20:])) else "SELL" if len(prices) > 20 else "BUY"
-            results['Momentum'] = "BUY" if (np.mean(np.diff(prices[-7:])) > 0) else "SELL" if len(prices) > 7 else "BUY"
+            # 1. Trend (28-period)
+            results['Trend'] = "BUY" if len(prices) > 28 and prices[-1] > prices[-28] else ("SELL" if len(prices) > 28 else "BUY")
 
+            # 2. Mean Reversion
+            results['MeanRev'] = "BUY" if len(prices) > 20 and prices[-1] < np.mean(prices[-20:]) else ("SELL" if len(prices) > 20 else "BUY")
+
+            # 3. Short Momentum
+            results['Momentum'] = "BUY" if len(prices) > 7 and np.mean(np.diff(prices[-7:])) > 0 else ("SELL" if len(prices) > 7 else "BUY")
+
+            # 4. Channel
             if len(prices) > 28:
-                high = np.max(prices[-28:])
-                low = np.min(prices[-28:])
+                high = np.max(prices[-28:]); low = np.min(prices[-28:])
                 results['Channel'] = "BUY" if prices[-1] > (high + low) / 2 else "SELL"
             else:
                 results['Channel'] = "BUY"
 
-            results['Volatility'] = "BUY" if (np.std(np.diff(prices[-14:])) > 0) else "SELL" if len(prices) > 14 else "BUY"
+            # 5. Volatility
+            results['Volatility'] = "BUY" if len(prices) > 14 and np.std(np.diff(prices[-14:])) > 0 else ("SELL" if len(prices) > 14 else "BUY")
+
+            # 6. RSI Strategy
+            rsi14 = gen.calculate_rsi(prices, 14)
+            results['RSI'] = "BUY" if rsi14 < 35 else ("SELL" if rsi14 > 65 else "NO-TRADE")
+
+            # 7. MACD Strategy
+            _, _, macd_hist = gen.calculate_macd(prices)
+            results['MACD'] = "BUY" if macd_hist > 0 else "SELL"
+
+            # 8. Bollinger Strategy
+            _, _, _, bb_pos = gen.calculate_bollinger_bands(prices, 20, 2)
+            results['Bollinger'] = "BUY" if bb_pos < 0.2 else ("SELL" if bb_pos > 0.8 else "NO-TRADE")
+
+            # 9. Stochastic Strategy
+            stoch_k, stoch_d = gen.calculate_stochastic(prices, 14, 3)
+            if stoch_k < 20 and stoch_k > stoch_d:
+                results['Stochastic'] = "BUY"
+            elif stoch_k > 80 and stoch_k < stoch_d:
+                results['Stochastic'] = "SELL"
+            else:
+                results['Stochastic'] = "NO-TRADE"
+
+            # 10. Williams %R
+            wr = gen.calculate_williams_r(prices, 14)
+            results['WilliamsR'] = "BUY" if wr < -80 else ("SELL" if wr > -20 else "NO-TRADE")
+
+            # 11. CCI Strategy
+            cci = gen.calculate_cci(prices, 20)
+            results['CCI'] = "BUY" if cci < -100 else ("SELL" if cci > 100 else "NO-TRADE")
+
+            # 12. Aroon Strategy
+            aroon_up, aroon_down = gen.calculate_aroon(prices, 25)
+            if aroon_up > 70 and aroon_up > aroon_down:
+                results['Aroon'] = "BUY"
+            elif aroon_down > 70 and aroon_down > aroon_up:
+                results['Aroon'] = "SELL"
+            else:
+                results['Aroon'] = "NO-TRADE"
+
+            # 13. ADX Trend Strength
+            adx = gen.calculate_adx(prices, 14)
+            ema_fast = gen.calculate_ema(prices, 7)
+            ema_slow = gen.calculate_ema(prices, 21)
+            if adx > 25 and ema_fast > ema_slow:
+                results['ADX_Trend'] = "BUY"
+            elif adx > 25 and ema_fast < ema_slow:
+                results['ADX_Trend'] = "SELL"
+            else:
+                results['ADX_Trend'] = "NO-TRADE"
+
+            # 14. EMA Cross (triple alignment)
+            ema7  = gen.calculate_ema(prices, 7)
+            ema21 = gen.calculate_ema(prices, 21)
+            ema50 = gen.calculate_ema(prices, 50)
+            if ema7 > ema21 > ema50:
+                results['EMACross'] = "BUY"
+            elif ema7 < ema21 < ema50:
+                results['EMACross'] = "SELL"
+            else:
+                results['EMACross'] = "NO-TRADE"
+
+            # 15. Donchian Breakout
+            _, _, don_pos = gen.calculate_donchian(prices, 20)
+            results['Donchian'] = "BUY" if don_pos > 0.8 else ("SELL" if don_pos < 0.2 else "NO-TRADE")
+
+            # 16. ROC Strategy
+            roc = gen.calculate_roc(prices, 10)
+            results['ROC'] = "BUY" if roc > 2.0 else ("SELL" if roc < -2.0 else "NO-TRADE")
+
+            # 17. DPO Strategy
+            dpo = gen.calculate_dpo(prices, 20)
+            results['DPO'] = "BUY" if dpo > 0 else "SELL"
+
         except Exception:
-            results = {'Trend': "BUY", 'MeanRev': "BUY", 'Momentum': "BUY", 'Channel': "BUY", 'Volatility': "BUY"}
+            results = {
+                'Trend': "BUY", 'MeanRev': "BUY", 'Momentum': "BUY", 'Channel': "BUY",
+                'Volatility': "BUY", 'RSI': "BUY", 'MACD': "BUY", 'Bollinger': "BUY",
+                'Stochastic': "BUY", 'WilliamsR': "BUY", 'CCI': "BUY", 'Aroon': "BUY",
+                'ADX_Trend': "BUY", 'EMACross': "BUY", 'Donchian': "BUY", 'ROC': "BUY",
+                'DPO': "BUY",
+            }
         return results
 
 # ==============================
@@ -641,8 +935,10 @@ def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protect
             confidence = 72
 
         strategies = comparator.analyze_strategies(prices, asset)
-        strategy_agreement = sum(1 for s in strategies.values() if (s == "BUY") == signal)
-        confidence = max(60, min(99, int(confidence + strategy_agreement)))
+        active_strats = max(1, sum(1 for s in strategies.values() if s != "NO-TRADE"))
+        strategy_agreement = sum(1 for s in strategies.values() if s != "NO-TRADE" and (s == "BUY") == signal)
+        strategy_score = int(round((strategy_agreement / active_strats) * 10))
+        confidence = max(60, min(99, int(confidence + strategy_score)))
 
         news_score, headlines = news_analyzer.score_asset_news(asset)
 
@@ -755,22 +1051,77 @@ def save_to_excel(results):
 # ==============================
 # TRAINING DATA
 # ==============================
-def generate_training_data_rsi_enhanced(n=650):
+def generate_training_data_rsi_enhanced(n=800):
     X_data, y_data = [], []
     for i in range(n):
         gen = SignalGenerator(f"train_{i}", datetime.now().strftime("%Y-%m-%d"))
         prices = gen.generate_realistic_prices(120)
         features = gen.calculate_ultra_400_features(prices)
+
+        # Multi-indicator confluence scoring
         rsi14 = gen.calculate_rsi(prices, 14)
         ema15 = gen.calculate_ema(prices, 15)
         ema_delta = (prices[-1] - ema15) / (ema15 + 1e-9)
+        _, _, macd_hist = gen.calculate_macd(prices)
+        _, _, _, bb_pos = gen.calculate_bollinger_bands(prices, 20, 2)
+        stoch_k, stoch_d = gen.calculate_stochastic(prices, 14, 3)
+        cci = gen.calculate_cci(prices, 20)
+        williams_r = gen.calculate_williams_r(prices, 14)
+        aroon_up, aroon_down = gen.calculate_aroon(prices, 25)
+        roc = gen.calculate_roc(prices, 10)
+        adx = gen.calculate_adx(prices, 14)
 
-        if rsi14 < 30 and ema_delta > -0.02:
-            y = np.random.choice([1, 0], p=[0.72, 0.28])
-        elif rsi14 > 70 and ema_delta < 0.02:
-            y = np.random.choice([0, 1], p=[0.72, 0.28])
+        buy_votes = 0; sell_votes = 0
+
+        # RSI (weight 2 for extreme zones)
+        if rsi14 < 35:   buy_votes += 2
+        elif rsi14 > 65: sell_votes += 2
+
+        if ema_delta > 0.005:   buy_votes += 1
+        elif ema_delta < -0.005: sell_votes += 1
+
+        if macd_hist > 0: buy_votes += 1
+        else:             sell_votes += 1
+
+        if bb_pos < 0.25:  buy_votes += 1
+        elif bb_pos > 0.75: sell_votes += 1
+
+        if stoch_k < 25:   buy_votes += 1
+        elif stoch_k > 75: sell_votes += 1
+
+        if stoch_k > stoch_d: buy_votes += 1
+        else:                 sell_votes += 1
+
+        if cci < -100:   buy_votes += 1
+        elif cci > 100:  sell_votes += 1
+
+        if williams_r < -80:  buy_votes += 1
+        elif williams_r > -20: sell_votes += 1
+
+        if aroon_up > aroon_down:   buy_votes += 1
+        elif aroon_down > aroon_up: sell_votes += 1
+
+        if roc > 1.0:    buy_votes += 1
+        elif roc < -1.0: sell_votes += 1
+
+        # ADX boosts confidence of dominant direction
+        adx_boost = 2 if adx > 30 else (1 if adx > 20 else 0)
+        if buy_votes > sell_votes:   buy_votes += adx_boost
+        elif sell_votes > buy_votes: sell_votes += adx_boost
+
+        total = buy_votes + sell_votes
+        buy_ratio = buy_votes / total if total > 0 else 0.5
+
+        if buy_ratio >= 0.70:
+            y = np.random.choice([1, 0], p=[0.82, 0.18])
+        elif buy_ratio >= 0.60:
+            y = np.random.choice([1, 0], p=[0.70, 0.30])
+        elif buy_ratio <= 0.30:
+            y = np.random.choice([0, 1], p=[0.82, 0.18])
+        elif buy_ratio <= 0.40:
+            y = np.random.choice([0, 1], p=[0.70, 0.30])
         else:
-            y = np.random.choice([0, 1], p=[0.48, 0.52])
+            y = np.random.choice([0, 1], p=[0.50, 0.50])
 
         X_data.append(features)
         y_data.append(y)
@@ -780,9 +1131,9 @@ def generate_training_data_rsi_enhanced(n=650):
 # ==============================
 # STREAMLIT UI
 # ==============================
-st.set_page_config(layout="wide", page_title="Velora AI - RSI/EMA15 400F", initial_sidebar_state="expanded")
-st.title("🚀 VELORA AI - RSI/EMA15 400 Features")
-st.markdown("**45s refresh | 7s precompute | protection mode | news-aware ensemble**")
+st.set_page_config(layout="wide", page_title="Velora AI - Deep Ensemble 650F", initial_sidebar_state="expanded")
+st.title("🚀 VELORA AI - Deep Ensemble | 650 Features | 17 Strategies | 21+ Models")
+st.markdown("**45s refresh | 7s precompute | 90% confidence threshold | 17-strategy confluence | news-aware**")
 st.caption(f"Protection Mode: {'ON' if PROTECTION_MODE else 'OFF'} | Min Conf: {MIN_CONFIDENCE_TO_TRADE} | Vol Limit: {HIGH_VOL_THRESHOLD}")
 st.markdown("---")
 
@@ -810,9 +1161,9 @@ if "prefetch_time" not in st.session_state:
     st.session_state.prefetch_time = None
 
 if not getattr(st.session_state.model, "trained", False):
-    with st.spinner("🔧 Training RSI/EMA15 400F ensemble..."):
+    with st.spinner("🔧 Training Deep Ensemble (650F, 800 samples, 21+ models)..."):
         try:
-            X_train, y_train = generate_training_data_rsi_enhanced(650)
+            X_train, y_train = generate_training_data_rsi_enhanced(800)
             st.session_state.model.train(X_train, y_train)
         except Exception as e:
             st.error(f"Training error: {str(e)}")
@@ -843,15 +1194,19 @@ with c2:
         st.session_state.prefetch_time = None
         st.rerun()
 with c3:
-    if st.button("📥 DOWNLOAD", use_container_width=True):
-        if os.path.exists(EXCEL_FILE):
-            with open(EXCEL_FILE, "rb") as f:
-                st.download_button(
-                    "📊 Excel",
-                    f,
-                    f"Velora_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
+    if os.path.exists(EXCEL_FILE):
+        with open(EXCEL_FILE, "rb") as _ef:
+            _excel_bytes = _ef.read()
+        st.download_button(
+            "📥 DOWNLOAD Excel",
+            _excel_bytes,
+            f"Velora_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    else:
+        st.button("📥 DOWNLOAD", disabled=True, use_container_width=True,
+                  help="Henüz sinyal kaydedilmedi. Scan çalıştır.")
 
 st.markdown("---")
 
