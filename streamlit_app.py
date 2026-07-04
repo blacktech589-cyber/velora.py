@@ -35,11 +35,8 @@ try:
     XGB_OK = True
 except Exception:
     XGB_OK = False
-    try:
+   try:
     from lightgbm import LGBMClassifier
-    LGBM_OK = True
-except Exception:
-    LGBM_OK = False
     LGBM_OK = True
 except Exception:
     LGBM_OK = False
