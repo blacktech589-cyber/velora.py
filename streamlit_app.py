@@ -990,17 +990,16 @@ max_workers = os.cpu_count() or 4
 with ThreadPoolExecutor(max_workers=max_workers) as executor:
     futures = [
         executor.submit(
-            self._train_single_model,
+            advanced_analyze,   # veya doğru fonksiyon
             model_name,
             model,
             X,
             y
         )
-        for model_name, model in self.models.items()
+        for model_name, model in models.items()
     ]
 
     results = []
-
     for future in as_completed(futures):
         try:
             result = future.result()
