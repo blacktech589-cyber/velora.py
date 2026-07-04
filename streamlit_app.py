@@ -61,6 +61,15 @@ PRICE_LIMIT = 120
 USE_BINOMO_SCREEN = os.getenv("USE_BINOMO_SCREEN", "false").lower() == "true"
 
 # ==============================
+# EMA TREND REVERSAL PULLBACK SIGNAL DEFAULTS
+# Configurable via sidebar; env vars set baseline defaults.
+# ==============================
+EMA_PULLBACK_PERIOD = int(os.getenv("EMA_PULLBACK_PERIOD", "30"))
+EMA_PULLBACK_LOOKBACK = int(os.getenv("EMA_PULLBACK_LOOKBACK", "30"))
+EMA_PULLBACK_MIN_CANDLES = int(os.getenv("EMA_PULLBACK_MIN_CANDLES", "2"))
+EMA_PULLBACK_DELAY_SEC = float(os.getenv("EMA_PULLBACK_DELAY_SEC", "3"))
+
+# ==============================
 # CONFIRMATION CONFIG (4-15 + INDICATORS)
 # BUY = düşüşten sonra al
 # SELL = yükselişten sonra sat
@@ -824,6 +833,171 @@ class StrategyComparator:
         return results
 
 # ==============================
+# EMA TREND REVERSAL PULLBACK SIGNAL
+# ==============================
+class EmaTrendReversalSignal:
+    """
+    Detects BUY/SELL reversal setups using an EMA trend filter + pullback counter.
+
+    BUY  logic: EMA uptrend over trend_lookback candles
+                → at least min_pullback_candles consecutive down candles (pullback)
+                → last candle reverses up
+                → after signal_delay_sec seconds, emit BUY (if conditions still met).
+
+    SELL logic: EMA downtrend over trend_lookback candles
+                → at least min_pullback_candles consecutive up candles (pullback)
+                → last candle reverses down
+                → after signal_delay_sec seconds, emit SELL.
+    """
+
+    def __init__(self, ema_period=30, trend_lookback=30, min_pullback_candles=2, signal_delay_sec=3.0):
+        self.ema_period = ema_period
+        self.trend_lookback = trend_lookback
+        self.min_pullback_candles = min_pullback_candles
+        self.signal_delay_sec = float(signal_delay_sec)
+        # Timestamps for pending signals (set when reversal is first detected)
+        self.pending_buy_since = None
+        self.pending_sell_since = None
+
+    def update_params(self, ema_period, trend_lookback, min_pullback_candles, signal_delay_sec):
+        """Apply new panel settings; reset pending state when params change."""
+        if (
+            self.ema_period != ema_period
+            or self.trend_lookback != trend_lookback
+            or self.min_pullback_candles != min_pullback_candles
+            or self.signal_delay_sec != float(signal_delay_sec)
+        ):
+            self.ema_period = ema_period
+            self.trend_lookback = trend_lookback
+            self.min_pullback_candles = min_pullback_candles
+            self.signal_delay_sec = float(signal_delay_sec)
+            self.pending_buy_since = None
+            self.pending_sell_since = None
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+    def _ema_series(self, prices):
+        """Compute EMA array via pandas ewm for numerical stability."""
+        return pd.Series(prices, dtype=np.float64).ewm(span=self.ema_period, adjust=False).mean().to_numpy()
+
+    def _trend_up(self, ema):
+        """Return True if EMA end > EMA start over the lookback window."""
+        if len(ema) < self.trend_lookback + 1:
+            return False
+        w = ema[-(self.trend_lookback + 1):]
+        return w[-1] > w[0]
+
+    def _trend_down(self, ema):
+        """Return True if EMA end < EMA start over the lookback window."""
+        if len(ema) < self.trend_lookback + 1:
+            return False
+        w = ema[-(self.trend_lookback + 1):]
+        return w[-1] < w[0]
+
+    @staticmethod
+    def _consecutive_down_before_last(prices):
+        """Count consecutive falling candles ending just before the last price."""
+        c, i = 0, len(prices) - 2
+        while i > 0 and prices[i] < prices[i - 1]:
+            c += 1
+            i -= 1
+        return c
+
+    @staticmethod
+    def _consecutive_up_before_last(prices):
+        """Count consecutive rising candles ending just before the last price."""
+        c, i = 0, len(prices) - 2
+        while i > 0 and prices[i] > prices[i - 1]:
+            c += 1
+            i -= 1
+        return c
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+    def check_signal(self, prices):
+        """
+        Call on every new price update.
+
+        Parameters
+        ----------
+        prices : array-like of float
+            Closing price series (most recent last).
+
+        Returns
+        -------
+        "BUY", "SELL", or None
+        """
+        prices = np.asarray(prices, dtype=np.float64)
+        min_len = max(self.ema_period, self.trend_lookback) + 5
+        if len(prices) < min_len:
+            return None
+
+        ema = self._ema_series(prices)
+        trend_up = self._trend_up(ema)
+        trend_down = self._trend_down(ema)
+
+        # Direction of the most recent candle
+        last_up = prices[-1] > prices[-2]
+        last_down = prices[-1] < prices[-2]
+
+        # Pullback depth (candles before the last one)
+        down_count = self._consecutive_down_before_last(prices)
+        up_count = self._consecutive_up_before_last(prices)
+
+        now = time.time()
+
+        # --- BUY setup: uptrend + pullback (down) + reversal candle up ---
+        if trend_up and down_count >= self.min_pullback_candles and last_up:
+            if self.pending_buy_since is None:
+                self.pending_buy_since = now
+        else:
+            self.pending_buy_since = None  # reset if conditions no longer met
+
+        # --- SELL setup: downtrend + pullback (up) + reversal candle down ---
+        if trend_down and up_count >= self.min_pullback_candles and last_down:
+            if self.pending_sell_since is None:
+                self.pending_sell_since = now
+        else:
+            self.pending_sell_since = None
+
+        # --- Emit after delay (conditions must still be valid at emit time) ---
+        if self.pending_buy_since is not None and (now - self.pending_buy_since) >= self.signal_delay_sec:
+            self.pending_buy_since = None
+            self.pending_sell_since = None
+            return "BUY"
+
+        if self.pending_sell_since is not None and (now - self.pending_sell_since) >= self.signal_delay_sec:
+            self.pending_sell_since = None
+            self.pending_buy_since = None
+            return "SELL"
+
+        return None
+
+
+# Per-asset EmaTrendReversalSignal instances (module-level, persist across Streamlit reruns).
+# Each asset gets its own instance so pending timers are independent.
+_ema_reversal_instances = {}  # type: dict[str, EmaTrendReversalSignal]
+
+
+def _get_ema_reversal(asset, ema_period, trend_lookback, min_pullback_candles, signal_delay_sec):
+    """Return (or create) the EmaTrendReversalSignal instance for *asset*, applying current params."""
+    if asset not in _ema_reversal_instances:
+        _ema_reversal_instances[asset] = EmaTrendReversalSignal(
+            ema_period=ema_period,
+            trend_lookback=trend_lookback,
+            min_pullback_candles=min_pullback_candles,
+            signal_delay_sec=signal_delay_sec,
+        )
+    else:
+        _ema_reversal_instances[asset].update_params(
+            ema_period, trend_lookback, min_pullback_candles, signal_delay_sec
+        )
+    return _ema_reversal_instances[asset]
+
+
+# ==============================
 # ANALYSIS HELPERS
 # ==============================
 def rsi_ema15_core(prices, gen):
@@ -892,7 +1066,17 @@ def candle_indicator_confirmation(prices, core, raw_signal, gen):
     }
     return ok, reason, details
 
-def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protector):
+def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protector, ema_cfg=None):
+    """
+    Run full analysis for *asset*.
+
+    Parameters
+    ----------
+    ema_cfg : dict or None
+        EMA reversal settings with keys: ema_period, trend_lookback,
+        min_pullback_candles, signal_delay_sec.
+        Falls back to module-level EMA_PULLBACK_* defaults when None.
+    """
     try:
         gen = SignalGenerator(asset, time_seed)
         prices, market_source = gen.fetch_live_prices(PRICE_LIMIT)
@@ -928,10 +1112,24 @@ def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protect
                 asset=asset
             )
 
+        # ------------------------------------------------------------------
+        # EMA Trend Reversal Pullback signal (separate, additive layer)
+        # ------------------------------------------------------------------
+        cfg = ema_cfg or {}
+        ema_rev_instance = _get_ema_reversal(
+            asset,
+            ema_period=cfg.get("ema_period", EMA_PULLBACK_PERIOD),
+            trend_lookback=cfg.get("trend_lookback", EMA_PULLBACK_LOOKBACK),
+            min_pullback_candles=cfg.get("min_pullback_candles", EMA_PULLBACK_MIN_CANDLES),
+            signal_delay_sec=cfg.get("signal_delay_sec", EMA_PULLBACK_DELAY_SEC),
+        )
+        ema_reversal = ema_rev_instance.check_signal(prices) or ""
+
         return {
             "Asset": asset,
             "Signal": final_signal,
             "Confidence": final_conf,
+            "EMA_Reversal": ema_reversal,
             "DL_Models": model_count,
             "Strategy_Match": strategy_agreement,
             "Trend": strategies.get("Trend", "BUY"),
@@ -1100,6 +1298,47 @@ st.markdown("**Live market data | Binomo screen optional | 1m candles where avai
 st.caption(f"Protection Mode: {'ON' if PROTECTION_MODE else 'OFF'} | Min Conf: {MIN_CONFIDENCE_TO_TRADE} | Vol Limit: {HIGH_VOL_THRESHOLD} | Interval: {PRICE_INTERVAL} | Binomo Screen: {'ON' if USE_BINOMO_SCREEN else 'OFF'}")
 st.markdown("---")
 
+# ==============================
+# SIDEBAR: EMA Trend Reversal Settings
+# Values read here are passed into every analysis round so worker
+# threads never need to access st.session_state directly.
+# ==============================
+with st.sidebar:
+    st.header("⚙️ EMA Trend Reversal")
+    st.markdown("Configure the pullback-reversal signal layer.")
+    _ema_period_ui = st.number_input(
+        "EMA Period",
+        min_value=5, max_value=200, value=EMA_PULLBACK_PERIOD, step=1,
+        help="EMA span used to determine trend direction (default: 30)."
+    )
+    _trend_lookback_ui = st.number_input(
+        "Trend Lookback (candles)",
+        min_value=5, max_value=500, value=EMA_PULLBACK_LOOKBACK, step=1,
+        help="Number of candles over which EMA trend is evaluated (default: 30)."
+    )
+    _min_pullback_ui = st.number_input(
+        "Min Pullback Candles",
+        min_value=1, max_value=20, value=EMA_PULLBACK_MIN_CANDLES, step=1,
+        help="Minimum consecutive candles in the pullback direction (default: 2)."
+    )
+    _delay_sec_ui = st.number_input(
+        "Signal Delay (sec)",
+        min_value=0.0, max_value=60.0, value=float(EMA_PULLBACK_DELAY_SEC), step=0.5,
+        help="Seconds to wait after reversal before emitting signal (default: 3)."
+    )
+    st.caption(
+        f"Defaults — EMA: {EMA_PULLBACK_PERIOD} | Lookback: {EMA_PULLBACK_LOOKBACK} "
+        f"| Min candles: {EMA_PULLBACK_MIN_CANDLES} | Delay: {EMA_PULLBACK_DELAY_SEC}s"
+    )
+
+# Build config dict that will be forwarded to all analysis calls this run.
+_ema_cfg = {
+    "ema_period": int(_ema_period_ui),
+    "trend_lookback": int(_trend_lookback_ui),
+    "min_pullback_candles": int(_min_pullback_ui),
+    "signal_delay_sec": float(_delay_sec_ui),
+}
+
 if "model" not in st.session_state:
     st.session_state.model = RSIRegimeEnsemble()
     st.session_state.comparator = StrategyComparator()
@@ -1180,7 +1419,7 @@ with c5:
 
 st.markdown("---")
 
-def run_analysis_round(model, comparator, current_time, news_analyzer, protector):
+def run_analysis_round(model, comparator, current_time, news_analyzer, protector, ema_cfg=None):
     results = []
     with ThreadPoolExecutor(max_workers=6) as executor:
         futures = {
@@ -1191,7 +1430,8 @@ def run_analysis_round(model, comparator, current_time, news_analyzer, protector
                 current_time,
                 comparator,
                 news_analyzer,
-                protector
+                protector,
+                ema_cfg,
             ): asset
             for asset in ALL_ASSETS
         }
@@ -1216,7 +1456,8 @@ if st.session_state.running:
                 st.session_state.comparator,
                 prefetch_time,
                 st.session_state.news_analyzer,
-                st.session_state.protector
+                st.session_state.protector,
+                _ema_cfg,
             )
             st.session_state.prefetch_time = prefetch_time
 
@@ -1232,7 +1473,8 @@ if st.session_state.running:
                     st.session_state.comparator,
                     seed,
                     st.session_state.news_analyzer,
-                    st.session_state.protector
+                    st.session_state.protector,
+                    _ema_cfg,
                 )
 
         if results:
@@ -1259,7 +1501,7 @@ if st.session_state.running:
             st.markdown("---")
             st.subheader("🏆 Top Signals (Confidence)")
             top_df = df.nlargest(20, "Confidence")[[
-                "Asset", "Signal", "Confidence", "DL_Models", "RSI14", "ATR_Ratio", "Confirm_4_15", "Market_Source", "Last_Price", "Blocked_Reason"
+                "Asset", "Signal", "EMA_Reversal", "Confidence", "DL_Models", "RSI14", "ATR_Ratio", "Confirm_4_15", "Market_Source", "Last_Price", "Blocked_Reason"
             ]].copy()
             st.dataframe(top_df, use_container_width=True, hide_index=True)
 
