@@ -26,6 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 import json
+import os
 import time
 
 import numpy as np
@@ -45,6 +46,13 @@ except Exception:
     MLPClassifier = None
     StandardScaler = None
 
+try:
+    from tensorflow import keras
+    from tensorflow.keras import layers
+except Exception:
+    keras = None
+    layers = None
+
 
 APP_TITLE = "Binomo 1M Algo - Deep Learning Streamlit"
 SCAN_SECONDS = 60
@@ -53,6 +61,33 @@ MAX_CANDLES = 500
 DEFAULT_MIN_CONF = 68
 DEFAULT_MAX_ATR = 0.008
 EXPORT_FILE = Path("binomo_1m_signals.xlsx")
+NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+BINANCE_SYMBOLS = {
+    "BTCUSDT": "BTCUSDT",
+    "ETHUSDT": "ETHUSDT",
+    "SOLUSDT": "SOLUSDT",
+    "BNBUSDT": "BNBUSDT",
+    "XRPUSDT": "XRPUSDT",
+    "ADAUSDT": "ADAUSDT",
+    "DOGEUSDT": "DOGEUSDT",
+}
+
+YAHOO_SYMBOLS = {
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "USD/JPY": "JPY=X",
+    "USD/CHF": "CHF=X",
+    "AUD/USD": "AUDUSD=X",
+    "USD/CAD": "CAD=X",
+    "GOLD": "GC=F",
+    "SILVER": "SI=F",
+    "OIL": "CL=F",
+    "NASDAQ100": "^NDX",
+    "SP500": "^GSPC",
+}
 
 
 @dataclass
@@ -70,6 +105,9 @@ class SignalResult:
     pullback_score: float
     best_strategy: str
     strategy_score: float
+    news_score: float
+    telegram_score: float
+    data_source: str
     timestamp: str
 
 
@@ -132,6 +170,146 @@ def fetch_http_candles(url: str, timeout: int = 8) -> pd.DataFrame:
     return normalize_candles(pd.DataFrame(rows))
 
 
+def fetch_binance_candles(symbol: str, limit: int = MAX_CANDLES) -> pd.DataFrame:
+    url = "https://api.binance.com/api/v3/klines"
+    params = {"symbol": symbol.upper().strip(), "interval": "1m", "limit": min(limit, 1000)}
+    r = requests.get(url, params=params, timeout=8)
+    r.raise_for_status()
+    rows = []
+    for item in r.json():
+        rows.append(
+            {
+                "time": pd.to_datetime(int(item[0]), unit="ms"),
+                "open": float(item[1]),
+                "high": float(item[2]),
+                "low": float(item[3]),
+                "close": float(item[4]),
+                "volume": float(item[5]),
+            }
+        )
+    return normalize_candles(pd.DataFrame(rows))
+
+
+def fetch_yahoo_candles(symbol: str, limit: int = MAX_CANDLES) -> pd.DataFrame:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"interval": "1m", "range": "1d", "includePrePost": "false"}
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(url, params=params, headers=headers, timeout=8)
+    r.raise_for_status()
+    data = r.json()
+    result = (data.get("chart", {}) or {}).get("result", [])
+    if not result:
+        return pd.DataFrame()
+    node = result[0]
+    times = node.get("timestamp", []) or []
+    quote = (((node.get("indicators", {}) or {}).get("quote", [])) or [{}])[0]
+    rows = []
+    for i, ts in enumerate(times):
+        try:
+            rows.append(
+                {
+                    "time": pd.to_datetime(int(ts), unit="s"),
+                    "open": quote.get("open", [])[i],
+                    "high": quote.get("high", [])[i],
+                    "low": quote.get("low", [])[i],
+                    "close": quote.get("close", [])[i],
+                    "volume": quote.get("volume", [0])[i] if quote.get("volume") else 0,
+                }
+            )
+        except Exception:
+            pass
+    return normalize_candles(pd.DataFrame(rows).tail(limit))
+
+
+def fetch_market_candles(source: str, asset: str, endpoint: str = "") -> tuple[pd.DataFrame, str]:
+    source = source.lower()
+    asset_key = asset.upper().strip()
+    if source == "binomo/http":
+        return fetch_http_candles(endpoint), "Binomo/HTTP"
+    if source == "binance":
+        symbol = BINANCE_SYMBOLS.get(asset_key, asset_key.replace("/", ""))
+        return fetch_binance_candles(symbol), f"Binance {symbol} 1m"
+    if source == "yahoo":
+        symbol = YAHOO_SYMBOLS.get(asset.upper().strip(), asset.strip())
+        return fetch_yahoo_candles(symbol), f"Yahoo {symbol} 1m"
+    return pd.DataFrame(), "No source"
+
+
+def text_sentiment_score(texts: list[str]) -> float:
+    if not texts:
+        return 0.0
+    positive = [
+        "rise", "rising", "bull", "bullish", "gain", "gains", "up", "breakout",
+        "strong", "beat", "growth", "surge", "buy", "long", "support",
+    ]
+    negative = [
+        "fall", "falling", "bear", "bearish", "loss", "losses", "down", "breakdown",
+        "weak", "miss", "drop", "crash", "sell", "short", "resistance", "risk",
+    ]
+    blob = " ".join(str(t).lower() for t in texts)
+    pos = sum(blob.count(w) for w in positive)
+    neg = sum(blob.count(w) for w in negative)
+    if pos + neg == 0:
+        return 0.0
+    return float(np.clip((pos - neg) / (pos + neg), -1, 1))
+
+
+def fetch_news(asset: str, api_key: str = "") -> tuple[float, list[str]]:
+    api_key = (api_key or NEWS_API_KEY).strip()
+    if not api_key:
+        return 0.0, []
+    query = asset.replace("/", " ")
+    url = "https://newsapi.org/v2/everything"
+    params = {
+        "q": query,
+        "language": "en",
+        "sortBy": "publishedAt",
+        "pageSize": 10,
+        "apiKey": api_key,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=7)
+        r.raise_for_status()
+        articles = r.json().get("articles", []) or []
+        texts = [f"{a.get('title', '')} {a.get('description', '')}" for a in articles]
+        headlines = [str(a.get("title", "")) for a in articles if a.get("title")]
+        return text_sentiment_score(texts), headlines[:5]
+    except Exception:
+        return 0.0, []
+
+
+def fetch_telegram_texts(bot_token: str = "", chat_id: str = "", bridge_url: str = "") -> list[str]:
+    if bridge_url.strip():
+        try:
+            r = requests.get(bridge_url.strip(), timeout=7)
+            r.raise_for_status()
+            payload = r.json()
+            rows = payload.get("messages", payload.get("data", payload)) if isinstance(payload, dict) else payload
+            return [str(x.get("text", x)) if isinstance(x, dict) else str(x) for x in rows][-30:]
+        except Exception:
+            return []
+
+    bot_token = (bot_token or TELEGRAM_BOT_TOKEN).strip()
+    chat_id = str(chat_id or TELEGRAM_CHAT_ID).strip()
+    if not bot_token:
+        return []
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
+        r = requests.get(url, params={"limit": 40, "allowed_updates": json.dumps(["message", "channel_post"])}, timeout=7)
+        r.raise_for_status()
+        texts = []
+        for item in r.json().get("result", []) or []:
+            msg = item.get("message") or item.get("channel_post") or {}
+            if chat_id and str((msg.get("chat") or {}).get("id", "")) != chat_id:
+                continue
+            text = msg.get("text") or msg.get("caption")
+            if text:
+                texts.append(str(text))
+        return texts[-30:]
+    except Exception:
+        return []
+
+
 def rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     gain = delta.clip(lower=0).ewm(alpha=1 / period, adjust=False).mean()
@@ -165,6 +343,14 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["ema15"] = close.ewm(span=15, adjust=False).mean()
     out["ema21"] = close.ewm(span=21, adjust=False).mean()
     out["ema50"] = close.ewm(span=50, adjust=False).mean()
+    out["macd"] = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+    out["macd_signal"] = out["macd"].ewm(span=9, adjust=False).mean()
+    out["macd_hist"] = out["macd"] - out["macd_signal"]
+    bb_mid = close.rolling(20).mean()
+    bb_std = close.rolling(20).std()
+    out["bb_upper"] = bb_mid + 2 * bb_std
+    out["bb_lower"] = bb_mid - 2 * bb_std
+    out["bb_pos"] = (close - out["bb_lower"]) / (out["bb_upper"] - out["bb_lower"]).replace(0, np.nan)
     out["rsi7"] = rsi(close, 7)
     out["rsi14"] = rsi(close, 14)
     out["rsi21"] = rsi(close, 21)
@@ -221,7 +407,7 @@ def rolling_slope(close: pd.Series, window: int) -> pd.Series:
     return pd.Series(values, index=close.index)
 
 
-FEATURES = [
+BASE_FEATURES = [
     "ret1",
     "ret2",
     "ret3",
@@ -237,6 +423,10 @@ FEATURES = [
     "ema50_delta",
     "ema5_15_spread",
     "ema15_50_spread",
+    "macd",
+    "macd_signal",
+    "macd_hist",
+    "bb_pos",
     "mom3",
     "mom5",
     "mom10",
@@ -254,14 +444,79 @@ FEATURES = [
     "trend_50",
 ]
 
+MODEL_FEATURE_DIM = 700
+MODEL_FEATURES = [f"f{i:03d}" for i in range(MODEL_FEATURE_DIM)]
+
+
+def build_700_feature_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Derin ogrenme ve ensemble icin sabit 700 ozellik uretir."""
+    feat = add_indicators(df)
+    series_list = []
+
+    def add_feature(values) -> None:
+        s = pd.Series(values, index=feat.index)
+        s = s.replace([np.inf, -np.inf], np.nan).fillna(0).clip(-10, 10)
+        series_list.append(s)
+
+    for col in BASE_FEATURES:
+        add_feature(feat[col])
+
+    lag_cols = [
+        "ret1", "ret2", "ret3", "rsi7", "rsi14", "rsi21", "atr_ratio", "atr_z",
+        "ema5_delta", "ema9_delta", "ema15_delta", "ema21_delta", "ema50_delta",
+        "ema5_15_spread", "ema15_50_spread", "macd", "macd_signal", "macd_hist", "bb_pos",
+        "mom3", "mom5", "mom10", "mom15",
+        "vol10", "vol20", "range_pos20", "range_pos50", "body", "wick_up",
+        "wick_down", "candle_power", "trend_10", "trend_20", "trend_50",
+    ]
+    for col in lag_cols:
+        for lag in [1, 2, 3, 4, 5, 8, 13, 21]:
+            add_feature(feat[col].shift(lag))
+
+    stat_cols = [
+        "ret1", "body", "candle_power", "atr_ratio", "atr_z", "ema15_delta",
+        "ema15_50_spread", "rsi14", "rsi21", "mom3", "mom10", "vol10",
+        "range_pos20", "trend_20", "macd_hist", "bb_pos",
+    ]
+    for col in stat_cols:
+        for window in [3, 5, 8, 13, 21, 34, 55]:
+            roll = feat[col].rolling(window)
+            add_feature(roll.mean())
+            add_feature(roll.std())
+            add_feature(roll.min())
+            add_feature(roll.max())
+            add_feature(feat[col] - roll.mean())
+
+    close = feat["close"]
+    for lag in range(1, 121):
+        add_feature(close.pct_change(lag))
+
+    interaction_cols = [
+        "rsi14", "rsi21", "atr_ratio", "atr_z", "ema15_delta",
+        "ema15_50_spread", "macd_hist", "bb_pos", "mom3", "mom10", "vol10", "range_pos20",
+        "candle_power", "trend_20",
+    ]
+    for i, a in enumerate(interaction_cols):
+        for b in interaction_cols[i:]:
+            add_feature(feat[a] * feat[b])
+
+    if len(series_list) < MODEL_FEATURE_DIM:
+        for _ in range(MODEL_FEATURE_DIM - len(series_list)):
+            add_feature(0.0)
+
+    out = pd.concat(series_list[:MODEL_FEATURE_DIM], axis=1)
+    out.columns = MODEL_FEATURES
+    return out.replace([np.inf, -np.inf], np.nan).fillna(0).clip(-10, 10)
+
 
 def make_supervised(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     """Sonraki 1 mum yukari mi asagi mi etiketi olusturur."""
     feat = add_indicators(df)
+    feature_frame = build_700_feature_frame(df)
     y = (feat["close"].shift(-1) > feat["close"]).astype(int)
-    train = feat.iloc[:-1].copy()
+    train = feature_frame.iloc[:-1].copy()
     y = y.iloc[:-1]
-    X = train[FEATURES].to_numpy(dtype=float)
+    X = train[MODEL_FEATURES].to_numpy(dtype=float)
     return X, y.to_numpy(dtype=int)
 
 
@@ -289,6 +544,28 @@ def strategy_votes(df: pd.DataFrame) -> dict[str, pd.Series]:
     )
     votes["Range_Break"] = pd.Series(
         np.where(feat["range_pos20"] > 0.82, 1, np.where(feat["range_pos20"] < 0.18, -1, 0)),
+        index=feat.index,
+    )
+    votes["MACD_Cross"] = np.sign(feat["macd_hist"])
+    votes["Bollinger_Reversal"] = pd.Series(
+        np.where(feat["bb_pos"] < 0.12, 1, np.where(feat["bb_pos"] > 0.88, -1, 0)),
+        index=feat.index,
+    )
+    votes["Bollinger_Breakout"] = pd.Series(
+        np.where((feat["bb_pos"] > 0.92) & (feat["mom3"] > 0), 1, np.where((feat["bb_pos"] < 0.08) & (feat["mom3"] < 0), -1, 0)),
+        index=feat.index,
+    )
+    votes["Wick_Reversal"] = pd.Series(
+        np.where((feat["wick_down"] > 0.55) & (feat["rsi14"] < 45), 1, np.where((feat["wick_up"] > 0.55) & (feat["rsi14"] > 55), -1, 0)),
+        index=feat.index,
+    )
+    votes["Trend_Continuation"] = np.sign(feat["trend_10"] + feat["trend_20"] + feat["trend_50"])
+    votes["RSI_EMA15_Filter"] = pd.Series(
+        np.where((feat["rsi14"] < 40) & (feat["ema15_delta"] < 0), 1, np.where((feat["rsi14"] > 60) & (feat["ema15_delta"] > 0), -1, 0)),
+        index=feat.index,
+    )
+    votes["Volatility_Break"] = pd.Series(
+        np.where((feat["atr_z"] > 1.0) & (feat["mom5"] > 0), 1, np.where((feat["atr_z"] > 1.0) & (feat["mom5"] < 0), -1, 0)),
         index=feat.index,
     )
 
@@ -341,8 +618,10 @@ class OneMinuteModel:
         self.scaler = StandardScaler() if StandardScaler else None
         self.models = []
         self.deep_model = None
+        self.keras_model = None
         self.trained = False
         self.deep_trained = False
+        self.keras_trained = False
 
     def train(self, df: pd.DataFrame) -> str:
         if RandomForestClassifier is None:
@@ -369,7 +648,7 @@ class OneMinuteModel:
 
         if MLPClassifier is not None:
             self.deep_model = MLPClassifier(
-                hidden_layer_sizes=(96, 48, 24),
+                hidden_layer_sizes=(256, 128, 64, 32),
                 activation="relu",
                 solver="adam",
                 alpha=0.0008,
@@ -382,14 +661,35 @@ class OneMinuteModel:
             self.deep_model.fit(Xs, y)
             self.deep_trained = True
 
+        if keras is not None and layers is not None and len(Xs) >= 120:
+            self.keras_model = keras.Sequential(
+                [
+                    layers.Input(shape=(MODEL_FEATURE_DIM,)),
+                    layers.Dense(256, activation="relu"),
+                    layers.Dropout(0.20),
+                    layers.Dense(128, activation="relu"),
+                    layers.Dropout(0.15),
+                    layers.Dense(64, activation="relu"),
+                    layers.Dense(1, activation="sigmoid"),
+                ]
+            )
+            self.keras_model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
+            self.keras_model.fit(Xs, y, epochs=25, batch_size=32, verbose=0, validation_split=0.15)
+            self.keras_trained = True
+
         self.trained = True
-        dl = " + derin ogrenme aktif" if self.deep_trained else ""
+        dl_parts = []
+        if self.deep_trained:
+            dl_parts.append("MLP")
+        if self.keras_trained:
+            dl_parts.append("Keras")
+        dl = " + derin ogrenme aktif: " + ", ".join(dl_parts) if dl_parts else ""
         return f"{len(self.models)} klasik model{dl}, son {len(df)} mumla egitildi."
 
     def predict_proba_up(self, df: pd.DataFrame) -> Optional[float]:
         if not self.trained or not self.models:
             return None
-        feat = add_indicators(df).iloc[-1:][FEATURES].to_numpy(dtype=float)
+        feat = build_700_feature_frame(df).iloc[-1:][MODEL_FEATURES].to_numpy(dtype=float)
         xs = self.scaler.transform(feat)
         probs = []
         for model in self.models:
@@ -402,6 +702,10 @@ class OneMinuteModel:
             cls = list(self.deep_model.classes_)
             deep_prob = float(p[cls.index(1)] if 1 in cls else 0.5)
             probs.extend([deep_prob, deep_prob])
+
+        if self.keras_trained and self.keras_model is not None:
+            keras_prob = float(self.keras_model.predict(xs, verbose=0)[0][0])
+            probs.extend([keras_prob, keras_prob, keras_prob])
 
         return float(np.mean(probs))
 
@@ -444,9 +748,12 @@ def generate_signal(
     model: OneMinuteModel,
     min_conf: int,
     max_atr_ratio: float,
+    news_score: float = 0.0,
+    telegram_score: float = 0.0,
+    data_source: str = "",
 ) -> SignalResult:
     if len(candles) < 30:
-        return SignalResult(asset, "NO-TRADE", 0, "Yetersiz mum verisi", 0, 50, 0, 0, 0, 0, 0, "Yetersiz veri", 0, now_str())
+        return SignalResult(asset, "NO-TRADE", 0, "Yetersiz mum verisi", 0, 50, 0, 0, 0, 0, 0, "Yetersiz veri", 0, 0, 0, data_source, now_str())
 
     df = normalize_candles(candles)
     scores = rule_scores(df)
@@ -461,16 +768,24 @@ def generate_signal(
     raw = (
         0.38 * scores["trend_score"]
         + 0.24 * scores["momentum"]
-        + 0.18 * scores["rsi_bias"]
+        + 0.32 * scores["rsi_bias"]
         + 0.20 * scores["pullback_score"]
         + 0.35 * model_vote
         + 0.28 * strategy["combined_vote"]
+        + 0.10 * news_score
+        + 0.10 * telegram_score
     )
+
+    if scores["rsi"] <= 30:
+        raw = max(raw, 0.18)
+    elif scores["rsi"] >= 70:
+        raw = min(raw, -0.18)
+
     raw = float(np.clip(raw, -1, 1))
 
     confidence = int(round(50 + abs(raw) * 49))
     signal = "BUY" if raw > 0 else "SELL"
-    reason = f"Trend + momentum + RSI/ATR + EMA15 + deep model + strateji testi ({strategy['best']})"
+    reason = f"RSI zorunlu + EMA15/ATR + 700F deep + strateji testi ({strategy['best']})"
 
     if scores["atr_ratio"] > max_atr_ratio:
         signal = "NO-TRADE"
@@ -502,6 +817,9 @@ def generate_signal(
         pullback_score=scores["pullback_score"],
         best_strategy=strategy["best"],
         strategy_score=float(strategy["score"]),
+        news_score=float(news_score),
+        telegram_score=float(telegram_score),
+        data_source=data_source,
         timestamp=now_str(),
     )
 
@@ -526,6 +844,9 @@ def result_to_dict(r: SignalResult) -> dict:
         "Pullback_Score": round(r.pullback_score, 4),
         "Best_Strategy": r.best_strategy,
         "Strategy_Score": round(r.strategy_score, 4),
+        "News_Score": round(r.news_score, 4),
+        "Telegram_Score": round(r.telegram_score, 4),
+        "Data_Source": r.data_source,
     }
 
 
@@ -548,43 +869,99 @@ def render_signal_badge(signal: str) -> None:
         st.warning("NO-TRADE")
 
 
+def ensure_model_fields(model: OneMinuteModel) -> OneMinuteModel:
+    """Eski Streamlit session objeleri yeni alanlari tasimayabilir."""
+    if not hasattr(model, "models"):
+        model.models = []
+    if not hasattr(model, "deep_model"):
+        model.deep_model = None
+    if not hasattr(model, "keras_model"):
+        model.keras_model = None
+    if not hasattr(model, "trained"):
+        model.trained = False
+    if not hasattr(model, "deep_trained"):
+        model.deep_trained = False
+    if not hasattr(model, "keras_trained"):
+        model.keras_trained = False
+    if not hasattr(model, "scaler"):
+        model.scaler = StandardScaler() if StandardScaler else None
+    return model
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
-    st.title(APP_TITLE)
-    st.caption("1 dakikalik mum verisiyle calisir. MLP derin ogrenme + klasik ensemble + risk filtresi kullanir.")
+    st.markdown(
+        """
+        <style>
+        .block-container {padding-top: 1.2rem;}
+        .metric-card {
+            border: 1px solid rgba(120,120,120,.22);
+            border-radius: 8px;
+            padding: 14px 16px;
+            background: rgba(255,255,255,.035);
+        }
+        .hero-title {font-size: 2.1rem; font-weight: 800; margin-bottom: .1rem;}
+        .hero-sub {opacity: .78; margin-bottom: 1rem;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(f"<div class='hero-title'>{APP_TITLE}</div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='hero-sub'>700 ozellikli deep ensemble, EMA15/RSI/ATR, haber, Telegram ve strateji backtest paneli.</div>",
+        unsafe_allow_html=True,
+    )
 
     if "model" not in st.session_state:
         st.session_state.model = OneMinuteModel()
+    st.session_state.model = ensure_model_fields(st.session_state.model)
     if "candles" not in st.session_state:
         st.session_state.candles = pd.DataFrame()
     if "history" not in st.session_state:
         st.session_state.history = []
     if "last_scan" not in st.session_state:
         st.session_state.last_scan = 0.0
+    if "headlines" not in st.session_state:
+        st.session_state.headlines = []
+    if "telegram_texts" not in st.session_state:
+        st.session_state.telegram_texts = []
+    if "data_source" not in st.session_state:
+        st.session_state.data_source = ""
 
     with st.sidebar:
         st.header("Ayarlar")
-        asset = st.text_input("Varlik adi", value="EUR/USD OTC")
+        asset = st.text_input("Varlik adi", value="EUR/USD")
+        source = st.selectbox("Veri kaynagi", ["Binomo/HTTP", "Binance", "Yahoo", "CSV"], index=2)
         min_conf = st.slider("Minimum guven", 50, 95, DEFAULT_MIN_CONF)
         max_atr = st.number_input("Maks ATR orani", min_value=0.0001, max_value=0.2, value=DEFAULT_MAX_ATR, step=0.0005, format="%.4f")
-        endpoint = st.text_input("HTTP mum endpoint", value="")
+        endpoint = st.text_input("Binomo/HTTP mum endpoint", value="")
         uploaded = st.file_uploader("CSV mum verisi yukle", type=["csv"])
+        st.divider()
+        news_api_key = st.text_input("NewsAPI key", value=NEWS_API_KEY, type="password")
+        use_news = st.toggle("Haber cek", value=False)
+        st.divider()
+        telegram_token = st.text_input("Telegram bot token", value=TELEGRAM_BOT_TOKEN, type="password")
+        telegram_chat_id = st.text_input("Telegram chat id", value=TELEGRAM_CHAT_ID)
+        telegram_bridge = st.text_input("Telegram bridge endpoint", value="")
+        use_telegram = st.toggle("Telegram cek", value=False)
+        st.divider()
         auto = st.toggle("60 saniyede otomatik tara", value=False)
 
         load_btn = st.button("Veriyi Yukle / Yenile", use_container_width=True)
         train_btn = st.button("Modeli Egit", use_container_width=True)
         scan_btn = st.button("Sinyal Uret", use_container_width=True)
 
-    if uploaded is not None and load_btn:
+    if uploaded is not None and load_btn and source == "CSV":
         st.session_state.candles = normalize_candles(pd.read_csv(uploaded))
+        st.session_state.data_source = "CSV"
         st.success(f"CSV yuklendi: {len(st.session_state.candles)} mum")
 
-    if endpoint and load_btn:
+    if load_btn and source != "CSV":
         try:
-            st.session_state.candles = fetch_http_candles(endpoint)
-            st.success(f"Endpoint okundu: {len(st.session_state.candles)} mum")
+            st.session_state.candles, st.session_state.data_source = fetch_market_candles(source, asset, endpoint)
+            st.success(f"{st.session_state.data_source} okundu: {len(st.session_state.candles)} mum")
         except Exception as exc:
-            st.error(f"Endpoint okunamadi: {exc}")
+            st.error(f"Veri okunamadi: {exc}")
 
     candles = st.session_state.candles
 
@@ -595,7 +972,21 @@ def main() -> None:
     should_auto_scan = auto and (time.time() - st.session_state.last_scan >= SCAN_SECONDS)
     if scan_btn or should_auto_scan:
         st.session_state.last_scan = time.time()
-        result = generate_signal(asset, candles, st.session_state.model, min_conf, max_atr)
+        news_score, headlines = fetch_news(asset, news_api_key) if use_news else (0.0, [])
+        telegram_texts = fetch_telegram_texts(telegram_token, telegram_chat_id, telegram_bridge) if use_telegram else []
+        telegram_score = text_sentiment_score(telegram_texts)
+        st.session_state.headlines = headlines
+        st.session_state.telegram_texts = telegram_texts
+        result = generate_signal(
+            asset,
+            candles,
+            st.session_state.model,
+            min_conf,
+            max_atr,
+            news_score=news_score,
+            telegram_score=telegram_score,
+            data_source=st.session_state.data_source,
+        )
         row = result_to_dict(result)
         st.session_state.history.insert(0, row)
         try:
@@ -603,18 +994,25 @@ def main() -> None:
         except Exception as exc:
             st.warning(f"Excel yazilamadi: {exc}")
 
-    top1, top2, top3, top4 = st.columns(4)
+    top1, top2, top3, top4, top5 = st.columns(5)
     last_result = st.session_state.history[0] if st.session_state.history else None
 
     with top1:
         st.metric("Mum sayisi", len(candles))
     with top2:
-        model_state = "Deep aktif" if st.session_state.model.deep_trained else ("Klasik aktif" if st.session_state.model.trained else "Kural motoru")
+        if getattr(st.session_state.model, "keras_trained", False):
+            model_state = "Keras + MLP"
+        elif getattr(st.session_state.model, "deep_trained", False):
+            model_state = "MLP 700F"
+        else:
+            model_state = "Klasik aktif" if getattr(st.session_state.model, "trained", False) else "Kural motoru"
         st.metric("Model", model_state)
     with top3:
         st.metric("Son fiyat", "-" if candles.empty else f"{candles['close'].iloc[-1]:.8f}")
     with top4:
         st.metric("Son tarama", "-" if not last_result else last_result["Time"])
+    with top5:
+        st.metric("Kaynak", st.session_state.data_source or "-")
 
     st.divider()
 
@@ -625,7 +1023,7 @@ def main() -> None:
             render_signal_badge(last_result["Signal"])
             st.metric("Guven", f"{last_result['Confidence']}%")
             st.write(last_result["Reason"])
-            st.json({k: last_result[k] for k in ["RSI14", "ATR_Ratio", "Trend_Score", "Pullback_Score"]})
+            st.json({k: last_result[k] for k in ["RSI14", "ATR_Ratio", "Trend_Score", "Pullback_Score", "Best_Strategy", "Strategy_Score", "News_Score", "Telegram_Score"]})
         else:
             st.info("Veri yukleyip Sinyal Uret'e basin.")
 
@@ -637,6 +1035,37 @@ def main() -> None:
             st.dataframe(candles.tail(20), use_container_width=True, hide_index=True)
         else:
             st.warning("Henuz mum verisi yok.")
+
+    st.subheader("Strateji Testleri")
+    if not candles.empty and len(candles) >= 40:
+        strategy_state = backtest_strategy_weights(candles)
+        weight_rows = [
+            {
+                "Strategy": name,
+                "Weight": round(float(weight), 4),
+                "Latest_Vote": round(float(strategy_state.get("latest_votes", {}).get(name, 0)), 2),
+            }
+            for name, weight in sorted(strategy_state.get("weights", {}).items(), key=lambda x: x[1], reverse=True)
+        ]
+        st.dataframe(pd.DataFrame(weight_rows), use_container_width=True, hide_index=True)
+    else:
+        st.caption("Strateji testi icin en az 40 mum gerekir.")
+
+    info1, info2 = st.columns(2)
+    with info1:
+        st.subheader("Haber")
+        if st.session_state.headlines:
+            for h in st.session_state.headlines:
+                st.write(f"- {h}")
+        else:
+            st.caption("Haber cekilmedi veya sonuc yok.")
+    with info2:
+        st.subheader("Telegram")
+        if st.session_state.telegram_texts:
+            for t in st.session_state.telegram_texts[-5:]:
+                st.write(f"- {t[:220]}")
+        else:
+            st.caption("Telegram cekilmedi veya bot/bridge sonucu yok.")
 
     st.divider()
     st.subheader("Sinyal Gecmisi")
