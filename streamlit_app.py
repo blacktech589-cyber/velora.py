@@ -36,6 +36,14 @@ try:
 except Exception:
     TEXTBLOB_AVAILABLE = False
 
+# Optional Binomo selenium reader
+try:
+    from binomo_scraper import fetch_binomo_prices
+    BINOMO_READER_AVAILABLE = True
+except Exception:
+    BINOMO_READER_AVAILABLE = False
+    fetch_binomo_prices = None
+
 # ==============================
 # TIMING & RISK CONFIG
 # ==============================
@@ -50,6 +58,7 @@ NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
 PRICE_TIMEOUT_SEC = 8
 PRICE_INTERVAL = "1m"
 PRICE_LIMIT = 120
+USE_BINOMO_SCREEN = os.getenv("USE_BINOMO_SCREEN", "false").lower() == "true"
 
 # ==============================
 # CONFIRMATION CONFIG (4-15 + INDICATORS)
@@ -166,6 +175,19 @@ class SignalGenerator:
         self.time_seed = time_seed or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         np.random.seed(int(hashlib.md5(f"{asset}{self.time_seed}".encode()).hexdigest(), 16) % 2**32)
 
+    def _fetch_binomo_screen_prices(self, limit=PRICE_LIMIT):
+        if not USE_BINOMO_SCREEN or not BINOMO_READER_AVAILABLE or fetch_binomo_prices is None:
+            return None, None
+        try:
+            result = fetch_binomo_prices(self.asset, limit=limit)
+            if result and getattr(result, "prices", None):
+                prices = np.array(result.prices, dtype=np.float64)
+                if len(prices) >= 20:
+                    return prices, result.source
+        except Exception:
+            return None, None
+        return None, None
+
     def _fetch_binance_prices(self, symbol, interval=PRICE_INTERVAL, limit=PRICE_LIMIT):
         try:
             url = "https://api.binance.com/api/v3/klines"
@@ -209,6 +231,10 @@ class SignalGenerator:
         return None
 
     def fetch_live_prices(self, length=PRICE_LIMIT):
+        prices, source = self._fetch_binomo_screen_prices(limit=length)
+        if prices is not None:
+            return prices, source
+
         if self.asset in BINANCE_SYMBOLS:
             prices = self._fetch_binance_prices(BINANCE_SYMBOLS[self.asset], limit=length)
             if prices is not None:
@@ -1070,8 +1096,8 @@ def load_model_bundle(model):
 # ==============================
 st.set_page_config(layout="wide", page_title="Velora AI - RSI/EMA15 700F", initial_sidebar_state="expanded")
 st.title("🚀 VELORA AI - RSI/EMA15 700 Features")
-st.markdown("**Live market data | 1m candles where available | protection mode | news-aware ensemble | 4-15 reversal confirmation**")
-st.caption(f"Protection Mode: {'ON' if PROTECTION_MODE else 'OFF'} | Min Conf: {MIN_CONFIDENCE_TO_TRADE} | Vol Limit: {HIGH_VOL_THRESHOLD} | Interval: {PRICE_INTERVAL}")
+st.markdown("**Live market data | Binomo screen optional | 1m candles where available | protection mode | news-aware ensemble | 4-15 reversal confirmation**")
+st.caption(f"Protection Mode: {'ON' if PROTECTION_MODE else 'OFF'} | Min Conf: {MIN_CONFIDENCE_TO_TRADE} | Vol Limit: {HIGH_VOL_THRESHOLD} | Interval: {PRICE_INTERVAL} | Binomo Screen: {'ON' if USE_BINOMO_SCREEN else 'OFF'}")
 st.markdown("---")
 
 if "model" not in st.session_state:
