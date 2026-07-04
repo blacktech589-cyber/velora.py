@@ -915,7 +915,7 @@ if st.session_state.running:
                     st.session_state.model,
                     current_time,
                     st.session_state.comparator
-                    ): asset
+                }: asset
                 for asset in assets
                 }
                 for future in as_completed(futures):
