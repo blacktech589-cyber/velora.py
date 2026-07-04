@@ -987,10 +987,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 max_workers = os.cpu_count() or 4
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+models = st.session_state.get("models", {})
+
 with ThreadPoolExecutor(max_workers=max_workers) as executor:
     futures = [
         executor.submit(
-            advanced_analyze,   # veya doğru fonksiyon
+            advanced_analyze,
             model_name,
             model,
             X,
@@ -998,6 +1002,14 @@ with ThreadPoolExecutor(max_workers=max_workers) as executor:
         )
         for model_name, model in models.items()
     ]
+
+    results = []
+
+    for future in as_completed(futures):
+        try:
+            results.append(future.result())
+        except Exception as e:
+            print(f"Hata: {e}")
 
     results = []
     for future in as_completed(futures):
