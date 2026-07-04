@@ -919,29 +919,29 @@ with ThreadPoolExecutor(max_workers=8) as executor:
         for asset in assets
     }
 
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+results = {}
+
+with ThreadPoolExecutor(max_workers=8) as executor:
+    futures = {
+        executor.submit(
+            advanced_analyze,
+            asset,
+            st.session_state.model,
+            current_time,
+            st.session_state.comparator
+        ): asset
+        for asset in assets
+    }
+
     for future in as_completed(futures):
         asset = futures[future]
         try:
-            result = future.result()
-            results.append(result)
+            results[asset] = future.result()
         except Exception as e:
             print(f"Hata ({asset}): {e}")
-                for future in as_completed(futures):
-                    asset = futures[future]
-                    try:
-                        results[asset] = future.result()
-                    except Exception:
-                        results[asset] = None
-                        results = {}
-                        with ThreadPoolExecutor(max_workers=8) as executor:
-                            futures = {
-                                executor.submit()
-                                advanced_analyze,
-                                asset,
-                                st.session_state.model,
-                                current_time,
-                                st.session_state.comparator
-                            }: asset
+            results[asset] = None
                 for asset in assets
                 {
                 for future in as_completed(futures):
