@@ -917,7 +917,7 @@ if st.session_state.running:
                     st.session_state.comparator
                 }: asset
                 for asset in assets
-                }
+                {
                 for future in as_completed(futures):
                     asset = futures[future]
                     try:
