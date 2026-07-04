@@ -43,8 +43,8 @@ SCAN_INTERVAL_SEC = 45
 PREDICTION_LEAD_SEC = 7
 
 PROTECTION_MODE = True
-MIN_CONFIDENCE_TO_TRADE = 78
-HIGH_VOL_THRESHOLD = 0.045
+MIN_CONFIDENCE_TO_TRADE = 70
+HIGH_VOL_THRESHOLD = 0.060
 NEWS_TIMEOUT_SEC = 6
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
 
@@ -53,14 +53,14 @@ NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
 # ==============================
 CONFIRM_WINDOW_FAST = 7
 CONFIRM_WINDOW_SLOW = 13
-MIN_FAST_COUNT = 6
-MIN_SLOW_DOMINANCE = 0.55
-RSI_BUY_MAX = 58
-RSI_SELL_MIN = 42
-ATR_MIN_RATIO = 0.002
-ATR_MAX_RATIO = 0.060
-EMA_STACK_REQUIRED = True
-MACD_CONFIRM_REQUIRED = True
+MIN_FAST_COUNT = 5
+MIN_SLOW_DOMINANCE = 0.50
+RSI_BUY_MAX = 65
+RSI_SELL_MIN = 35
+ATR_MIN_RATIO = 0.001
+ATR_MAX_RATIO = 0.080
+EMA_STACK_REQUIRED = False
+MACD_CONFIRM_REQUIRED = False
 
 # ==============================
 # MODEL STORAGE
@@ -464,21 +464,21 @@ class ProtectionEngine:
 
         vol_regime = self._get_vol_regime(asset, atr_ratio)
         if PROTECTION_MODE and vol_regime > HIGH_VOL_THRESHOLD:
-            conf = max(50, conf - 10)
+            conf = max(55, conf - 6)
             if conf < MIN_CONFIDENCE_TO_TRADE:
                 return "NO-TRADE", conf, "High volatility regime"
 
-        if raw_signal and rsi14 >= 78 and ema15_delta < 0:
-            conf -= 12
-        if (not raw_signal) and rsi14 <= 22 and ema15_delta > 0:
-            conf -= 12
+        if raw_signal and rsi14 >= 82 and ema15_delta < 0:
+            conf -= 8
+        if (not raw_signal) and rsi14 <= 18 and ema15_delta > 0:
+            conf -= 8
 
-        if raw_signal and news_score < -0.15:
-            conf -= 10
-        if (not raw_signal) and news_score > 0.15:
-            conf -= 10
+        if raw_signal and news_score < -0.25:
+            conf -= 6
+        if (not raw_signal) and news_score > 0.25:
+            conf -= 6
 
-        conf = max(50, min(99, conf))
+        conf = max(55, min(99, conf))
         if PROTECTION_MODE and conf < MIN_CONFIDENCE_TO_TRADE:
             return "NO-TRADE", conf, "Protection filter"
 
@@ -723,7 +723,7 @@ def candle_indicator_confirmation(prices, core, raw_signal, gen):
     macd, macd_sig, macd_hist = gen.calculate_macd(p)
 
     if raw_signal is True:
-        candle_ok = (up_fast >= MIN_FAST_COUNT) and (up_dom >= MIN_SLOW_DOMINANCE) and (up_slow > dn_slow)
+        candle_ok = (up_fast >= MIN_FAST_COUNT) and (up_dom >= MIN_SLOW_DOMINANCE)
         rsi_ok = (rsi14 <= RSI_BUY_MAX)
         atr_ok = (ATR_MIN_RATIO <= atr_ratio <= ATR_MAX_RATIO)
         ema_ok = (ema7 > ema15 > ema30) if EMA_STACK_REQUIRED else True
@@ -731,7 +731,7 @@ def candle_indicator_confirmation(prices, core, raw_signal, gen):
         ok = candle_ok and rsi_ok and atr_ok and ema_ok and macd_ok
         reason = "" if ok else "BUY confirmation failed (7-13/RSI/ATR/EMA/MACD)"
     else:
-        candle_ok = (dn_fast >= MIN_FAST_COUNT) and (dn_dom >= MIN_SLOW_DOMINANCE) and (dn_slow > up_slow)
+        candle_ok = (dn_fast >= MIN_FAST_COUNT) and (dn_dom >= MIN_SLOW_DOMINANCE)
         rsi_ok = (rsi14 >= RSI_SELL_MIN)
         atr_ok = (ATR_MIN_RATIO <= atr_ratio <= ATR_MAX_RATIO)
         ema_ok = (ema7 < ema15 < ema30) if EMA_STACK_REQUIRED else True
@@ -762,7 +762,7 @@ def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protect
 
         strategies = comparator.analyze_strategies(prices, asset)
         strategy_agreement = sum(1 for s in strategies.values() if (s == "BUY") == signal)
-        confidence = max(60, min(99, int(confidence + strategy_agreement)))
+        confidence = max(62, min(99, int(confidence + strategy_agreement)))
 
         news_score, headlines = news_analyzer.score_asset_news(asset)
 
@@ -771,7 +771,18 @@ def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protect
         )
 
         if not confirm_ok:
-            final_signal, final_conf, blocked_reason = "NO-TRADE", min(confidence, 74), confirm_reason
+            fallback_conf = max(68, min(confidence, 76))
+            final_signal, final_conf, blocked_reason = protector.apply(
+                raw_signal=signal,
+                confidence=fallback_conf,
+                rsi14=core["rsi14"],
+                ema15_delta=core["ema15_delta"],
+                atr_ratio=core["atr_ratio"],
+                news_score=news_score,
+                asset=asset
+            )
+            if final_signal == "NO-TRADE":
+                blocked_reason = confirm_reason
         else:
             final_signal, final_conf, blocked_reason = protector.apply(
                 raw_signal=signal,
@@ -798,7 +809,7 @@ def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protect
             "ATR_Ratio": round(core["atr_ratio"], 6),
             "News_Score": round(news_score, 3),
             "Blocked_Reason": blocked_reason if blocked_reason else "",
-            "Confirm_7_13": "OK" if confirm_ok else "BLOCK",
+            "Confirm_7_13": "OK" if confirm_ok else "SOFT-BLOCK",
             "Confirm_Detail": (
                 f"u7:{confirm_details.get('up_fast',0)} d7:{confirm_details.get('dn_fast',0)} | "
                 f"u13:{confirm_details.get('up_slow',0)} d13:{confirm_details.get('dn_slow',0)} | "
@@ -878,6 +889,9 @@ def save_to_excel(results):
                         elif cell.value == "SELL":
                             cell.fill = PatternFill(start_color="FF4444", end_color="FF4444", fill_type="solid")
                             cell.font = Font(bold=True, color="FFFFFF", size=11)
+                        elif cell.value == "NO-TRADE":
+                            cell.fill = PatternFill(start_color="FFD966", end_color="FFD966", fill_type="solid")
+                            cell.font = Font(bold=True, color="000000", size=11)
         return True
     except Exception:
         return False
@@ -897,12 +911,12 @@ def generate_training_data_rsi_enhanced(n=1400):
         ema_delta = (prices[-1] - ema15) / (ema15 + 1e-9)
         atr_ratio = atr14 / (prices[-1] + 1e-9)
 
-        if rsi14 < 30 and ema_delta > -0.02 and atr_ratio < 0.05:
-            y = np.random.choice([1, 0], p=[0.74, 0.26])
-        elif rsi14 > 70 and ema_delta < 0.02 and atr_ratio < 0.05:
-            y = np.random.choice([0, 1], p=[0.74, 0.26])
+        if rsi14 < 35 and ema_delta > -0.03 and atr_ratio < 0.06:
+            y = np.random.choice([1, 0], p=[0.76, 0.24])
+        elif rsi14 > 65 and ema_delta < 0.03 and atr_ratio < 0.06:
+            y = np.random.choice([0, 1], p=[0.76, 0.24])
         else:
-            y = np.random.choice([0, 1], p=[0.49, 0.51])
+            y = np.random.choice([0, 1], p=[0.50, 0.50])
 
         X_data.append(features)
         y_data.append(y)
