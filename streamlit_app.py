@@ -7,6 +7,9 @@ import sys
 import traceback
 import warnings
 import hashlib
+import json
+import joblib
+from pathlib import Path
 warnings.filterwarnings("ignore")
 
 def log_exception(exc_type, exc_value, exc_traceback):
@@ -44,6 +47,29 @@ MIN_CONFIDENCE_TO_TRADE = 78
 HIGH_VOL_THRESHOLD = 0.045
 NEWS_TIMEOUT_SEC = 6
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
+
+# ==============================
+# CONFIRMATION CONFIG (7-13 + INDICATORS)
+# ==============================
+CONFIRM_WINDOW_FAST = 7
+CONFIRM_WINDOW_SLOW = 13
+MIN_FAST_COUNT = 6
+MIN_SLOW_DOMINANCE = 0.55
+RSI_BUY_MAX = 58
+RSI_SELL_MIN = 42
+ATR_MIN_RATIO = 0.002
+ATR_MAX_RATIO = 0.060
+EMA_STACK_REQUIRED = True
+MACD_CONFIRM_REQUIRED = True
+
+# ==============================
+# MODEL STORAGE
+# ==============================
+MODEL_DIR = Path("velora_models")
+MODEL_DIR.mkdir(exist_ok=True)
+MODEL_PATH = MODEL_DIR / "velora_700f_models.pkl"
+SCALER_PATH = MODEL_DIR / "velora_700f_scaler.pkl"
+META_PATH = MODEL_DIR / "velora_700f_meta.json"
 
 # ==============================
 # SKLEARN IMPORTS
@@ -164,7 +190,6 @@ class SignalGenerator:
 
         feats = []
 
-        # CORE RSI/EMA/ATR
         rsi_periods = [2, 3, 5, 7, 9, 11, 14, 18, 21, 28, 35, 42, 50]
         ema_periods = [3, 5, 7, 9, 12, 15, 18, 21, 26, 30, 34, 40, 50, 60]
         atr_periods = [5, 7, 10, 14, 21, 28]
@@ -192,7 +217,6 @@ class SignalGenerator:
         for i in range(len(ema_vals) - 1):
             feats.append((ema_vals[i] - ema_vals[i + 1]) / (ema_vals[i + 1] + eps))
 
-        # Multi-window stats
         windows = [3, 5, 7, 9, 12, 15, 18, 21, 24, 28, 32, 36, 42, 50, 60, 72, 84, 96]
         for w in windows:
             seg = p[-w:]
@@ -224,7 +248,6 @@ class SignalGenerator:
                 else:
                     feats.append(0.0)
 
-        # Oscillator + trend
         macd, macd_sig, macd_hist = self.calculate_macd(p)
         feats.extend([macd / (p[-1] + eps), macd_sig / (p[-1] + eps), macd_hist / (p[-1] + eps)])
 
@@ -255,7 +278,6 @@ class SignalGenerator:
             else:
                 feats.extend([np.mean(s > 0), np.mean(s < 0), np.mean(s == 0)])
 
-        # RSI+EMA15 interactions
         rsi14 = self.calculate_rsi(p, 14)
         ema15 = self.calculate_ema(p, 15)
         ema7 = self.calculate_ema(p, 7)
@@ -285,7 +307,61 @@ class SignalGenerator:
         elif len(feats) > 400:
             feats = feats[:400]
 
-        return feats
+        return feats.astype(np.float32)
+
+    def calculate_ultra_700_features(self, prices):
+        f400 = self.calculate_ultra_400_features(prices)
+        p = np.array(prices, dtype=np.float64)
+        p = np.nan_to_num(p, nan=0.0, posinf=0.0, neginf=0.0)
+        eps = 1e-9
+
+        extra = []
+
+        horizons = [2,3,4,5,6,8,10,12,15,18,21,24,30,36,42,50,60,72,84,96,110]
+        for h in horizons:
+            seg = p[-h:] if len(p) >= h else p
+            if len(seg) < 2:
+                extra.extend([0.0] * 8)
+                continue
+            r = np.diff(seg) / np.clip(seg[:-1], eps, np.inf)
+            mu = float(np.mean(r))
+            sd = float(np.std(r) + eps)
+            z_last = float((r[-1] - mu) / sd)
+            q10, q50, q90 = np.quantile(r, [0.1, 0.5, 0.9])
+            extra.extend([
+                float((seg[-1] - seg[0]) / (seg[0] + eps)),
+                float(sd),
+                float(mu),
+                float(z_last),
+                float(q10), float(q50), float(q90),
+                float((np.max(seg) - np.min(seg)) / (np.mean(seg) + eps)),
+            ])
+
+        for lag in [1,2,3,5,8,13,21,34]:
+            if len(p) > lag:
+                extra.append(float((p[-1] - p[-1-lag]) / (p[-1-lag] + eps)))
+                extra.append(float((p[-lag] - p[-1-lag]) / (p[-1-lag] + eps)))
+            else:
+                extra.extend([0.0, 0.0])
+
+        for w in [10,14,20,28,36,50,70,90,120]:
+            seg = p[-w:] if len(p) >= w else p
+            if len(seg) < 3:
+                extra.extend([0.0, 0.0]); continue
+            x = np.arange(len(seg))
+            c1 = np.polyfit(x, seg, 1)[0]
+            c2 = np.polyfit(x, seg, 2)[0]
+            extra.extend([float(c1 / (np.mean(seg) + eps)), float(c2 / (np.mean(seg) + eps))])
+
+        f = np.concatenate([f400, np.array(extra, dtype=np.float32)])
+        f = np.nan_to_num(f, nan=0.0, posinf=0.1, neginf=-0.1)
+        f = np.clip(f, -10, 10)
+
+        if len(f) < 700:
+            f = np.concatenate([f, np.zeros(700 - len(f), dtype=np.float32)])
+        elif len(f) > 700:
+            f = f[:700]
+        return f.astype(np.float32)
 
 # ==============================
 # NEWS ANALYZER
@@ -319,13 +395,7 @@ class NewsAnalyzer:
             return []
         try:
             url = "https://newsapi.org/v2/everything"
-            params = {
-                "q": query,
-                "language": "en",
-                "sortBy": "publishedAt",
-                "pageSize": 10,
-                "apiKey": self.api_key
-            }
+            params = {"q": query, "language": "en", "sortBy": "publishedAt", "pageSize": 10, "apiKey": self.api_key}
             r = requests.get(url, params=params, timeout=NEWS_TIMEOUT_SEC)
             if r.status_code != 200:
                 return []
@@ -347,7 +417,6 @@ class NewsAnalyzer:
                     pass
             return float(np.mean(vals)) if vals else 0.0
 
-        # fallback lexicon
         pos_words = {"surge", "beat", "growth", "bullish", "upgrade", "strong", "gain"}
         neg_words = {"drop", "miss", "bearish", "downgrade", "weak", "loss", "crash"}
         score = 0
@@ -416,7 +485,7 @@ class ProtectionEngine:
         return ("BUY" if raw_signal else "SELL"), conf, ""
 
 # ==============================
-# RSI REGIME ENSEMBLE
+# RSI REGIME ENSEMBLE (700F)
 # ==============================
 class RSIRegimeEnsemble:
     def __init__(self):
@@ -424,7 +493,7 @@ class RSIRegimeEnsemble:
         self.trained = False
         self.models = {}
         self.model_weights = {}
-        self.feature_importance_ = np.zeros(400, dtype=np.float64)
+        self.feature_importance_ = np.zeros(700, dtype=np.float64)
         self._build_model_pool()
 
     def _build_model_pool(self):
@@ -478,7 +547,7 @@ class RSIRegimeEnsemble:
                 else:
                     continue
 
-                if imp.shape[0] != 400:
+                if imp.shape[0] != 700:
                     continue
 
                 imp = np.nan_to_num(imp, nan=0.0, posinf=0.0, neginf=0.0)
@@ -491,7 +560,7 @@ class RSIRegimeEnsemble:
                 continue
 
         if len(importances) == 0:
-            self.feature_importance_ = np.zeros(400, dtype=np.float64)
+            self.feature_importance_ = np.zeros(700, dtype=np.float64)
             return
 
         W = np.array(mweights, dtype=np.float64)
@@ -518,7 +587,7 @@ class RSIRegimeEnsemble:
         X = np.nan_to_num(X, nan=0.0, posinf=0.1, neginf=-0.1)
         X = np.clip(X, -10, 10)
 
-        if X.ndim != 2 or X.shape[1] != 400:
+        if X.ndim != 2 or X.shape[1] != 700:
             return
 
         Xs = self.scaler.fit_transform(X)
@@ -550,7 +619,7 @@ class RSIRegimeEnsemble:
         x = np.nan_to_num(x, nan=0.0, posinf=0.1, neginf=-0.1)
         x = np.clip(x, -10, 10)
 
-        if x.shape[1] != 400:
+        if x.shape[1] != 700:
             return None, 50, 0
 
         xs = self.scaler.transform(x)
@@ -593,20 +662,20 @@ class StrategyComparator:
     def analyze_strategies(self, prices, asset):
         results = {}
         try:
-            results['Trend'] = "BUY" if (prices[-1] - prices[-28] > 0) else "SELL" if len(prices) > 28 else "BUY"
-            results['MeanRev'] = "BUY" if (prices[-1] < np.mean(prices[-20:])) else "SELL" if len(prices) > 20 else "BUY"
-            results['Momentum'] = "BUY" if (np.mean(np.diff(prices[-7:])) > 0) else "SELL" if len(prices) > 7 else "BUY"
+            results["Trend"] = "BUY" if (prices[-1] - prices[-28] > 0) else "SELL" if len(prices) > 28 else "BUY"
+            results["MeanRev"] = "BUY" if (prices[-1] < np.mean(prices[-20:])) else "SELL" if len(prices) > 20 else "BUY"
+            results["Momentum"] = "BUY" if (np.mean(np.diff(prices[-7:])) > 0) else "SELL" if len(prices) > 7 else "BUY"
 
             if len(prices) > 28:
                 high = np.max(prices[-28:])
                 low = np.min(prices[-28:])
-                results['Channel'] = "BUY" if prices[-1] > (high + low) / 2 else "SELL"
+                results["Channel"] = "BUY" if prices[-1] > (high + low) / 2 else "SELL"
             else:
-                results['Channel'] = "BUY"
+                results["Channel"] = "BUY"
 
-            results['Volatility'] = "BUY" if (np.std(np.diff(prices[-14:])) > 0) else "SELL" if len(prices) > 14 else "BUY"
+            results["Volatility"] = "BUY" if (np.std(np.diff(prices[-14:])) > 0) else "SELL" if len(prices) > 14 else "BUY"
         except Exception:
-            results = {'Trend': "BUY", 'MeanRev': "BUY", 'Momentum': "BUY", 'Channel': "BUY", 'Volatility': "BUY"}
+            results = {"Trend": "BUY", "MeanRev": "BUY", "Momentum": "BUY", "Channel": "BUY", "Volatility": "BUY"}
         return results
 
 # ==============================
@@ -627,12 +696,63 @@ def rsi_ema15_core(prices, gen):
         "trend_stack": float(np.sign(ema7 - ema15) + np.sign(ema15 - ema30)),
     }
 
+def candle_indicator_confirmation(prices, core, raw_signal, gen):
+    p = np.array(prices, dtype=np.float64)
+    d = np.diff(p)
+    if len(d) < CONFIRM_WINDOW_FAST:
+        return False, "Not enough candles", {}
+
+    fast = d[-CONFIRM_WINDOW_FAST:]
+    up_fast = int(np.sum(fast > 0))
+    dn_fast = int(np.sum(fast < 0))
+
+    slow = d[-CONFIRM_WINDOW_SLOW:] if len(d) >= CONFIRM_WINDOW_SLOW else d
+    up_slow = int(np.sum(slow > 0))
+    dn_slow = int(np.sum(slow < 0))
+    slow_len = max(len(slow), 1)
+
+    up_dom = up_slow / slow_len
+    dn_dom = dn_slow / slow_len
+
+    rsi14 = float(core["rsi14"])
+    atr_ratio = float(core["atr_ratio"])
+
+    ema7 = gen.calculate_ema(p, 7)
+    ema15 = gen.calculate_ema(p, 15)
+    ema30 = gen.calculate_ema(p, 30)
+    macd, macd_sig, macd_hist = gen.calculate_macd(p)
+
+    if raw_signal is True:
+        candle_ok = (up_fast >= MIN_FAST_COUNT) and (up_dom >= MIN_SLOW_DOMINANCE) and (up_slow > dn_slow)
+        rsi_ok = (rsi14 <= RSI_BUY_MAX)
+        atr_ok = (ATR_MIN_RATIO <= atr_ratio <= ATR_MAX_RATIO)
+        ema_ok = (ema7 > ema15 > ema30) if EMA_STACK_REQUIRED else True
+        macd_ok = (macd > macd_sig and macd_hist >= 0) if MACD_CONFIRM_REQUIRED else True
+        ok = candle_ok and rsi_ok and atr_ok and ema_ok and macd_ok
+        reason = "" if ok else "BUY confirmation failed (7-13/RSI/ATR/EMA/MACD)"
+    else:
+        candle_ok = (dn_fast >= MIN_FAST_COUNT) and (dn_dom >= MIN_SLOW_DOMINANCE) and (dn_slow > up_slow)
+        rsi_ok = (rsi14 >= RSI_SELL_MIN)
+        atr_ok = (ATR_MIN_RATIO <= atr_ratio <= ATR_MAX_RATIO)
+        ema_ok = (ema7 < ema15 < ema30) if EMA_STACK_REQUIRED else True
+        macd_ok = (macd < macd_sig and macd_hist <= 0) if MACD_CONFIRM_REQUIRED else True
+        ok = candle_ok and rsi_ok and atr_ok and ema_ok and macd_ok
+        reason = "" if ok else "SELL confirmation failed (7-13/RSI/ATR/EMA/MACD)"
+
+    details = {
+        "up_fast": up_fast, "dn_fast": dn_fast,
+        "up_slow": up_slow, "dn_slow": dn_slow,
+        "up_dom": round(up_dom, 3), "dn_dom": round(dn_dom, 3),
+        "rsi14": round(rsi14, 2), "atr_ratio": round(atr_ratio, 6),
+    }
+    return ok, reason, details
+
 def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protector):
     try:
         gen = SignalGenerator(asset, time_seed)
         prices = gen.generate_realistic_prices(120)
 
-        features = gen.calculate_ultra_400_features(prices)
+        features = gen.calculate_ultra_700_features(prices)
         core = rsi_ema15_core(prices, gen)
 
         signal, confidence, model_count = model.predict(features, rsi_value=core["rsi14"])
@@ -646,15 +766,22 @@ def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protect
 
         news_score, headlines = news_analyzer.score_asset_news(asset)
 
-        final_signal, final_conf, blocked_reason = protector.apply(
-            raw_signal=signal,
-            confidence=confidence,
-            rsi14=core["rsi14"],
-            ema15_delta=core["ema15_delta"],
-            atr_ratio=core["atr_ratio"],
-            news_score=news_score,
-            asset=asset
+        confirm_ok, confirm_reason, confirm_details = candle_indicator_confirmation(
+            prices=prices, core=core, raw_signal=signal, gen=gen
         )
+
+        if not confirm_ok:
+            final_signal, final_conf, blocked_reason = "NO-TRADE", min(confidence, 74), confirm_reason
+        else:
+            final_signal, final_conf, blocked_reason = protector.apply(
+                raw_signal=signal,
+                confidence=confidence,
+                rsi14=core["rsi14"],
+                ema15_delta=core["ema15_delta"],
+                atr_ratio=core["atr_ratio"],
+                news_score=news_score,
+                asset=asset
+            )
 
         return {
             "Asset": asset,
@@ -671,8 +798,14 @@ def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protect
             "ATR_Ratio": round(core["atr_ratio"], 6),
             "News_Score": round(news_score, 3),
             "Blocked_Reason": blocked_reason if blocked_reason else "",
+            "Confirm_7_13": "OK" if confirm_ok else "BLOCK",
+            "Confirm_Detail": (
+                f"u7:{confirm_details.get('up_fast',0)} d7:{confirm_details.get('dn_fast',0)} | "
+                f"u13:{confirm_details.get('up_slow',0)} d13:{confirm_details.get('dn_slow',0)} | "
+                f"RSI:{confirm_details.get('rsi14',0)} ATR:{confirm_details.get('atr_ratio',0)}"
+            ),
             "News_Headlines": " | ".join(headlines[:2]) if headlines else "",
-            "Source": f"🧠 RSI+EMA15 400F Ensemble ({model_count}) + Protection + News",
+            "Source": f"🧠 RSI+EMA15 700F Ensemble ({model_count}) + Protection + News + 7-13 Confirm",
             "Timestamp": datetime.now().strftime("%H:%M:%S")
         }
     except Exception:
@@ -714,7 +847,7 @@ def save_to_excel(results):
         if os.path.exists(EXCEL_FILE):
             df_old = pd.read_excel(EXCEL_FILE)
             df = pd.concat([df_old, df_new], ignore_index=True)
-            df = df.drop_duplicates(subset=["Asset", "Timestamp"], keep="last").tail(500)
+            df = df.drop_duplicates(subset=["Asset", "Timestamp"], keep="last").tail(700)
         else:
             df = df_new
 
@@ -745,44 +878,74 @@ def save_to_excel(results):
                         elif cell.value == "SELL":
                             cell.fill = PatternFill(start_color="FF4444", end_color="FF4444", fill_type="solid")
                             cell.font = Font(bold=True, color="FFFFFF", size=11)
-
-            for col in ws.columns:
-                ws.column_dimensions[col[0].column_letter].width = 15
         return True
     except Exception:
         return False
 
 # ==============================
-# TRAINING DATA
+# TRAINING / SAVE / LOAD
 # ==============================
-def generate_training_data_rsi_enhanced(n=650):
+def generate_training_data_rsi_enhanced(n=1400):
     X_data, y_data = [], []
     for i in range(n):
         gen = SignalGenerator(f"train_{i}", datetime.now().strftime("%Y-%m-%d"))
         prices = gen.generate_realistic_prices(120)
-        features = gen.calculate_ultra_400_features(prices)
+        features = gen.calculate_ultra_700_features(prices)
         rsi14 = gen.calculate_rsi(prices, 14)
         ema15 = gen.calculate_ema(prices, 15)
+        atr14 = gen.calculate_atr(prices, 14)
         ema_delta = (prices[-1] - ema15) / (ema15 + 1e-9)
+        atr_ratio = atr14 / (prices[-1] + 1e-9)
 
-        if rsi14 < 30 and ema_delta > -0.02:
-            y = np.random.choice([1, 0], p=[0.72, 0.28])
-        elif rsi14 > 70 and ema_delta < 0.02:
-            y = np.random.choice([0, 1], p=[0.72, 0.28])
+        if rsi14 < 30 and ema_delta > -0.02 and atr_ratio < 0.05:
+            y = np.random.choice([1, 0], p=[0.74, 0.26])
+        elif rsi14 > 70 and ema_delta < 0.02 and atr_ratio < 0.05:
+            y = np.random.choice([0, 1], p=[0.74, 0.26])
         else:
-            y = np.random.choice([0, 1], p=[0.48, 0.52])
+            y = np.random.choice([0, 1], p=[0.49, 0.51])
 
         X_data.append(features)
         y_data.append(y)
-
     return X_data, y_data
+
+def save_model_bundle(model):
+    try:
+        joblib.dump(model.models, MODEL_PATH)
+        joblib.dump(model.scaler, SCALER_PATH)
+        meta = {
+            "trained": bool(model.trained),
+            "model_weights": model.model_weights,
+            "top_features": model.get_top_features(30),
+            "saved_at": datetime.now().isoformat(),
+            "feature_dim": 700
+        }
+        with open(META_PATH, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+def load_model_bundle(model):
+    try:
+        if not (MODEL_PATH.exists() and SCALER_PATH.exists() and META_PATH.exists()):
+            return False
+        model.models = joblib.load(MODEL_PATH)
+        model.scaler = joblib.load(SCALER_PATH)
+        with open(META_PATH, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        model.model_weights = meta.get("model_weights", model.model_weights)
+        model.trained = bool(meta.get("trained", True))
+        model._compute_feature_importance()
+        return True
+    except Exception:
+        return False
 
 # ==============================
 # STREAMLIT UI
 # ==============================
-st.set_page_config(layout="wide", page_title="Velora AI - RSI/EMA15 400F", initial_sidebar_state="expanded")
-st.title("🚀 VELORA AI - RSI/EMA15 400 Features")
-st.markdown("**45s refresh | 7s precompute | protection mode | news-aware ensemble**")
+st.set_page_config(layout="wide", page_title="Velora AI - RSI/EMA15 700F", initial_sidebar_state="expanded")
+st.title("🚀 VELORA AI - RSI/EMA15 700 Features")
+st.markdown("**45s refresh | 7s precompute | protection mode | news-aware ensemble | 7-13 confirmation**")
 st.caption(f"Protection Mode: {'ON' if PROTECTION_MODE else 'OFF'} | Min Conf: {MIN_CONFIDENCE_TO_TRADE} | Vol Limit: {HIGH_VOL_THRESHOLD}")
 st.markdown("---")
 
@@ -810,9 +973,9 @@ if "prefetch_time" not in st.session_state:
     st.session_state.prefetch_time = None
 
 if not getattr(st.session_state.model, "trained", False):
-    with st.spinner("🔧 Training RSI/EMA15 400F ensemble..."):
+    with st.spinner("🔧 Training RSI/EMA15 700F ensemble..."):
         try:
-            X_train, y_train = generate_training_data_rsi_enhanced(650)
+            X_train, y_train = generate_training_data_rsi_enhanced(1400)
             st.session_state.model.train(X_train, y_train)
         except Exception as e:
             st.error(f"Training error: {str(e)}")
@@ -827,7 +990,7 @@ with m6: st.metric("🔄 Rounds", st.session_state.total_rounds)
 
 st.markdown("---")
 
-c1, c2, c3 = st.columns([2, 1, 1])
+c1, c2, c3, c4, c5 = st.columns([2, 1, 1, 1, 1])
 with c1:
     if st.button("🚀 START / STOP", use_container_width=True):
         st.session_state.running = not st.session_state.running
@@ -843,6 +1006,17 @@ with c2:
         st.session_state.prefetch_time = None
         st.rerun()
 with c3:
+    if st.button("💾 TRAIN+SAVE", use_container_width=True):
+        with st.spinner("Training + saving 700F model..."):
+            X_train, y_train = generate_training_data_rsi_enhanced(1400)
+            st.session_state.model.train(X_train, y_train)
+            ok = save_model_bundle(st.session_state.model)
+            st.success("Saved ✅" if ok else "Save failed ❌")
+with c4:
+    if st.button("📂 LOAD MODEL", use_container_width=True):
+        ok = load_model_bundle(st.session_state.model)
+        st.success("Loaded ✅" if ok else "Load failed ❌")
+with c5:
     if st.button("📥 DOWNLOAD", use_container_width=True):
         if os.path.exists(EXCEL_FILE):
             with open(EXCEL_FILE, "rb") as f:
@@ -934,12 +1108,12 @@ if st.session_state.running:
             st.markdown("---")
             st.subheader("🏆 Top Signals (Confidence)")
             top_df = df.nlargest(20, "Confidence")[
-                ["Asset", "Signal", "Confidence", "DL_Models", "RSI14", "EMA15_Delta", "News_Score", "Blocked_Reason"]
+                ["Asset", "Signal", "Confidence", "DL_Models", "RSI14", "ATR_Ratio", "Confirm_7_13", "Blocked_Reason"]
             ].copy()
             st.dataframe(top_df, use_container_width=True, hide_index=True)
 
             st.markdown("---")
-            st.subheader("🧬 Feature Importance (Top 30 / 400)")
+            st.subheader("🧬 Feature Importance (Top 30 / 700)")
             top_feats = st.session_state.model.get_top_features(k=30)
             if top_feats:
                 fi_df = pd.DataFrame(top_feats, columns=["Feature_Index", "Importance"])
