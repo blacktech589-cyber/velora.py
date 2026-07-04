@@ -1,6 +1,7 @@
 # ==============================
 # SYSTEM & ERROR HANDLING
 # ==============================
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import sys
 import traceback
@@ -80,7 +81,7 @@ class UltraIntelligentEnsembleModel:
         X_scaled = self.scaler.transform(X)
         preds = self.model.predict(X_scaled)
         return preds
-
+        current_time = datetime.now()
 # ==============================
 # STREAMLIT UI
 # ==============================
@@ -907,6 +908,7 @@ if st.session_state.running:
 
 results = []
 
+current_time = datetime.now()
 with ThreadPoolExecutor(max_workers=8) as executor:
     futures = {
         executor.submit(
@@ -918,10 +920,8 @@ with ThreadPoolExecutor(max_workers=8) as executor:
         ): asset
         for asset in assets
     }
-
     from concurrent.futures import ThreadPoolExecutor, as_completed
-
-results = {}
+    results = {}
 
 with ThreadPoolExecutor(max_workers=8) as executor:
     futures = {
