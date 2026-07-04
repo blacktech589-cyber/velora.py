@@ -1,6 +1,7 @@
 # ==============================
 # SYSTEM & ERROR HANDLING
 # ==============================
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import sys
 import traceback
 import warnings
@@ -905,17 +906,34 @@ if st.session_state.running:
             results = []
             from concurrent.futures import ThreadPoolExecutor, as_completed
             futures = {
-                from concurrent.futures import ThreadPoolExecutor, as_completed
-            results = {}
+               results = {}
             with ThreadPoolExecutor(max_workers=8) as executor:
                 futures = {
-                    executor.submit()
+                    executor.submit(
                         advanced_analyze,
-                    asset,
-                    st.session_state.model,
-                    current_time,
-                    st.session_state.comparator
-                }: asset
+                        asset,
+                        st.session_state.model,
+                        current_time,
+                        st.session_state.comparator
+                    ): asset
+                    for asset in assets
+                }
+                for future in as_completed(futures):
+                    asset = futures[future]
+                    try:
+                        results[asset] = future.result()
+                    except Exception:
+                        results[asset] = None
+                        results = {}
+                        with ThreadPoolExecutor(max_workers=8) as executor:
+                            futures = {
+                                executor.submit()
+                                advanced_analyze,
+                                asset,
+                                st.session_state.model,
+                                current_time,
+                                st.session_state.comparator
+                            }: asset
                 for asset in assets
                 {
                 for future in as_completed(futures):
