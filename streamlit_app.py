@@ -869,5 +869,3 @@ else:
                 st.caption(asset)
         
         st.markdown("---")
-        st.markdown("""
-       
