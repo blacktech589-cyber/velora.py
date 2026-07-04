@@ -922,7 +922,8 @@ with ThreadPoolExecutor(max_workers=8) as executor:
         for asset in assets
     }
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    results = {}
+
+results = {}
 
 with ThreadPoolExecutor(max_workers=8) as executor:
     futures = {
@@ -943,9 +944,6 @@ with ThreadPoolExecutor(max_workers=8) as executor:
         except Exception as e:
             print(f"Hata ({asset}): {e}")
             results[asset] = None
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-
-results = []
 
 with ThreadPoolExecutor(max_workers=max_workers) as executor:
     futures = [
