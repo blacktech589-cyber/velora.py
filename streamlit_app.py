@@ -904,10 +904,10 @@ if st.session_state.running:
         with st.spinner(f"🔄 TUR {st.session_state.total_rounds}: {len(ALL_ASSETS)} Varlık Taraniyor (20 Model, 1000+ Özellik, 5 Strateji)"):
             results = []
             from concurrent.futures import ThreadPoolExecutor, as_completed
-                futures = {
-                    executor.submit(advanced_analyze, asset, st.session_state.model, current_time, st.session_state.comparator): asset
-                    for asset in ALL_ASSETS
-                }
+            futures = {
+                executor.submit(advanced_analyze, asset, st.session_state.model, current_time, st.session_state.comparator): asset
+                for asset in ALL_ASSETS
+            }
                 
                 for future in as_completed(futures):
                     try:
