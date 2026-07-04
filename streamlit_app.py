@@ -908,13 +908,20 @@ if st.session_state.running:
                 executor.submit(advanced_analyze, asset, st.session_state.model, current_time, st.session_state.comparator): asset
                 for asset in ALL_ASSETS
             }
-                
-                for future in as_completed(futures):
-                    try:
-                        result = future.result()
-                        results.append(result)
-                    except Exception as e:
-                        pass
+            results = []
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = []
+                for model_name, model in self.models.items():
+                    futures.append(
+                        executor.submit(self._train_single_model, model_name, model, X, y)
+                    )
+                    for future in as_completed(futures):
+                        try:
+                            result = future.result()
+                            if result is not None:
+                                results.append(result)
+                        except Exception:
+                            pass
             
             if results:
                 df_results = pd.DataFrame(results)
