@@ -942,30 +942,29 @@ with ThreadPoolExecutor(max_workers=8) as executor:
         except Exception as e:
             print(f"Hata ({asset}): {e}")
             results[asset] = None
-                for asset in assets
-                {
-                for future in as_completed(futures):
-                    asset = futures[future]
-                    try:
-                        results[asset] = future.result()
-                    except Exception as e:
-                        results[asset] = None
-                        for asset in ALL_ASSETS
-                        }
-                        results = []
-                        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                            futures = []
-                            for model_name, model in self.models.items():
-                                futures.append()
-                                    executor.submit(self._train_single_model, model_name, model, X, y)
-                                }
-                                for future in as_completed(futures):
-                                    try:
-                                        result = future.result()
-                                        if result is not None:
-                                            results.append(result)
-                                    except Exception:
-                                        pass
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+
+results = []
+
+with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    futures = [
+        executor.submit(
+            self._train_single_model,
+            model_name,
+            model,
+            X,
+            y
+        )
+        for model_name, model in self.models.items()
+    ]
+
+    for future in as_completed(futures):
+        try:
+            result = future.result()
+            if result is not None:
+                results.append(result)
+        except Exception as e:
+            print(f"Model eğitimi hatası: {e}")
                                         if results:
                                             df_results = pd.DataFrame(results)
                                             buy_count = len(df_results[df_results['Signal'] == 'BUY'])
