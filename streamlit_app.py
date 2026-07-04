@@ -947,6 +947,13 @@ def run_analysis(assets, advanced_analyze, current_time):
         except Exception as e:
             results[asset] = None
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+
+current_time = datetime.now()
+
+comparator = st.session_state.get("comparator", None)
+
 with ThreadPoolExecutor(max_workers=8) as executor:
     futures = {
         executor.submit(
@@ -954,11 +961,19 @@ with ThreadPoolExecutor(max_workers=8) as executor:
             asset,
             st.session_state.model,
             current_time,
-            st.session_state.comparator
+            comparator
         ): asset
         for asset in assets
     }
 
+    results = {}
+
+    for future in as_completed(futures):
+        asset = futures[future]
+        try:
+            results[asset] = future.result()
+        except Exception:
+            results[asset] = None
     for future in as_completed(futures):
         asset = futures[future]
         try:
