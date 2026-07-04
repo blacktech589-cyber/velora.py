@@ -909,7 +909,7 @@ else:
     st.info("👇 **BAŞLAT** butonuna basarak Ultra-Zeki AI analizini başlatın")
     
     with st.expander("ℹ️ SISTEM ÖZELLİKLERİ", expanded=True):
-        st.markdown(""")
+        st.markdown("")
 
 
 
