@@ -982,6 +982,11 @@ with ThreadPoolExecutor(max_workers=8) as executor:
             print(f"Hata ({asset}): {e}")
             results[asset] = None
 
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+max_workers = os.cpu_count() or 4
+
 with ThreadPoolExecutor(max_workers=max_workers) as executor:
     futures = [
         executor.submit(
@@ -994,6 +999,15 @@ with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for model_name, model in self.models.items()
     ]
 
+    results = []
+
+    for future in as_completed(futures):
+        try:
+            result = future.result()
+            if result is not None:
+                results.append(result)
+        except Exception as e:
+            print(f"Model hatası: {e}")
     for future in as_completed(futures):
         try:
             result = future.result()
