@@ -4,12 +4,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 warnings.filterwarnings('ignore')
 
-# --- ERROR LOGGING ---
+# ===============================
+# ERROR LOGGING
+# ===============================
 def log_exception(exc_type, exc_value, exc_traceback):
     with open("hata_log.txt", "w", encoding="utf-8") as f:
         traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
+
 sys.excepthook = log_exception
 
+# ===============================
+# CORE LIBRARIES
+# ===============================
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -18,29 +24,52 @@ import os
 import joblib
 from datetime import datetime, timedelta
 import hashlib
+
 from sklearn.metrics import accuracy_score, precision_score, recall_score
 
-# ML Libraries
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler, PolynomialFeatures
-from sklearn.ensemble import (RandomForestClassifier, GradientBoostingClassifier, AdaBoostClassifier, 
-                              ExtraTreesClassifier, VotingClassifier, StackingClassifier)
+# ===============================
+# SKLEARN MODELS & TOOLS
+# ===============================
+from sklearn.preprocessing import (
+    StandardScaler, MinMaxScaler, RobustScaler, PolynomialFeatures
+)
+
+from sklearn.ensemble import (
+    RandomForestClassifier,
+    GradientBoostingClassifier,
+    AdaBoostClassifier,
+    ExtraTreesClassifier,
+    VotingClassifier,
+    StackingClassifier,
+    HistGradientBoostingClassifier  # Cloud-safe alternatif
+)
+
 from sklearn.neural_network import MLPClassifier
 from sklearn.svm import SVC
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+
+# ===============================
+# OPTIONAL ML LIBRARIES (CLOUD SAFE)
+# ===============================
+
+# --- XGBoost ---
 try:
     from xgboost import XGBClassifier
     XGB_OK = True
 except Exception:
+    XGBClassifier = None
     XGB_OK = False
-    try:
-        from lightgbm import LGBMClassifier
-        LGBM_OK = True
-    except Exception:
-        LGBM_OK = False
 
+# --- LightGBM ---
+try:
+    from lightgbm import LGBMClassifier
+    LGBM_OK = True
+except Exception:
+    LGBMClassifier = None
+    LGBM_OK = False
 # Data Generation
 from sklearn.datasets import make_classification
 
