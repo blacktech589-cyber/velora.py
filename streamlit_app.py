@@ -913,17 +913,32 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 results = {}
 
-with ThreadPoolExecutor(max_workers=8) as executor:
-    futures = {
-        executor.submit(
-            advanced_analyze,
-            asset,
-            st.session_state.model,
-            current_time,
-            st.session_state.comparator
-        ): asset
-        for asset in assets
-    }
+def run_analysis(assets, advanced_analyze, current_time):
+    results = {}
+
+    comparator = st.session_state.get("comparator")
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {
+            executor.submit(
+                advanced_analyze,
+                asset,
+                st.session_state.model,
+                current_time,
+                comparator
+            ): asset
+            for asset in assets
+        }
+
+        for future in as_completed(futures):
+            asset = futures[future]
+            try:
+                results[asset] = future.result()
+            except Exception as e:
+                results[asset] = None
+                st.error(f"Hata ({asset}): {e}")
+
+    return results
 
     for future in as_completed(futures):
         asset = futures[future]
