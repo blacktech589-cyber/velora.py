@@ -47,6 +47,9 @@ MIN_CONFIDENCE_TO_TRADE = 70
 HIGH_VOL_THRESHOLD = 0.060
 NEWS_TIMEOUT_SEC = 6
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
+PRICE_TIMEOUT_SEC = 8
+PRICE_INTERVAL = "1m"
+PRICE_LIMIT = 120
 
 # ==============================
 # CONFIRMATION CONFIG (4-15 + INDICATORS)
@@ -72,6 +75,57 @@ MODEL_DIR.mkdir(exist_ok=True)
 MODEL_PATH = MODEL_DIR / "velora_700f_models.pkl"
 SCALER_PATH = MODEL_DIR / "velora_700f_scaler.pkl"
 META_PATH = MODEL_DIR / "velora_700f_meta.json"
+
+# ==============================
+# MARKET DATA CONFIG
+# ==============================
+BINANCE_SYMBOLS = {
+    "Bitcoin": "BTCUSDT",
+    "Ethereum": "ETHUSDT",
+    "Cardano": "ADAUSDT",
+    "Solana": "SOLUSDT",
+    "Chainlink": "LINKUSDT",
+    "Bitcoin Cash": "BCHUSDT",
+    "Kusama": "KSMUSDT",
+    "Toncoin": "TONUSDT",
+    "Aave": "AAVEUSDT",
+    "Pancake Swap": "CAKEUSDT",
+    "Uniswap": "UNIUSDT",
+    "Crypto IDX": "BTCUSDT",
+}
+YAHOO_SYMBOLS = {
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "USD/JPY": "JPY=X",
+    "USD/CHF": "CHF=X",
+    "AUD/USD": "AUDUSD=X",
+    "USD/CAD": "CAD=X",
+    "NZD/USD": "NZDUSD=X",
+    "EUR/GBP": "EURGBP=X",
+    "EUR/JPY": "EURJPY=X",
+    "GBP/JPY": "GBPJPY=X",
+    "EUR/CAD": "EURCAD=X",
+    "GBP/CHF": "GBPCHF=X",
+    "AUD/CAD": "AUDCAD=X",
+    "GBP/NZD": "GBPNZD=X",
+    "CHF/JPY": "CHFJPY=X",
+    "Nvidia": "NVDA",
+    "Apple": "AAPL",
+    "Microsoft": "MSFT",
+    "Google": "GOOG",
+    "Amazon": "AMZN",
+    "Tesla": "TSLA",
+    "Meta": "META",
+    "Yum Brands": "YUM",
+    "Gold": "GC=F",
+    "Silver": "SI=F",
+    "Oil": "CL=F",
+    "Natural Gas": "NG=F",
+    "Copper": "HG=F",
+    "SP500": "^GSPC",
+    "NASDAQ100": "^NDX",
+    "DAX40": "^GDAXI",
+}
 
 # ==============================
 # SKLEARN IMPORTS
@@ -104,13 +158,68 @@ except Exception:
     LGBM_AVAILABLE = False
 
 # ==============================
-# SIGNAL GENERATOR
+# SIGNAL GENERATOR / MARKET DATA
 # ==============================
 class SignalGenerator:
     def __init__(self, asset, time_seed=None):
         self.asset = asset
         self.time_seed = time_seed or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         np.random.seed(int(hashlib.md5(f"{asset}{self.time_seed}".encode()).hexdigest(), 16) % 2**32)
+
+    def _fetch_binance_prices(self, symbol, interval=PRICE_INTERVAL, limit=PRICE_LIMIT):
+        try:
+            url = "https://api.binance.com/api/v3/klines"
+            params = {"symbol": symbol, "interval": interval, "limit": limit}
+            r = requests.get(url, params=params, timeout=PRICE_TIMEOUT_SEC)
+            if r.status_code != 200:
+                return None
+            data = r.json()
+            closes = [float(row[4]) for row in data if len(row) > 4]
+            if len(closes) >= 30:
+                return np.array(closes, dtype=np.float64)
+        except Exception:
+            return None
+        return None
+
+    def _fetch_yahoo_prices(self, symbol, interval=PRICE_INTERVAL, limit=PRICE_LIMIT):
+        try:
+            range_map = {"1m": "1d", "2m": "1d", "5m": "5d", "15m": "5d", "30m": "1mo", "60m": "1mo"}
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+            params = {
+                "interval": interval,
+                "range": range_map.get(interval, "1d"),
+                "includePrePost": "false",
+                "events": "div,splits",
+            }
+            headers = {"User-Agent": "Mozilla/5.0"}
+            r = requests.get(url, params=params, headers=headers, timeout=PRICE_TIMEOUT_SEC)
+            if r.status_code != 200:
+                return None
+            data = r.json()
+            result = (data.get("chart", {}) or {}).get("result", [])
+            if not result:
+                return None
+            quote = (((result[0].get("indicators", {}) or {}).get("quote", [])) or [{}])[0]
+            closes = quote.get("close", []) or []
+            closes = [float(x) for x in closes if x is not None]
+            if len(closes) >= 30:
+                return np.array(closes[-limit:], dtype=np.float64)
+        except Exception:
+            return None
+        return None
+
+    def fetch_live_prices(self, length=PRICE_LIMIT):
+        if self.asset in BINANCE_SYMBOLS:
+            prices = self._fetch_binance_prices(BINANCE_SYMBOLS[self.asset], limit=length)
+            if prices is not None:
+                return prices, f"Binance {PRICE_INTERVAL}"
+
+        if self.asset in YAHOO_SYMBOLS:
+            prices = self._fetch_yahoo_prices(YAHOO_SYMBOLS[self.asset], limit=length)
+            if prices is not None:
+                return prices, f"Yahoo Finance {PRICE_INTERVAL}"
+
+        return self.generate_realistic_prices(length), "Simulated"
 
     def generate_realistic_prices(self, length=120):
         if "EUR" in self.asset or "GBP" in self.asset or "USD" in self.asset:
@@ -760,7 +869,7 @@ def candle_indicator_confirmation(prices, core, raw_signal, gen):
 def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protector):
     try:
         gen = SignalGenerator(asset, time_seed)
-        prices = gen.generate_realistic_prices(120)
+        prices, market_source = gen.fetch_live_prices(PRICE_LIMIT)
 
         features = gen.calculate_ultra_700_features(prices)
         core = rsi_ema15_core(prices, gen)
@@ -814,6 +923,9 @@ def advanced_analyze(asset, model, time_seed, comparator, news_analyzer, protect
                 f"u15:{confirm_details.get('up_slow',0)} d15:{confirm_details.get('dn_slow',0)} | "
                 f"RSI:{confirm_details.get('rsi14',0)} ATR:{confirm_details.get('atr_ratio',0)}"
             ),
+            "Market_Source": market_source,
+            "Price_Count": int(len(prices)),
+            "Last_Price": round(float(prices[-1]), 6),
             "News_Headlines": " | ".join(headlines[:2]) if headlines else "",
             "Source": f"🧠 RSI+EMA15 700F Ensemble ({model_count}) + Protection + News + 4-15 Reversal Confirm",
             "Timestamp": datetime.now().strftime("%H:%M:%S")
@@ -958,8 +1070,8 @@ def load_model_bundle(model):
 # ==============================
 st.set_page_config(layout="wide", page_title="Velora AI - RSI/EMA15 700F", initial_sidebar_state="expanded")
 st.title("🚀 VELORA AI - RSI/EMA15 700 Features")
-st.markdown("**45s refresh | 7s precompute | protection mode | news-aware ensemble | 4-15 reversal confirmation**")
-st.caption(f"Protection Mode: {'ON' if PROTECTION_MODE else 'OFF'} | Min Conf: {MIN_CONFIDENCE_TO_TRADE} | Vol Limit: {HIGH_VOL_THRESHOLD}")
+st.markdown("**Live market data | 1m candles where available | protection mode | news-aware ensemble | 4-15 reversal confirmation**")
+st.caption(f"Protection Mode: {'ON' if PROTECTION_MODE else 'OFF'} | Min Conf: {MIN_CONFIDENCE_TO_TRADE} | Vol Limit: {HIGH_VOL_THRESHOLD} | Interval: {PRICE_INTERVAL}")
 st.markdown("---")
 
 if "model" not in st.session_state:
@@ -1121,7 +1233,7 @@ if st.session_state.running:
             st.markdown("---")
             st.subheader("🏆 Top Signals (Confidence)")
             top_df = df.nlargest(20, "Confidence")[[
-                "Asset", "Signal", "Confidence", "DL_Models", "RSI14", "ATR_Ratio", "Confirm_4_15", "Blocked_Reason"
+                "Asset", "Signal", "Confidence", "DL_Models", "RSI14", "ATR_Ratio", "Confirm_4_15", "Market_Source", "Last_Price", "Blocked_Reason"
             ]].copy()
             st.dataframe(top_df, use_container_width=True, hide_index=True)
 
