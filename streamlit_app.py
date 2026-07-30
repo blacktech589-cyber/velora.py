@@ -589,9 +589,9 @@ def render_clickable_ranking(table: pd.DataFrame, key: str):
     return event
 
 
-@st.fragment(run_every="20s")
+@st.fragment(run_every="38s")
 def render_auto_top_signal():
-    """En yüksek model güvenini 20 saniyede bir yeniden okur."""
+    """En yüksek model güvenlerini 38 saniyede bir dönüşümlü gösterir."""
     if not OUTPUT_FILE.exists():
         st.info("Henüz kaydedilmiş bir AI işlemi bulunmuyor.")
         return
@@ -603,9 +603,11 @@ def render_auto_top_signal():
     history = history.dropna(subset=["Güven"])
     if history.empty:
         return
-    top = history.sort_values(
+    ranked = history.sort_values(
         ["Güven", "Zaman"], ascending=[False, False]
-    ).iloc[0]
+    ).head(20).reset_index(drop=True)
+    rotation_index = (int(time.time()) // 38) % len(ranked)
+    top = ranked.iloc[rotation_index]
     confidence_percent = float(top["Güven"]) * 100
     st.subheader("🏆 En yüksek güvenli işlem")
     a1, a2, a3, a4 = st.columns(4)
@@ -618,7 +620,8 @@ def render_auto_top_signal():
     )
     st.progress(min(max(confidence_percent / 100, 0.0), 1.0))
     st.caption(
-        "Bu bölüm 20 saniyede bir yenilenir · Son kontrol: "
+        f"38 saniyede bir değişir · Sıra {rotation_index + 1}/{len(ranked)} · "
+        "En yüksek güven yüzdeleri önceliklidir · "
         + datetime.now().astimezone().strftime("%H:%M:%S")
     )
 
@@ -726,7 +729,7 @@ def render_live_market(asset_name: str, symbol: str, interval: str):
 
 st.set_page_config(page_title="Binomo DL Araştırma", layout="wide")
 st.title("Binomo Derin Öğrenme Araştırması")
-st.caption("Sürüm: CLOUD-SAFE-2026.07.30.11 — Rotating Top 20")
+st.caption("Sürüm: CLOUD-SAFE-2026.07.30.13 — Dual 38s")
 st.warning("Araştırma amaçlıdır. Otomatik işlem yapmaz; yatırım tavsiyesi veya kazanç garantisi değildir.")
 render_auto_top_signal()
 render_best_accuracy_panel()
