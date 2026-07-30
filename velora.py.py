@@ -40,16 +40,9 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-try:
-    import tensorflow as tf
-    from tensorflow.keras import Model, Sequential
-    from tensorflow.keras.callbacks import EarlyStopping
-    from tensorflow.keras.layers import (
-        GRU, LSTM, Conv1D, Dense, Dropout, GlobalAveragePooling1D, Input
-    )
-    TF_AVAILABLE = True
-except ImportError:
-    TF_AVAILABLE = False
+# Community Cloud güvenli sürümünde ağır TensorFlow çalışma zamanı yüklenmez.
+# DeepMLP, çok katmanlı sinir ağı modeli olarak ensemble içinde çalışır.
+TF_AVAILABLE = False
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -348,26 +341,6 @@ def sequences(frame: pd.DataFrame, lookback: int):
     return np.asarray(xs), np.asarray(ys), rows
 
 
-def build_dl_models(shape):
-    early = EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)
-    lstm = Sequential([
-        Input(shape=shape), LSTM(32), Dropout(.2), Dense(16, activation="relu"),
-        Dense(1, activation="sigmoid")
-    ], name="LSTM")
-    gru = Sequential([
-        Input(shape=shape), GRU(32), Dropout(.2), Dense(16, activation="relu"),
-        Dense(1, activation="sigmoid")
-    ], name="GRU")
-    inp = Input(shape=shape)
-    z = Conv1D(32, 3, padding="causal", activation="relu")(inp)
-    z = Conv1D(16, 3, padding="causal", activation="relu")(z)
-    z = GlobalAveragePooling1D()(z)
-    cnn = Model(inp, Dense(1, activation="sigmoid")(z), name="CNN1D")
-    for model in (lstm, gru, cnn):
-        model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
-    return [lstm, gru, cnn], early
-
-
 def train_and_predict(frame, lookback, epochs):
     X, y, row_ids = sequences(frame, lookback)
     if len(X) < 100:
@@ -417,20 +390,6 @@ def train_and_predict(frame, lookback, epochs):
             float(pipe.predict_proba(latest_seq.reshape(1, -1))[0, 1])
         )
         names.append(name)
-
-    if TF_AVAILABLE:
-        dl_models, early = build_dl_models(X_train.shape[1:])
-        for model in dl_models:
-            model.fit(
-                X_train, y_train, validation_split=.2, epochs=epochs, batch_size=32,
-                callbacks=[early], verbose=0, shuffle=False,
-            )
-            probabilities.append(model.predict(X_test, verbose=0).ravel())
-            latest_probs.append(float(model.predict(latest_seq, verbose=0)[0, 0]))
-            names.append(model.name)
-            model.save(MODEL_DIR / f"{model.name}.keras")
-        # Streamlit yeniden çalıştırmalarında TensorFlow grafiklerini biriktirme.
-        tf.keras.backend.clear_session()
 
     ensemble = np.mean(probabilities, axis=0)
     pred = (ensemble >= .5).astype(int)
@@ -538,6 +497,7 @@ def latest_indicators(frame: pd.DataFrame) -> dict:
 
 st.set_page_config(page_title="Binomo DL Araştırma", layout="wide")
 st.title("Binomo Derin Öğrenme Araştırması")
+st.caption("Sürüm: CLOUD-SAFE-2026.07.30.3")
 st.warning("Araştırma amaçlıdır. Otomatik işlem yapmaz; yatırım tavsiyesi veya kazanç garantisi değildir.")
 data_source = st.radio(
     "Veri kaynağı",
