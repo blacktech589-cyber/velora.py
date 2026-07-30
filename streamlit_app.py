@@ -622,6 +622,45 @@ def render_auto_top_signal():
     )
 
 
+@st.fragment(run_every="38s")
+def render_best_accuracy_panel():
+    """Geçmiş testlerde en yüksek doğruluğu 38 saniyede bir gösterir."""
+    if not OUTPUT_FILE.exists():
+        return
+    history = pd.read_excel(OUTPUT_FILE, sheet_name="Sinyaller")
+    accuracy_column = (
+        "En başarılı model doğruluğu"
+        if "En başarılı model doğruluğu" in history
+        else "Test doğruluğu"
+    )
+    if history.empty or accuracy_column not in history:
+        return
+    history[accuracy_column] = pd.to_numeric(
+        history[accuracy_column], errors="coerce"
+    )
+    history = history.dropna(subset=[accuracy_column])
+    if history.empty:
+        return
+    best = history.sort_values(
+        [accuracy_column, "Zaman"], ascending=[False, False]
+    ).iloc[0]
+    accuracy_percent = float(best[accuracy_column]) * 100
+    st.subheader("🧠 En çok bilen model")
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Varlık", str(best.get("Varlık", "-")))
+    b2.metric(
+        "Model",
+        str(best.get("En başarılı model", best.get("Modeller", "-"))),
+    )
+    b3.metric("Test başarısı", f"%{accuracy_percent:.1f}")
+    b4.metric("Sinyal", str(best.get("Sinyal", "-")))
+    st.progress(min(max(accuracy_percent / 100, 0.0), 1.0))
+    st.caption(
+        "38 saniyede bir yenilenir · Zaman sıralı geçmiş test sonucudur · "
+        + datetime.now().astimezone().strftime("%H:%M:%S")
+    )
+
+
 def latest_indicators(frame: pd.DataFrame) -> dict:
     row = frame.iloc[-1]
     return {
@@ -683,9 +722,10 @@ def render_live_market(asset_name: str, symbol: str, interval: str):
 
 st.set_page_config(page_title="Binomo DL Araştırma", layout="wide")
 st.title("Binomo Derin Öğrenme Araştırması")
-st.caption("Sürüm: CLOUD-SAFE-2026.07.30.9 — Live Data 20s")
+st.caption("Sürüm: CLOUD-SAFE-2026.07.30.10 — Best AI 38s")
 st.warning("Araştırma amaçlıdır. Otomatik işlem yapmaz; yatırım tavsiyesi veya kazanç garantisi değildir.")
 render_auto_top_signal()
+render_best_accuracy_panel()
 data_source = st.radio(
     "Veri kaynağı",
     ["Çevrim içi veriyi kendisi indir", "CSV kullan"],
@@ -791,6 +831,11 @@ if should_analyze:
         else:
             signal = "YUKARI" if probability >= .5 else "AŞAĞI"
         confidence = directional_confidence
+        best_model_name = max(
+            model_details,
+            key=lambda name: model_details[name]["test_doğruluğu"],
+        )
+        best_model_accuracy = model_details[best_model_name]["test_doğruluğu"]
         record = {
             "Zaman": datetime.now().astimezone().isoformat(timespec="seconds"),
             "Varlık": asset,
@@ -802,6 +847,8 @@ if should_analyze:
             "Tahmin ufku (mum)": horizon,
             "Model sayısı": len(model_names),
             "Modeller": ", ".join(model_names),
+            "En başarılı model": best_model_name,
+            "En başarılı model doğruluğu": best_model_accuracy,
             "AI karar nedeni": (
                 "Düşük model uzlaşması" if signal == "BEKLE"
                 else "Dinamik ağırlıklı model uzlaşması"
