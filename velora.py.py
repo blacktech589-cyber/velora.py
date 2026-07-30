@@ -27,15 +27,16 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
 from openpyxl.formatting.rule import ColorScaleRule
 from openpyxl.styles import Alignment, Font, PatternFill
-from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, precision_score, recall_score
+from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -380,7 +381,7 @@ def train_and_predict(frame, lookback, epochs):
             "Mum aralığını veya tahmin ufkunu değiştirin."
         )
     # Cloud belleğini korurken en yeni piyasa rejimine öncelik verir.
-    max_windows = 3500
+    max_windows = 1200
     if len(X) > max_windows:
         X, y = X[-max_windows:], y[-max_windows:]
     split = int(len(X) * .8)
@@ -393,12 +394,20 @@ def train_and_predict(frame, lookback, epochs):
     probabilities, latest_probs, names = [], [], []
 
     classical = [
-        ("RandomForest", RandomForestClassifier(
-            n_estimators=160, min_samples_leaf=3, class_weight="balanced",
-            random_state=42, n_jobs=1)),
-        ("ExtraTrees", ExtraTreesClassifier(
-            n_estimators=160, min_samples_leaf=3, class_weight="balanced",
-            random_state=42, n_jobs=1)),
+        ("DeepMLP", MLPClassifier(
+            hidden_layer_sizes=(64, 32), activation="relu",
+            alpha=0.001, batch_size=64,
+            max_iter=max(40, int(epochs) * 3),
+            early_stopping=True, validation_fraction=0.15,
+            n_iter_no_change=10, random_state=42,
+        )),
+        ("HistGradientBoosting", HistGradientBoostingClassifier(
+            max_iter=160, learning_rate=0.05, max_leaf_nodes=31,
+            l2_regularization=0.1, early_stopping=True, random_state=42,
+        )),
+        ("LogisticRegression", LogisticRegression(
+            C=0.5, max_iter=500, class_weight="balanced", random_state=42,
+        )),
     ]
     for name, estimator in classical:
         pipe = Pipeline([("imputer", SimpleImputer()), ("scale", StandardScaler()), ("model", estimator)])
@@ -408,7 +417,6 @@ def train_and_predict(frame, lookback, epochs):
             float(pipe.predict_proba(latest_seq.reshape(1, -1))[0, 1])
         )
         names.append(name)
-        joblib.dump(pipe, MODEL_DIR / f"{name}.joblib")
 
     if TF_AVAILABLE:
         dl_models, early = build_dl_models(X_train.shape[1:])
@@ -558,7 +566,7 @@ else:
 c4, c5 = st.columns(2)
 lookback = c4.number_input("Model penceresi (mum)", 20, 120, 40)
 epochs = c5.slider("DL epoch", 5, 60, 15)
-force_run = st.button("Verileri yenile, analiz et ve Excel'e kaydet", type="primary")
+force_run = st.button("Analizi başlat ve Excel'e kaydet", type="primary")
 
 csv_bytes = None
 csv_source = None
@@ -587,10 +595,9 @@ if csv_bytes:
 if "last_saved_analysis" not in st.session_state:
     st.session_state.last_saved_analysis = None
 
-should_analyze = bool(
-    csv_bytes
-    and (force_run or analysis_key != st.session_state.last_saved_analysis)
-)
+# Community Cloud'da sayfa açılışında ağır model eğitimi süreci düşürebilir.
+# Veri otomatik indirilir; eğitim kullanıcı düğmeye bastığında bir kez çalışır.
+should_analyze = bool(csv_bytes and force_run)
 
 if should_analyze:
     try:
@@ -664,3 +671,8 @@ elif csv_bytes and st.session_state.last_saved_analysis == analysis_key:
     if not existing.empty:
         st.subheader("Öncelikli işlemler")
         st.dataframe(existing, use_container_width=True, hide_index=True)
+elif csv_bytes:
+    st.success(
+        "Piyasa verisi hazır. Model eğitimi için "
+        "'Analizi başlat ve Excel'e kaydet' düğmesine basın."
+    )
