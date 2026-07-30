@@ -6,6 +6,7 @@ dışa aktarılan mum verisini analiz eder; platform hesabına bağlanmaz.
 from __future__ import annotations
 
 import io
+import hashlib
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +38,7 @@ except ImportError:
 APP_DIR = Path(__file__).resolve().parent
 MODEL_DIR = APP_DIR / "models"
 OUTPUT_FILE = APP_DIR / "binomo_sinyalleri.xlsx"
+AUTO_CSV_FILE = APP_DIR / "hazir_veri.csv"
 LOG_FILE = APP_DIR / "hata_log.txt"
 MODEL_DIR.mkdir(exist_ok=True)
 logging.basicConfig(
@@ -293,6 +295,13 @@ def append_excel(record: dict) -> bytes:
         data = pd.concat([old, new], ignore_index=True).tail(5000)
     else:
         data = new
+    # En yüksek güvenli işlemler her zaman ilk sırada görünür.
+    data = data.drop(columns=["Öncelik"], errors="ignore")
+    data["Güven"] = pd.to_numeric(data["Güven"], errors="coerce")
+    data = data.sort_values(
+        ["Güven", "Zaman"], ascending=[False, False], na_position="last"
+    ).reset_index(drop=True)
+    data.insert(0, "Öncelik", np.arange(1, len(data) + 1))
     with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
         data.to_excel(writer, sheet_name="Sinyaller", index=False)
         ws = writer.sheets["Sinyaller"]
@@ -307,17 +316,43 @@ def append_excel(record: dict) -> bytes:
             ws.column_dimensions[letter].width = min(32, max(12, max(len(str(c.value or "")) for c in col) + 2))
         if ws.max_row > 1:
             ws.conditional_formatting.add(
-                f"D2:D{ws.max_row}",
+                f"F2:F{ws.max_row}",
                 ColorScaleRule(start_type="min", start_color="F8696B",
                                mid_type="percentile", mid_value=50, mid_color="FFEB84",
                                end_type="max", end_color="63BE7B"),
             )
+            for cell in ws["E"][1:]:
+                cell.number_format = "0.00%"
+            for cell in ws["F"][1:]:
+                cell.number_format = "0.00%"
         pd.DataFrame([{
             "Not": "Araştırma amaçlıdır; yatırım tavsiyesi veya kazanç garantisi değildir.",
             "Veri": "Kullanıcının yüklediği geçmiş OHLC mum verisi",
             "Doğrulama": "Son %20 veri, zaman sırası korunarak test edilir.",
         }]).to_excel(writer, sheet_name="Açıklama", index=False)
     return OUTPUT_FILE.read_bytes()
+
+
+def prioritized_signal_table() -> pd.DataFrame:
+    """Excel geçmişini ekranda güven yüzdesine göre önceliklendirir."""
+    if not OUTPUT_FILE.exists():
+        return pd.DataFrame()
+    history = pd.read_excel(OUTPUT_FILE, sheet_name="Sinyaller")
+    history["Güven"] = pd.to_numeric(history["Güven"], errors="coerce")
+    history = history.sort_values(
+        ["Güven", "Zaman"], ascending=[False, False], na_position="last"
+    ).reset_index(drop=True)
+    history["Öncelik"] = np.arange(1, len(history) + 1)
+    history["Güven"] = history["Güven"] * 100
+    if "Model olasılığı" in history:
+        history["Model olasılığı"] = history["Model olasılığı"] * 100
+    if "Test doğruluğu" in history:
+        history["Test doğruluğu"] = history["Test doğruluğu"] * 100
+    visible = [
+        "Öncelik", "Varlık", "Sinyal", "Güven", "Model olasılığı",
+        "Tahmin ufku (mum)", "Test doğruluğu", "Zaman",
+    ]
+    return history[[column for column in visible if column in history.columns]]
 
 
 def latest_indicators(frame: pd.DataFrame) -> dict:
@@ -343,15 +378,43 @@ st.set_page_config(page_title="Binomo DL Araştırma", layout="wide")
 st.title("Binomo CSV Derin Öğrenme Araştırması")
 st.warning("Araştırma amaçlıdır. Otomatik işlem yapmaz; yatırım tavsiyesi veya kazanç garantisi değildir.")
 uploaded = st.file_uploader("Binomo mum verisi CSV", type=["csv"])
+st.caption(
+    "CSV yüklenince analiz otomatik başlar. Alternatif olarak "
+    f"`{AUTO_CSV_FILE.name}` dosyasını uygulamayla aynı klasöre koyabilirsiniz."
+)
 c1, c2, c3 = st.columns(3)
 asset = c1.text_input("Varlık", "EUR/USD")
 horizon = c2.number_input("Tahmin ufku (mum)", 1, 20, 1)
 lookback = c3.number_input("Model penceresi (mum)", 20, 120, 40)
 epochs = st.slider("DL epoch", 5, 100, 25)
+force_run = st.button("Aynı veriyi yeniden analiz et")
 
-if uploaded and st.button("Eğit, test et ve Excel'e kaydet", type="primary"):
+csv_bytes = None
+csv_source = None
+if uploaded is not None:
+    csv_bytes = uploaded.getvalue()
+    csv_source = uploaded.name
+elif AUTO_CSV_FILE.exists():
+    csv_bytes = AUTO_CSV_FILE.read_bytes()
+    csv_source = AUTO_CSV_FILE.name
+    st.info(f"Hazır veri bulundu: {AUTO_CSV_FILE.name}")
+
+analysis_key = None
+if csv_bytes:
+    settings = f"{asset}|{horizon}|{lookback}|{epochs}".encode("utf-8")
+    analysis_key = hashlib.sha256(csv_bytes + settings).hexdigest()
+
+if "last_saved_analysis" not in st.session_state:
+    st.session_state.last_saved_analysis = None
+
+should_analyze = bool(
+    csv_bytes
+    and (force_run or analysis_key != st.session_state.last_saved_analysis)
+)
+
+if should_analyze:
     try:
-        raw = pd.read_csv(uploaded, sep=None, engine="python")
+        raw = pd.read_csv(io.BytesIO(csv_bytes), sep=None, engine="python")
         data = normalize_columns(raw)
         frame = add_features(data, int(horizon))
         with st.spinner("Modeller eğitiliyor..."):
@@ -375,7 +438,32 @@ if uploaded and st.button("Eğit, test et ve Excel'e kaydet", type="primary"):
             **indicators,
         }
         excel_bytes = append_excel(record)
-        st.success(f"Sonuç: {signal} — model güveni %{confidence * 100:.1f}")
+        st.session_state.last_saved_analysis = analysis_key
+
+        # Kullanıcının ilk gördüğü bölüm: önceliklendirilmiş işlem listesi.
+        st.subheader("Öncelikli işlemler")
+        st.caption("En yüksek güven yüzdesi ilk sıradadır.")
+        priority_table = prioritized_signal_table()
+        st.dataframe(
+            priority_table,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Güven": st.column_config.ProgressColumn(
+                    "Güven", min_value=0.0, max_value=100.0, format="%.1f%%"
+                ),
+                "Model olasılığı": st.column_config.NumberColumn(
+                    "Yukarı olasılığı", format="%.1f%%"
+                ),
+                "Test doğruluğu": st.column_config.NumberColumn(
+                    "Test doğruluğu", format="%.1f%%"
+                ),
+            },
+        )
+        st.success(
+            f"{csv_source} otomatik analiz edildi ve Excel'e kaydedildi. "
+            f"Sonuç: {signal} — model güveni %{confidence * 100:.1f}"
+        )
         st.json(metrics)
         st.subheader("Son mum teknik göstergeleri")
         st.dataframe(pd.DataFrame([indicators]), use_container_width=True, hide_index=True)
@@ -387,3 +475,9 @@ if uploaded and st.button("Eğit, test et ve Excel'e kaydet", type="primary"):
     except Exception as exc:
         logging.exception("Analiz başarısız")
         st.error(f"İşlem tamamlanamadı: {exc}")
+elif csv_bytes and st.session_state.last_saved_analysis == analysis_key:
+    st.success("Bu veri daha önce analiz edilip Excel'e kaydedildi.")
+    existing = prioritized_signal_table()
+    if not existing.empty:
+        st.subheader("Öncelikli işlemler")
+        st.dataframe(existing, use_container_width=True, hide_index=True)
