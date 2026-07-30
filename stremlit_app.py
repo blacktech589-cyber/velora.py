@@ -27,15 +27,16 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
 from openpyxl.formatting.rule import ColorScaleRule
 from openpyxl.styles import Alignment, Font, PatternFill
-from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, precision_score, recall_score
+from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -393,12 +394,20 @@ def train_and_predict(frame, lookback, epochs):
     probabilities, latest_probs, names = [], [], []
 
     classical = [
-        ("RandomForest", RandomForestClassifier(
-            n_estimators=160, min_samples_leaf=3, class_weight="balanced",
-            random_state=42, n_jobs=1)),
-        ("ExtraTrees", ExtraTreesClassifier(
-            n_estimators=160, min_samples_leaf=3, class_weight="balanced",
-            random_state=42, n_jobs=1)),
+        ("DeepMLP", MLPClassifier(
+            hidden_layer_sizes=(128, 64, 32), activation="relu",
+            alpha=0.001, batch_size=64,
+            max_iter=max(80, int(epochs) * 6),
+            early_stopping=True, validation_fraction=0.15,
+            n_iter_no_change=10, random_state=42,
+        )),
+        ("HistGradientBoosting", HistGradientBoostingClassifier(
+            max_iter=160, learning_rate=0.05, max_leaf_nodes=31,
+            l2_regularization=0.1, early_stopping=True, random_state=42,
+        )),
+        ("LogisticRegression", LogisticRegression(
+            C=0.5, max_iter=500, class_weight="balanced", random_state=42,
+        )),
     ]
     for name, estimator in classical:
         pipe = Pipeline([("imputer", SimpleImputer()), ("scale", StandardScaler()), ("model", estimator)])
@@ -408,7 +417,6 @@ def train_and_predict(frame, lookback, epochs):
             float(pipe.predict_proba(latest_seq.reshape(1, -1))[0, 1])
         )
         names.append(name)
-        joblib.dump(pipe, MODEL_DIR / f"{name}.joblib")
 
     if TF_AVAILABLE:
         dl_models, early = build_dl_models(X_train.shape[1:])
