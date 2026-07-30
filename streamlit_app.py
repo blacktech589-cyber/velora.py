@@ -606,7 +606,17 @@ def render_auto_top_signal():
     ranked = history.sort_values(
         ["Güven", "Zaman"], ascending=[False, False]
     ).head(20).reset_index(drop=True)
-    rotation_index = (int(time.time()) // 40) % len(ranked)
+    if "top_signal_manual_offset" not in st.session_state:
+        st.session_state.top_signal_manual_offset = 0
+    if st.button(
+        "Sonraki yüksek yüzde →",
+        key="next_top_confidence",
+        use_container_width=True,
+    ):
+        st.session_state.top_signal_manual_offset += 1
+    rotation_index = (
+        int(time.time()) // 40 + st.session_state.top_signal_manual_offset
+    ) % len(ranked)
     top = ranked.iloc[rotation_index]
     confidence_percent = float(top["Güven"]) * 100
     st.subheader("🏆 En yüksek güvenli işlem")
@@ -729,7 +739,7 @@ def render_live_market(asset_name: str, symbol: str, interval: str):
 
 st.set_page_config(page_title="Binomo DL Araştırma", layout="wide")
 st.title("Binomo Derin Öğrenme Araştırması")
-st.caption("Sürüm: CLOUD-SAFE-2026.07.30.14 — Ranked 40s")
+st.caption("Sürüm: CLOUD-SAFE-2026.07.30.15 — Click Next")
 st.warning("Araştırma amaçlıdır. Otomatik işlem yapmaz; yatırım tavsiyesi veya kazanç garantisi değildir.")
 render_auto_top_signal()
 render_best_accuracy_panel()
