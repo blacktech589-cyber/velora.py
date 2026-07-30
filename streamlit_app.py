@@ -708,6 +708,7 @@ def analyze_10_20_trend(frame: pd.DataFrame) -> dict:
             "sma20": np.nan,
             "range_position": np.nan,
             "price_zone": "YETERSİZ VERİ",
+            "alternating_pattern": "YETERSİZ VERİ",
         }
 
     close = frame["close"].astype(float)
@@ -762,15 +763,26 @@ def analyze_10_20_trend(frame: pd.DataFrame) -> dict:
     ):
         second_candle = "2. YÜKSELİŞ MUMU"
         candle_signal = "YUKARI"
+        alternating_pattern = "ARDIŞIK YÜKSELİŞ"
     elif (
         bool(bearish.iloc[-2]) and bool(bearish.iloc[-1])
         and bool(falling_closes.iloc[-2]) and bool(falling_closes.iloc[-1])
     ):
         second_candle = "2. DÜŞÜŞ MUMU"
         candle_signal = "AŞAĞI"
+        alternating_pattern = "ARDIŞIK DÜŞÜŞ"
+    elif bool(bearish.iloc[-2]) and bool(bullish.iloc[-1]):
+        second_candle = "DÜŞÜŞ → YÜKSELİŞ"
+        candle_signal = "YUKARI"
+        alternating_pattern = "DÖNÜŞ BUY"
+    elif bool(bullish.iloc[-2]) and bool(bearish.iloc[-1]):
+        second_candle = "YÜKSELİŞ → DÜŞÜŞ"
+        candle_signal = "AŞAĞI"
+        alternating_pattern = "DÖNÜŞ SELL"
     else:
         second_candle = "TEYİT YOK"
         candle_signal = "BEKLE"
+        alternating_pattern = "DÖNÜŞ YOK"
 
     if mean_reversion_signal == candle_signal and candle_signal != "BEKLE":
         trend_signal = candle_signal
@@ -793,6 +805,7 @@ def analyze_10_20_trend(frame: pd.DataFrame) -> dict:
         "sma20": sma20,
         "range_position": range_position,
         "price_zone": price_zone,
+        "alternating_pattern": alternating_pattern,
     }
 
 
@@ -892,7 +905,7 @@ def render_live_market(asset_name: str, symbol: str, interval: str):
 
 st.set_page_config(page_title="Binomo DL Araştırma", layout="wide")
 st.title("Binomo Derin Öğrenme Araştırması")
-st.caption("Sürüm: ENTERPRISE-AI-2026.07.30.19 — 1M High Confidence")
+st.caption("Sürüm: ENTERPRISE-AI-2026.07.30.20 — Reversal Candles")
 st.warning("Araştırma amaçlıdır. Otomatik işlem yapmaz; yatırım tavsiyesi veya kazanç garantisi değildir.")
 render_auto_top_signal()
 render_best_accuracy_panel()
@@ -1051,6 +1064,7 @@ if should_analyze:
             "Ham AI sinyali": ai_signal,
             "10/20 trend sinyali": trend_analysis["trend_signal"],
             "İkinci mum durumu": trend_analysis["second_candle"],
+            "Dönüş mum deseni": trend_analysis["alternating_pattern"],
             "Trend açıklaması": trend_analysis["trend_reason"],
             "SMA 10": round(float(trend_analysis["sma10"]), 6),
             "SMA 20": round(float(trend_analysis["sma20"]), 6),
@@ -1098,7 +1112,7 @@ if should_analyze:
         e4.metric("Denetim ID", enterprise["audit_id"])
         st.info("Birleşik karar açıklaması: " + combined_reason)
         st.subheader("10/20 mum trend stratejisi")
-        t1, t2, t3, t4, t5 = st.columns(5)
+        t1, t2, t3, t4, t5, t6 = st.columns(6)
         t1.metric("Trend sinyali", trend_analysis["trend_signal"])
         t2.metric("İkinci mum", trend_analysis["second_candle"])
         t3.metric("SMA 10", f"{trend_analysis['sma10']:.6f}")
@@ -1108,6 +1122,7 @@ if should_analyze:
             trend_analysis["price_zone"],
             f"%{trend_analysis['range_position'] * 100:.1f}",
         )
+        t6.metric("Dönüş deseni", trend_analysis["alternating_pattern"])
         st.info(trend_analysis["trend_reason"])
         with st.expander("Zeka motoru — model ağırlıkları"):
             st.dataframe(
