@@ -589,9 +589,9 @@ def render_clickable_ranking(table: pd.DataFrame, key: str):
     return event
 
 
-@st.fragment(run_every="38s")
+@st.fragment(run_every="40s")
 def render_auto_top_signal():
-    """En yüksek model güvenlerini 38 saniyede bir dönüşümlü gösterir."""
+    """Güven yüzdesine göre sıralı işlemleri 40 saniyede bir gösterir."""
     if not OUTPUT_FILE.exists():
         st.info("Henüz kaydedilmiş bir AI işlemi bulunmuyor.")
         return
@@ -606,7 +606,7 @@ def render_auto_top_signal():
     ranked = history.sort_values(
         ["Güven", "Zaman"], ascending=[False, False]
     ).head(20).reset_index(drop=True)
-    rotation_index = (int(time.time()) // 38) % len(ranked)
+    rotation_index = (int(time.time()) // 40) % len(ranked)
     top = ranked.iloc[rotation_index]
     confidence_percent = float(top["Güven"]) * 100
     st.subheader("🏆 En yüksek güvenli işlem")
@@ -620,15 +620,15 @@ def render_auto_top_signal():
     )
     st.progress(min(max(confidence_percent / 100, 0.0), 1.0))
     st.caption(
-        f"38 saniyede bir değişir · Sıra {rotation_index + 1}/{len(ranked)} · "
+        f"40 saniyede bir değişir · Sıra {rotation_index + 1}/{len(ranked)} · "
         "En yüksek güven yüzdeleri önceliklidir · "
         + datetime.now().astimezone().strftime("%H:%M:%S")
     )
 
 
-@st.fragment(run_every="38s")
+@st.fragment(run_every="40s")
 def render_best_accuracy_panel():
-    """Geçmiş testlerde en yüksek doğruluğu 38 saniyede bir gösterir."""
+    """Test başarısına göre sıralı modelleri 40 saniyede bir gösterir."""
     if not OUTPUT_FILE.exists():
         return
     history = pd.read_excel(OUTPUT_FILE, sheet_name="Sinyaller")
@@ -648,7 +648,7 @@ def render_best_accuracy_panel():
     ranked = history.sort_values(
         [accuracy_column, "Zaman"], ascending=[False, False]
     ).head(20).reset_index(drop=True)
-    rotation_index = (int(time.time()) // 38) % len(ranked)
+    rotation_index = (int(time.time()) // 40) % len(ranked)
     best = ranked.iloc[rotation_index]
     accuracy_percent = float(best[accuracy_column]) * 100
     st.subheader("🧠 En çok bilen model")
@@ -662,7 +662,7 @@ def render_best_accuracy_panel():
     b4.metric("Sinyal", str(best.get("Sinyal", "-")))
     st.progress(min(max(accuracy_percent / 100, 0.0), 1.0))
     st.caption(
-        f"38 saniyede bir değişir · Sıra {rotation_index + 1}/{len(ranked)} · "
+        f"40 saniyede bir değişir · Sıra {rotation_index + 1}/{len(ranked)} · "
         "Yüksek başarı yüzdeleri önceliklidir · "
         + datetime.now().astimezone().strftime("%H:%M:%S")
     )
@@ -729,7 +729,7 @@ def render_live_market(asset_name: str, symbol: str, interval: str):
 
 st.set_page_config(page_title="Binomo DL Araştırma", layout="wide")
 st.title("Binomo Derin Öğrenme Araştırması")
-st.caption("Sürüm: CLOUD-SAFE-2026.07.30.13 — Dual 38s")
+st.caption("Sürüm: CLOUD-SAFE-2026.07.30.14 — Ranked 40s")
 st.warning("Araştırma amaçlıdır. Otomatik işlem yapmaz; yatırım tavsiyesi veya kazanç garantisi değildir.")
 render_auto_top_signal()
 render_best_accuracy_panel()
