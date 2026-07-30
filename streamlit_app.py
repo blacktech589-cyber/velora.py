@@ -706,6 +706,8 @@ def analyze_10_20_trend(frame: pd.DataFrame) -> dict:
             "trend_reason": "Trend analizi için en az 22 mum gerekir.",
             "sma10": np.nan,
             "sma20": np.nan,
+            "range_position": np.nan,
+            "price_zone": "YETERSİZ VERİ",
         }
 
     close = frame["close"].astype(float)
@@ -713,17 +715,40 @@ def analyze_10_20_trend(frame: pd.DataFrame) -> dict:
     last_close = float(close.iloc[-1])
     sma10 = float(close.tail(10).mean())
     sma20 = float(close.tail(20).mean())
+    low20 = float(frame["low"].tail(20).min())
+    high20 = float(frame["high"].tail(20).max())
+    price_range = high20 - low20
+    range_position = (
+        (last_close - low20) / price_range
+        if price_range > 0 else 0.5
+    )
 
-    # Kullanıcının istediği ortalamaya dönüş stratejisi:
-    # iki ortalamanın üstünde SELL, altında BUY.
-    if last_close > sma10 and last_close > sma20:
+    # Öncelik fiyat bölgesindedir: dipte BUY, tepede SELL.
+    if range_position <= 0.20:
+        mean_reversion_signal = "YUKARI"
+        price_zone = "DİP BÖLGESİ"
+        mean_reversion_reason = (
+            f"Fiyat son 20 mum aralığının alt %{range_position * 100:.1f} "
+            "bölgesinde: BUY"
+        )
+    elif range_position >= 0.80:
         mean_reversion_signal = "AŞAĞI"
-        mean_reversion_reason = "Fiyat SMA10 ve SMA20 üzerinde: SELL"
+        price_zone = "TEPE BÖLGESİ"
+        mean_reversion_reason = (
+            f"Fiyat son 20 mum aralığının üst %{range_position * 100:.1f} "
+            "bölgesinde: SELL"
+        )
     elif last_close < sma10 and last_close < sma20:
         mean_reversion_signal = "YUKARI"
+        price_zone = "ORTA-ALT BÖLGE"
         mean_reversion_reason = "Fiyat SMA10 ve SMA20 altında: BUY"
+    elif last_close > sma10 and last_close > sma20:
+        mean_reversion_signal = "AŞAĞI"
+        price_zone = "ORTA-ÜST BÖLGE"
+        mean_reversion_reason = "Fiyat SMA10 ve SMA20 üzerinde: SELL"
     else:
         mean_reversion_signal = "BEKLE"
+        price_zone = "ORTA BÖLGE"
         mean_reversion_reason = "Fiyat SMA10/SMA20 arasında"
 
     bullish = close > open_price
@@ -766,6 +791,8 @@ def analyze_10_20_trend(frame: pd.DataFrame) -> dict:
         "trend_reason": trend_reason,
         "sma10": sma10,
         "sma20": sma20,
+        "range_position": range_position,
+        "price_zone": price_zone,
     }
 
 
@@ -773,6 +800,7 @@ def enterprise_context(
     frame: pd.DataFrame,
     probability: float,
     metrics: dict,
+    minimum_confidence: float = 0.65,
 ) -> dict:
     """Kararı veri kalitesi, rejim ve belirsizlik açısından denetler."""
     feature_frame = frame[FEATURES].replace([np.inf, -np.inf], np.nan)
@@ -792,7 +820,10 @@ def enterprise_context(
     else:
         regime = "Yatay / zayıf trend"
     disagreement = float(metrics.get("Model anlaşmazlığı", 0))
-    adaptive_threshold = min(0.70, 0.55 + disagreement)
+    minimum_confidence = max(0.55, min(0.85, minimum_confidence))
+    adaptive_threshold = min(
+        0.85, minimum_confidence + min(disagreement, 0.10)
+    )
     directional_confidence = max(probability, 1 - probability)
     if quality_score < 90:
         decision = "BEKLE"
@@ -861,7 +892,7 @@ def render_live_market(asset_name: str, symbol: str, interval: str):
 
 st.set_page_config(page_title="Binomo DL Araştırma", layout="wide")
 st.title("Binomo Derin Öğrenme Araştırması")
-st.caption("Sürüm: ENTERPRISE-AI-2026.07.30.17 — Trend 10/20")
+st.caption("Sürüm: ENTERPRISE-AI-2026.07.30.19 — 1M High Confidence")
 st.warning("Araştırma amaçlıdır. Otomatik işlem yapmaz; yatırım tavsiyesi veya kazanç garantisi değildir.")
 render_auto_top_signal()
 render_best_accuracy_panel()
@@ -883,7 +914,7 @@ else:
 c1, c2, c3 = st.columns(3)
 if data_source == "Çevrim içi veriyi kendisi indir":
     asset = c1.selectbox("Varlık", list(MARKET_SYMBOLS), index=0)
-    interval = c2.selectbox("Mum aralığı", list(INTERVAL_PERIODS), index=2)
+    interval = c2.selectbox("Mum aralığı", list(INTERVAL_PERIODS), index=0)
     horizon = c3.number_input("Tahmin ufku (mum)", 1, 20, 1)
 else:
     asset = c1.text_input("Varlık", "EUR/USD")
@@ -891,12 +922,20 @@ else:
     interval = c3.text_input("Mum aralığı", "CSV")
 if data_source == "Çevrim içi veriyi kendisi indir":
     render_live_market(asset, MARKET_SYMBOLS[asset], interval)
-c4, c5, c6 = st.columns(3)
-lookback = c4.number_input("Model penceresi (mum)", 20, 120, 40)
+c4, c5, c6, c7 = st.columns(4)
+lookback = c4.number_input("Model penceresi (mum)", 20, 120, 90)
 epochs = c5.slider("DL epoch", 5, 60, 15)
 payout_rate = c6.number_input(
     "Binomo ödeme oranı (%)", min_value=0, max_value=100, value=82,
     help="Platformda görünen oranı elle girin; model güveninden farklıdır.",
+)
+minimum_confidence_percent = c7.slider(
+    "Minimum karar güveni (%)",
+    min_value=55,
+    max_value=85,
+    value=65,
+    step=1,
+    help="Bu eşik aşılmazsa sistem YUKARI/AŞAĞI yerine BEKLE verir.",
 )
 analysis_candles = st.slider(
     "Analiz edilecek son mum sayısı",
@@ -933,7 +972,8 @@ elif AUTO_CSV_FILE.exists():
 analysis_key = None
 if csv_bytes:
     settings = (
-        f"{asset}|{horizon}|{lookback}|{epochs}|{analysis_candles}"
+        f"{asset}|{horizon}|{lookback}|{epochs}|{analysis_candles}|"
+        f"{minimum_confidence_percent}"
     ).encode("utf-8")
     analysis_key = hashlib.sha256(csv_bytes + settings).hexdigest()
 
@@ -965,7 +1005,12 @@ if should_analyze:
             )
         indicators = latest_indicators(frame)
         trend_analysis = analyze_10_20_trend(frame)
-        enterprise = enterprise_context(frame, probability, metrics)
+        enterprise = enterprise_context(
+            frame,
+            probability,
+            metrics,
+            minimum_confidence_percent / 100,
+        )
         ai_signal = enterprise["decision"]
         if (
             ai_signal in {"YUKARI", "AŞAĞI"}
@@ -1009,11 +1054,16 @@ if should_analyze:
             "Trend açıklaması": trend_analysis["trend_reason"],
             "SMA 10": round(float(trend_analysis["sma10"]), 6),
             "SMA 20": round(float(trend_analysis["sma20"]), 6),
+            "20 mum fiyat bölgesi": trend_analysis["price_zone"],
+            "20 mum konumu (%)": round(
+                float(trend_analysis["range_position"]) * 100, 2
+            ),
             "Piyasa rejimi": enterprise["regime"],
             "Veri kalite puanı": round(enterprise["quality_score"], 2),
             "Dinamik güven eşiği": round(
                 enterprise["adaptive_threshold"], 4
             ),
+            "Minimum güven ayarı (%)": minimum_confidence_percent,
             "Denetim kimliği": enterprise["audit_id"],
             "Test doğruluğu": round(metrics["Doğruluk"], 4),
             "Test precision": round(metrics["Precision"], 4),
@@ -1048,11 +1098,16 @@ if should_analyze:
         e4.metric("Denetim ID", enterprise["audit_id"])
         st.info("Birleşik karar açıklaması: " + combined_reason)
         st.subheader("10/20 mum trend stratejisi")
-        t1, t2, t3, t4 = st.columns(4)
+        t1, t2, t3, t4, t5 = st.columns(5)
         t1.metric("Trend sinyali", trend_analysis["trend_signal"])
         t2.metric("İkinci mum", trend_analysis["second_candle"])
         t3.metric("SMA 10", f"{trend_analysis['sma10']:.6f}")
         t4.metric("SMA 20", f"{trend_analysis['sma20']:.6f}")
+        t5.metric(
+            "Fiyat bölgesi",
+            trend_analysis["price_zone"],
+            f"%{trend_analysis['range_position'] * 100:.1f}",
+        )
         st.info(trend_analysis["trend_reason"])
         with st.expander("Zeka motoru — model ağırlıkları"):
             st.dataframe(
