@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -165,7 +166,7 @@ INTERVAL_PERIODS = {
 }
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=20, show_spinner=False)
 def download_market_data(symbol: str, interval: str) -> pd.DataFrame:
     """Ek paket gerektirmeden harici piyasa kaynağından OHLCV indirir."""
     encoded_symbol = urlencode({"symbol": symbol}).split("=", 1)[1]
@@ -417,17 +418,38 @@ def train_and_predict(frame, lookback, epochs, max_windows=6000):
         )
         names.append(name)
 
-    ensemble = np.mean(probabilities, axis=0)
+    # Her modelin yakın geçmiş test başarısına göre dinamik ağırlıklandırma.
+    model_scores = [
+        accuracy_score(y_test, (model_probability >= 0.5).astype(int))
+        for model_probability in probabilities
+    ]
+    model_weights = np.array(
+        [max(0.05, score - 0.45) for score in model_scores], dtype=float
+    )
+    model_weights /= model_weights.sum()
+    ensemble = np.average(np.vstack(probabilities), axis=0, weights=model_weights)
     pred = (ensemble >= .5).astype(int)
+    disagreement = float(np.mean(np.std(np.vstack(probabilities), axis=0)))
     metrics = {
         "Doğruluk": accuracy_score(y_test, pred),
         "Precision": precision_score(y_test, pred, zero_division=0),
         "Recall": recall_score(y_test, pred, zero_division=0),
         "Test örneği": len(y_test),
+        "Model anlaşmazlığı": round(disagreement, 4),
     }
 
-    probability = float(np.mean(latest_probs))
-    return probability, metrics, names
+    probability = float(np.average(latest_probs, weights=model_weights))
+    model_details = {
+        name: {
+            "test_doğruluğu": round(float(score), 4),
+            "zeka_ağırlığı": round(float(weight), 4),
+            "yukarı_olasılığı": round(float(latest), 4),
+        }
+        for name, score, weight, latest in zip(
+            names, model_scores, model_weights, latest_probs
+        )
+    }
+    return probability, metrics, names, model_details
 
 
 def append_excel(record: dict, market_data: pd.DataFrame | None = None) -> bytes:
@@ -440,8 +462,18 @@ def append_excel(record: dict, market_data: pd.DataFrame | None = None) -> bytes
     # En yüksek güvenli işlemler her zaman ilk sırada görünür.
     data = data.drop(columns=["Öncelik"], errors="ignore")
     data["Güven"] = pd.to_numeric(data["Güven"], errors="coerce")
+    payout_source = data.get(
+        "Binomo ödeme oranı (%)",
+        pd.Series(0.0, index=data.index),
+    )
+    payout = pd.to_numeric(payout_source, errors="coerce").fillna(0)
+    data["Karşılaştırma puanı"] = (
+        data["Güven"] * payout - (1 - data["Güven"]) * 100
+    ).round(2)
     data = data.sort_values(
-        ["Güven", "Zaman"], ascending=[False, False], na_position="last"
+        ["Karşılaştırma puanı", "Güven", "Zaman"],
+        ascending=[False, False, False],
+        na_position="last",
     ).reset_index(drop=True)
     data.insert(0, "Öncelik", np.arange(1, len(data) + 1))
     with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
@@ -486,8 +518,20 @@ def prioritized_signal_table() -> pd.DataFrame:
         return pd.DataFrame()
     history = pd.read_excel(OUTPUT_FILE, sheet_name="Sinyaller")
     history["Güven"] = pd.to_numeric(history["Güven"], errors="coerce")
+    payout_source = history.get(
+        "Binomo ödeme oranı (%)",
+        pd.Series(0.0, index=history.index),
+    )
+    payout = pd.to_numeric(payout_source, errors="coerce").fillna(0)
+    # Bir birim risk için ikili işlem beklenen değeri:
+    # kazanma_olasılığı * ödeme - kaybetme_olasılığı * 100
+    history["Karşılaştırma puanı"] = (
+        history["Güven"] * payout - (1 - history["Güven"]) * 100
+    ).round(2)
     history = history.sort_values(
-        ["Güven", "Zaman"], ascending=[False, False], na_position="last"
+        ["Karşılaştırma puanı", "Güven", "Zaman"],
+        ascending=[False, False, False],
+        na_position="last",
     ).reset_index(drop=True)
     history["Öncelik"] = np.arange(1, len(history) + 1)
     history["Güven"] = history["Güven"] * 100
@@ -496,10 +540,142 @@ def prioritized_signal_table() -> pd.DataFrame:
     if "Test doğruluğu" in history:
         history["Test doğruluğu"] = history["Test doğruluğu"] * 100
     visible = [
-        "Öncelik", "Varlık", "Sinyal", "Güven yüzdesi", "Güven", "Model olasılığı",
+        "Öncelik", "Varlık", "Sinyal", "Karşılaştırma puanı",
+        "Güven yüzdesi", "Güven", "Binomo ödeme oranı (%)", "Model olasılığı",
         "Tahmin ufku (mum)", "Test doğruluğu", "Zaman",
     ]
     return history[[column for column in visible if column in history.columns]]
+
+
+def render_clickable_ranking(table: pd.DataFrame, key: str):
+    """Sıralamayı gösterir ve tıklanan işlemin ayrıntısını açar."""
+    event = st.dataframe(
+        table,
+        use_container_width=True,
+        hide_index=True,
+        key=key,
+        on_select="rerun",
+        selection_mode="single-row",
+        column_config={
+            "Güven": st.column_config.ProgressColumn(
+                "Güven", min_value=0.0, max_value=100.0, format="%.1f%%"
+            ),
+            "Model olasılığı": st.column_config.NumberColumn(
+                "Yukarı olasılığı", format="%.1f%%"
+            ),
+            "Test doğruluğu": st.column_config.NumberColumn(
+                "Test doğruluğu", format="%.1f%%"
+            ),
+            "Karşılaştırma puanı": st.column_config.NumberColumn(
+                "Beklenen değer", format="%.2f"
+            ),
+        },
+    )
+    selected_rows = event.selection.rows
+    if selected_rows:
+        selected = table.iloc[int(selected_rows[0])]
+        st.subheader(f"Seçilen işlem: {selected.get('Varlık', '-')}")
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("Sinyal", str(selected.get("Sinyal", "-")))
+        d2.metric("Güven", str(selected.get("Güven yüzdesi", "-")))
+        d3.metric(
+            "Ödeme",
+            f"%{float(selected.get('Binomo ödeme oranı (%)', 0)):.1f}",
+        )
+        d4.metric(
+            "Karşılaştırma",
+            f"{float(selected.get('Karşılaştırma puanı', 0)):.2f}",
+        )
+    return event
+
+
+@st.fragment(run_every="40s")
+def render_auto_top_signal():
+    """Güven yüzdesine göre sıralı işlemleri 40 saniyede bir gösterir."""
+    if not OUTPUT_FILE.exists():
+        st.info("Henüz kaydedilmiş bir AI işlemi bulunmuyor.")
+        return
+    history = pd.read_excel(OUTPUT_FILE, sheet_name="Sinyaller")
+    if history.empty or "Güven" not in history:
+        st.info("Henüz karşılaştırılabilir işlem bulunmuyor.")
+        return
+    history["Güven"] = pd.to_numeric(history["Güven"], errors="coerce")
+    history = history.dropna(subset=["Güven"])
+    if history.empty:
+        return
+    ranked = history.sort_values(
+        ["Güven", "Zaman"], ascending=[False, False]
+    ).head(20).reset_index(drop=True)
+    if "top_signal_manual_offset" not in st.session_state:
+        st.session_state.top_signal_manual_offset = 0
+    if st.button(
+        "Sonraki yüksek yüzde →",
+        key="next_top_confidence",
+        use_container_width=True,
+    ):
+        st.session_state.top_signal_manual_offset += 1
+    rotation_index = (
+        int(time.time()) // 40 + st.session_state.top_signal_manual_offset
+    ) % len(ranked)
+    top = ranked.iloc[rotation_index]
+    confidence_percent = float(top["Güven"]) * 100
+    st.subheader("🏆 En yüksek güvenli işlem")
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("Varlık", str(top.get("Varlık", "-")))
+    a2.metric("Sinyal", str(top.get("Sinyal", "-")))
+    a3.metric("Güven yüzdesi", f"%{confidence_percent:.1f}")
+    a4.metric(
+        "Binomo ödeme",
+        f"%{float(top.get('Binomo ödeme oranı (%)', 0)):.1f}",
+    )
+    st.progress(min(max(confidence_percent / 100, 0.0), 1.0))
+    st.caption(
+        f"40 saniyede bir değişir · Sıra {rotation_index + 1}/{len(ranked)} · "
+        "En yüksek güven yüzdeleri önceliklidir · "
+        + datetime.now().astimezone().strftime("%H:%M:%S")
+    )
+
+
+@st.fragment(run_every="40s")
+def render_best_accuracy_panel():
+    """Test başarısına göre sıralı modelleri 40 saniyede bir gösterir."""
+    if not OUTPUT_FILE.exists():
+        return
+    history = pd.read_excel(OUTPUT_FILE, sheet_name="Sinyaller")
+    accuracy_column = (
+        "En başarılı model doğruluğu"
+        if "En başarılı model doğruluğu" in history
+        else "Test doğruluğu"
+    )
+    if history.empty or accuracy_column not in history:
+        return
+    history[accuracy_column] = pd.to_numeric(
+        history[accuracy_column], errors="coerce"
+    )
+    history = history.dropna(subset=[accuracy_column])
+    if history.empty:
+        return
+    ranked = history.sort_values(
+        [accuracy_column, "Zaman"], ascending=[False, False]
+    ).head(20).reset_index(drop=True)
+    rotation_index = (int(time.time()) // 40) % len(ranked)
+    best = ranked.iloc[rotation_index]
+    accuracy_percent = float(best[accuracy_column]) * 100
+    st.subheader("🧠 En çok bilen model")
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Varlık", str(best.get("Varlık", "-")))
+    b2.metric(
+        "Model",
+        str(best.get("En başarılı model", best.get("Modeller", "-"))),
+    )
+    b3.metric("Test başarısı", f"%{accuracy_percent:.1f}")
+    b4.metric("Sinyal", str(best.get("Sinyal", "-")))
+    st.progress(min(max(accuracy_percent / 100, 0.0), 1.0))
+    st.caption(
+        f"40 saniyede bir değişir · Sıra {rotation_index + 1}/{len(ranked)} · "
+        "Yüksek başarı yüzdeleri önceliklidir · "
+        + datetime.now().astimezone().strftime("%H:%M:%S")
+    )
 
 
 def latest_indicators(frame: pd.DataFrame) -> dict:
@@ -521,10 +697,102 @@ def latest_indicators(frame: pd.DataFrame) -> dict:
     }
 
 
+def enterprise_context(
+    frame: pd.DataFrame,
+    probability: float,
+    metrics: dict,
+) -> dict:
+    """Kararı veri kalitesi, rejim ve belirsizlik açısından denetler."""
+    feature_frame = frame[FEATURES].replace([np.inf, -np.inf], np.nan)
+    missing_ratio = float(feature_frame.isna().mean().mean())
+    quality_score = max(0.0, min(100.0, (1 - missing_ratio) * 100))
+    latest = frame.iloc[-1]
+    adx = float(latest.get("adx_14", 0) * 100)
+    volatility = float(latest.get("volatility_20", 0))
+    median_volatility = float(
+        frame["volatility_20"].dropna().median()
+        if frame["volatility_20"].notna().any() else 0
+    )
+    if adx >= 25:
+        regime = "Güçlü trend"
+    elif volatility > median_volatility * 1.5:
+        regime = "Yüksek volatilite"
+    else:
+        regime = "Yatay / zayıf trend"
+    disagreement = float(metrics.get("Model anlaşmazlığı", 0))
+    adaptive_threshold = min(0.70, 0.55 + disagreement)
+    directional_confidence = max(probability, 1 - probability)
+    if quality_score < 90:
+        decision = "BEKLE"
+        reason = "Veri kalite puanı yetersiz"
+    elif directional_confidence < adaptive_threshold:
+        decision = "BEKLE"
+        reason = "Dinamik güven eşiği aşılmadı"
+    else:
+        decision = "YUKARI" if probability >= 0.5 else "AŞAĞI"
+        reason = "Kalite ve model uzlaşması yeterli"
+    audit_payload = (
+        f"{frame['time'].iloc[-1]}|{probability:.8f}|{decision}|"
+        f"{quality_score:.4f}|{regime}"
+    )
+    audit_id = hashlib.sha256(audit_payload.encode("utf-8")).hexdigest()[:16]
+    return {
+        "decision": decision,
+        "reason": reason,
+        "quality_score": quality_score,
+        "regime": regime,
+        "adaptive_threshold": adaptive_threshold,
+        "directional_confidence": directional_confidence,
+        "audit_id": audit_id,
+    }
+
+
+@st.fragment(run_every="20s")
+def render_live_market(asset_name: str, symbol: str, interval: str):
+    """Son fiyat ve hızlı teknik göstergeleri sürekli günceller."""
+    try:
+        live_data = download_market_data(symbol, interval)
+        featured = add_features(live_data.tail(250).reset_index(drop=True), 1)
+        latest = featured.iloc[-1]
+        previous_close = float(live_data["close"].iloc[-2])
+        last_close = float(live_data["close"].iloc[-1])
+        change = (
+            (last_close / previous_close - 1) * 100
+            if previous_close else 0.0
+        )
+        rsi_value = float(latest["rsi_14"] * 100)
+        ema15 = float(
+            latest["close"] / (1 + latest["ema_ratio_15"])
+        )
+        technical_score = sum([
+            last_close > ema15,
+            rsi_value >= 50,
+            float(latest["macd_histogram"]) >= 0,
+        ])
+        technical_direction = (
+            "YUKARI" if technical_score >= 2 else "AŞAĞI"
+        )
+        st.subheader("Canlı piyasa verisi")
+        l1, l2, l3, l4, l5 = st.columns(5)
+        l1.metric("Varlık", asset_name)
+        l2.metric("Son fiyat", f"{last_close:.6f}", f"{change:+.3f}%")
+        l3.metric("RSI 14", f"{rsi_value:.1f}")
+        l4.metric("EMA 15", f"{ema15:.6f}")
+        l5.metric("Hızlı teknik yön", technical_direction)
+        st.caption(
+            f"{interval} veri · 20 saniyede bir kontrol · "
+            + datetime.now().astimezone().strftime("%H:%M:%S")
+        )
+    except Exception as exc:
+        st.warning(f"Canlı veri geçici olarak yenilenemedi: {exc}")
+
+
 st.set_page_config(page_title="Binomo DL Araştırma", layout="wide")
 st.title("Binomo Derin Öğrenme Araştırması")
-st.caption("Sürüm: CLOUD-SAFE-2026.07.30.5 — 30K mum")
+st.caption("Sürüm: ENTERPRISE-AI-2026.07.30.16 — Governed Intelligence")
 st.warning("Araştırma amaçlıdır. Otomatik işlem yapmaz; yatırım tavsiyesi veya kazanç garantisi değildir.")
+render_auto_top_signal()
+render_best_accuracy_panel()
 data_source = st.radio(
     "Veri kaynağı",
     ["Çevrim içi veriyi kendisi indir", "CSV kullan"],
@@ -549,6 +817,8 @@ else:
     asset = c1.text_input("Varlık", "EUR/USD")
     horizon = c2.number_input("Tahmin ufku (mum)", 1, 20, 1)
     interval = c3.text_input("Mum aralığı", "CSV")
+if data_source == "Çevrim içi veriyi kendisi indir":
+    render_live_market(asset, MARKET_SYMBOLS[asset], interval)
 c4, c5, c6 = st.columns(3)
 lookback = c4.number_input("Model penceresi (mum)", 20, 120, 40)
 epochs = c5.slider("DL epoch", 5, 60, 15)
@@ -618,12 +888,18 @@ if should_analyze:
             )
         frame = add_features(selected_data, int(horizon))
         with st.spinner("Modeller eğitiliyor..."):
-            probability, metrics, model_names = train_and_predict(
+            probability, metrics, model_names, model_details = train_and_predict(
                 frame, int(lookback), epochs, int(analysis_candles)
             )
         indicators = latest_indicators(frame)
-        signal = "YUKARI" if probability >= .5 else "AŞAĞI"
-        confidence = probability if signal == "YUKARI" else 1 - probability
+        enterprise = enterprise_context(frame, probability, metrics)
+        signal = enterprise["decision"]
+        confidence = enterprise["directional_confidence"]
+        best_model_name = max(
+            model_details,
+            key=lambda name: model_details[name]["test_doğruluğu"],
+        )
+        best_model_accuracy = model_details[best_model_name]["test_doğruluğu"]
         record = {
             "Zaman": datetime.now().astimezone().isoformat(timespec="seconds"),
             "Varlık": asset,
@@ -635,6 +911,17 @@ if should_analyze:
             "Tahmin ufku (mum)": horizon,
             "Model sayısı": len(model_names),
             "Modeller": ", ".join(model_names),
+            "En başarılı model": best_model_name,
+            "En başarılı model doğruluğu": best_model_accuracy,
+            "AI karar nedeni": (
+                enterprise["reason"]
+            ),
+            "Piyasa rejimi": enterprise["regime"],
+            "Veri kalite puanı": round(enterprise["quality_score"], 2),
+            "Dinamik güven eşiği": round(
+                enterprise["adaptive_threshold"], 4
+            ),
+            "Denetim kimliği": enterprise["audit_id"],
             "Test doğruluğu": round(metrics["Doğruluk"], 4),
             "Test precision": round(metrics["Precision"], 4),
             "Test recall": round(metrics["Recall"], 4),
@@ -649,27 +936,32 @@ if should_analyze:
         st.subheader("Öncelikli işlemler")
         st.caption("En yüksek güven yüzdesi ilk sıradadır.")
         priority_table = prioritized_signal_table()
-        st.dataframe(
-            priority_table,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Güven": st.column_config.ProgressColumn(
-                    "Güven", min_value=0.0, max_value=100.0, format="%.1f%%"
-                ),
-                "Model olasılığı": st.column_config.NumberColumn(
-                    "Yukarı olasılığı", format="%.1f%%"
-                ),
-                "Test doğruluğu": st.column_config.NumberColumn(
-                    "Test doğruluğu", format="%.1f%%"
-                ),
-            },
-        )
+        render_clickable_ranking(priority_table, "priority_after_analysis")
         st.success(
             f"{csv_source} otomatik analiz edildi ve Excel'e kaydedildi. "
             f"Sonuç: {signal} — model güveni %{confidence * 100:.1f}"
         )
         st.json(metrics)
+        st.subheader("Enterprise karar denetimi")
+        e1, e2, e3, e4 = st.columns(4)
+        e1.metric("Piyasa rejimi", enterprise["regime"])
+        e2.metric(
+            "Veri kalitesi", f"%{enterprise['quality_score']:.1f}"
+        )
+        e3.metric(
+            "Dinamik eşik",
+            f"%{enterprise['adaptive_threshold'] * 100:.1f}",
+        )
+        e4.metric("Denetim ID", enterprise["audit_id"])
+        st.info("Karar açıklaması: " + enterprise["reason"])
+        with st.expander("Zeka motoru — model ağırlıkları"):
+            st.dataframe(
+                pd.DataFrame(model_details).T.reset_index(
+                    names="Model"
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
         st.subheader("Son mum teknik göstergeleri")
         st.dataframe(pd.DataFrame([indicators]), use_container_width=True, hide_index=True)
         st.caption("Kullanılan modeller: " + ", ".join(model_names))
@@ -685,7 +977,7 @@ elif csv_bytes and st.session_state.last_saved_analysis == analysis_key:
     existing = prioritized_signal_table()
     if not existing.empty:
         st.subheader("Öncelikli işlemler")
-        st.dataframe(existing, use_container_width=True, hide_index=True)
+        render_clickable_ranking(existing, "priority_existing")
 elif csv_bytes:
     st.success(
         "Piyasa verisi hazır. Model eğitimi için "
