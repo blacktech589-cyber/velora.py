@@ -165,7 +165,7 @@ INTERVAL_PERIODS = {
 }
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=20, show_spinner=False)
 def download_market_data(symbol: str, interval: str) -> pd.DataFrame:
     """Ek paket gerektirmeden harici piyasa kaynağından OHLCV indirir."""
     encoded_symbol = urlencode({"symbol": symbol}).split("=", 1)[1]
@@ -641,9 +641,49 @@ def latest_indicators(frame: pd.DataFrame) -> dict:
     }
 
 
+@st.fragment(run_every="20s")
+def render_live_market(asset_name: str, symbol: str, interval: str):
+    """Son fiyat ve hızlı teknik göstergeleri sürekli günceller."""
+    try:
+        live_data = download_market_data(symbol, interval)
+        featured = add_features(live_data.tail(250).reset_index(drop=True), 1)
+        latest = featured.iloc[-1]
+        previous_close = float(live_data["close"].iloc[-2])
+        last_close = float(live_data["close"].iloc[-1])
+        change = (
+            (last_close / previous_close - 1) * 100
+            if previous_close else 0.0
+        )
+        rsi_value = float(latest["rsi_14"] * 100)
+        ema15 = float(
+            latest["close"] / (1 + latest["ema_ratio_15"])
+        )
+        technical_score = sum([
+            last_close > ema15,
+            rsi_value >= 50,
+            float(latest["macd_histogram"]) >= 0,
+        ])
+        technical_direction = (
+            "YUKARI" if technical_score >= 2 else "AŞAĞI"
+        )
+        st.subheader("Canlı piyasa verisi")
+        l1, l2, l3, l4, l5 = st.columns(5)
+        l1.metric("Varlık", asset_name)
+        l2.metric("Son fiyat", f"{last_close:.6f}", f"{change:+.3f}%")
+        l3.metric("RSI 14", f"{rsi_value:.1f}")
+        l4.metric("EMA 15", f"{ema15:.6f}")
+        l5.metric("Hızlı teknik yön", technical_direction)
+        st.caption(
+            f"{interval} veri · 20 saniyede bir kontrol · "
+            + datetime.now().astimezone().strftime("%H:%M:%S")
+        )
+    except Exception as exc:
+        st.warning(f"Canlı veri geçici olarak yenilenemedi: {exc}")
+
+
 st.set_page_config(page_title="Binomo DL Araştırma", layout="wide")
 st.title("Binomo Derin Öğrenme Araştırması")
-st.caption("Sürüm: CLOUD-SAFE-2026.07.30.8 — Auto Top 20s")
+st.caption("Sürüm: CLOUD-SAFE-2026.07.30.9 — Live Data 20s")
 st.warning("Araştırma amaçlıdır. Otomatik işlem yapmaz; yatırım tavsiyesi veya kazanç garantisi değildir.")
 render_auto_top_signal()
 data_source = st.radio(
@@ -670,6 +710,8 @@ else:
     asset = c1.text_input("Varlık", "EUR/USD")
     horizon = c2.number_input("Tahmin ufku (mum)", 1, 20, 1)
     interval = c3.text_input("Mum aralığı", "CSV")
+if data_source == "Çevrim içi veriyi kendisi indir":
+    render_live_market(asset, MARKET_SYMBOLS[asset], interval)
 c4, c5, c6 = st.columns(3)
 lookback = c4.number_input("Model penceresi (mum)", 20, 120, 40)
 epochs = c5.slider("DL epoch", 5, 60, 15)
