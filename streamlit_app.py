@@ -71,16 +71,44 @@ FEATURES = [
 ]
 
 MARKET_SYMBOLS = {
+    "Crypto IDX (piyasa vekili: Bitcoin)": "BTC-USD",
+    "Bitcoin (OTC vekili)": "BTC-USD",
+    "Ethereum (OTC vekili)": "ETH-USD",
+    "Solana (OTC vekili)": "SOL-USD",
+    "FC Barcelona Token (OTC vekili)": "BAR-USD",
+    "Cardano (OTC vekili)": "ADA-USD",
+    "Chainlink (OTC vekili)": "LINK-USD",
+    "Bitcoin Cash (OTC vekili)": "BCH-USD",
+    "Kusama (OTC vekili)": "KSM-USD",
+    "Aave (OTC vekili)": "AAVE-USD",
+    "PancakeSwap (OTC vekili)": "CAKE-USD",
+    "Uniswap (OTC vekili)": "UNI-USD",
     "EUR/USD": "EURUSD=X",
+    "EUR/USD (OTC vekili)": "EURUSD=X",
     "GBP/USD": "GBPUSD=X",
+    "GBP/USD (OTC vekili)": "GBPUSD=X",
     "USD/JPY": "JPY=X",
+    "USD/JPY (OTC vekili)": "JPY=X",
     "USD/CHF": "CHF=X",
     "AUD/USD": "AUDUSD=X",
+    "AUD/USD (OTC vekili)": "AUDUSD=X",
     "USD/CAD": "CAD=X",
+    "USD/CAD (OTC vekili)": "CAD=X",
     "NZD/USD": "NZDUSD=X",
+    "NZD/USD (OTC vekili)": "NZDUSD=X",
     "EUR/GBP": "EURGBP=X",
+    "EUR/GBP (OTC vekili)": "EURGBP=X",
     "EUR/JPY": "EURJPY=X",
     "GBP/JPY": "GBPJPY=X",
+    "GBP/JPY (OTC vekili)": "GBPJPY=X",
+    "GBP/CHF (OTC vekili)": "GBPCHF=X",
+    "CHF/JPY (OTC vekili)": "CHFJPY=X",
+    "EUR/CAD (OTC vekili)": "EURCAD=X",
+    "AUD/CAD (OTC vekili)": "AUDCAD=X",
+    "GBP/NZD (OTC vekili)": "GBPNZD=X",
+    "AUD/JPY": "AUDJPY=X",
+    "EUR/CHF": "EURCHF=X",
+    "GBP/AUD": "GBPAUD=X",
     "Bitcoin/USD": "BTC-USD",
     "Ethereum/USD": "ETH-USD",
     "Solana/USD": "SOL-USD",
@@ -267,13 +295,20 @@ def add_features(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
     x["natr_14"] = x["atr_14"]
     x["adx_14"], x["plus_di"], x["minus_di"] = directional_index(x)
     x["range_ratio"] = (x["high"] - x["low"]) / close.replace(0, np.nan)
-    x["volume_change"] = x["volume"].pct_change().replace([np.inf, -np.inf], np.nan)
+    # Forex kaynaklarında gerçek hacim bulunmayabilir. Böyle bir durumda
+    # hacim-tabanlı özellikleri sıfır/nötr üretmek eğitim satırlarını korur.
+    has_volume = bool((x["volume"].fillna(0) > 0).any())
+    effective_volume = x["volume"].fillna(0) if has_volume else pd.Series(1.0, index=x.index)
+    x["volume_change"] = effective_volume.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0)
     direction = np.sign(close.diff()).fillna(0)
-    obv = (direction * x["volume"]).cumsum()
-    x["obv_change"] = obv.pct_change(5).replace([np.inf, -np.inf], np.nan)
-    x["mfi_14"] = money_flow_index(x)
-    cumulative_volume = x["volume"].replace(0, np.nan).cumsum()
-    vwap = (typical * x["volume"]).cumsum() / cumulative_volume
+    obv = (direction * effective_volume).cumsum()
+    x["obv_change"] = obv.diff(5) / (obv.abs().rolling(20).mean() + 1e-9)
+    if has_volume:
+        x["mfi_14"] = money_flow_index(x)
+    else:
+        x["mfi_14"] = 0.5
+    cumulative_volume = effective_volume.cumsum()
+    vwap = (typical * effective_volume).cumsum() / cumulative_volume
     x["vwap_ratio"] = close / vwap.replace(0, np.nan) - 1
     future_return = close.shift(-horizon) / close - 1
     x["target"] = np.where(future_return.notna(), (future_return > 0).astype(int), np.nan)
@@ -288,10 +323,11 @@ def sequences(frame: pd.DataFrame, lookback: int):
         if np.isnan(labels[end]):
             continue
         window = values[end - lookback + 1:end + 1]
-        if np.isnan(window).all(axis=0).any():
-            continue
         med = np.nanmedian(window, axis=0)
+        # Tamamen boş kalan opsiyonel bir gösterge nötr (0) kabul edilir.
+        med = np.nan_to_num(med, nan=0.0, posinf=0.0, neginf=0.0)
         window = np.where(np.isnan(window), med, window)
+        window = np.nan_to_num(window, nan=0.0, posinf=0.0, neginf=0.0)
         xs.append(window)
         ys.append(int(labels[end]))
         rows.append(end)
@@ -320,8 +356,16 @@ def build_dl_models(shape):
 
 def train_and_predict(frame, lookback, epochs):
     X, y, row_ids = sequences(frame, lookback)
-    if len(X) < 100 or len(np.unique(y)) < 2:
-        raise ValueError("Yeterli ve iki sınıfı da içeren eğitim örneği bulunamadı.")
+    if len(X) < 100:
+        raise ValueError(
+            f"Yalnızca {len(X)} eğitim penceresi oluştu. Daha uzun bir mum "
+            "aralığı seçin (15m, 30m veya 1h önerilir)."
+        )
+    if len(np.unique(y)) < 2:
+        raise ValueError(
+            "Seçilen dönemde fiyat yalnızca tek yönde hareket etmiş. "
+            "Mum aralığını veya tahmin ufkunu değiştirin."
+        )
     split = int(len(X) * .8)
     if split < 50 or len(X) - split < 20:
         raise ValueError("Zaman bazlı test bölümü için daha fazla mum gerekiyor.")
@@ -483,7 +527,8 @@ if data_source == "CSV kullan":
 else:
     st.info(
         "Veriler harici piyasa kaynağından otomatik indirilir. "
-        "Binomo OTC fiyatlarıyla birebir aynı olmayabilir."
+        "Binomo OTC fiyatları halka açık olmadığından OTC seçimlerinde "
+        "normal piyasa karşılığı (vekil sembol) kullanılır."
     )
 c1, c2, c3 = st.columns(3)
 if data_source == "Çevrim içi veriyi kendisi indir":
