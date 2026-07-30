@@ -342,13 +342,20 @@ def add_features(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
     return x.replace([np.inf, -np.inf], np.nan)
 
 
-def sequences(frame: pd.DataFrame, lookback: int):
+def sequences(frame: pd.DataFrame, lookback: int, max_sequences: int = 6000):
     values = frame[FEATURES].to_numpy(dtype=np.float32)
     labels = frame["target"].to_numpy()
     xs, ys, rows = [], [], []
-    for end in range(lookback - 1, len(frame)):
-        if np.isnan(labels[end]):
-            continue
+    eligible = np.array([
+        end for end in range(lookback - 1, len(frame))
+        if not np.isnan(labels[end])
+    ], dtype=int)
+    if len(eligible) > max_sequences:
+        positions = np.linspace(
+            0, len(eligible) - 1, num=max_sequences, dtype=int
+        )
+        eligible = eligible[positions]
+    for end in eligible:
         window = values[end - lookback + 1:end + 1]
         med = np.nanmedian(window, axis=0)
         # Tamamen boş kalan opsiyonel bir gösterge nötr (0) kabul edilir.
@@ -361,8 +368,10 @@ def sequences(frame: pd.DataFrame, lookback: int):
     return np.asarray(xs), np.asarray(ys), rows
 
 
-def train_and_predict(frame, lookback, epochs):
-    X, y, row_ids = sequences(frame, lookback)
+def train_and_predict(frame, lookback, epochs, max_windows=6000):
+    X, y, row_ids = sequences(
+        frame, lookback, max_sequences=min(6000, int(max_windows))
+    )
     if len(X) < 100:
         raise ValueError(
             f"Yalnızca {len(X)} eğitim penceresi oluştu. Daha uzun bir mum "
@@ -374,9 +383,6 @@ def train_and_predict(frame, lookback, epochs):
             "Mum aralığını veya tahmin ufkunu değiştirin."
         )
     # Cloud belleğini korurken en yeni piyasa rejimine öncelik verir.
-    max_windows = 1200
-    if len(X) > max_windows:
-        X, y = X[-max_windows:], y[-max_windows:]
     split = int(len(X) * .8)
     if split < 50 or len(X) - split < 20:
         raise ValueError("Zaman bazlı test bölümü için daha fazla mum gerekiyor.")
@@ -517,7 +523,7 @@ def latest_indicators(frame: pd.DataFrame) -> dict:
 
 st.set_page_config(page_title="Binomo DL Araştırma", layout="wide")
 st.title("Binomo Derin Öğrenme Araştırması")
-st.caption("Sürüm: CLOUD-SAFE-2026.07.30.3")
+st.caption("Sürüm: CLOUD-SAFE-2026.07.30.5 — 30K mum")
 st.warning("Araştırma amaçlıdır. Otomatik işlem yapmaz; yatırım tavsiyesi veya kazanç garantisi değildir.")
 data_source = st.radio(
     "Veri kaynağı",
@@ -550,6 +556,17 @@ payout_rate = c6.number_input(
     "Binomo ödeme oranı (%)", min_value=0, max_value=100, value=82,
     help="Platformda görünen oranı elle girin; model güveninden farklıdır.",
 )
+analysis_candles = st.slider(
+    "Analiz edilecek son mum sayısı",
+    min_value=1000,
+    max_value=30000,
+    value=30000,
+    step=1000,
+    help=(
+        "Göstergeler tüm mevcut mumlarda hesaplanır. Model eğitimi Cloud "
+        "belleği için zaman geneline yayılmış en fazla 6.000 pencere kullanır."
+    ),
+)
 force_run = st.button("Analizi başlat ve Excel'e kaydet", type="primary")
 
 csv_bytes = None
@@ -573,7 +590,9 @@ elif AUTO_CSV_FILE.exists():
 
 analysis_key = None
 if csv_bytes:
-    settings = f"{asset}|{horizon}|{lookback}|{epochs}".encode("utf-8")
+    settings = (
+        f"{asset}|{horizon}|{lookback}|{epochs}|{analysis_candles}"
+    ).encode("utf-8")
     analysis_key = hashlib.sha256(csv_bytes + settings).hexdigest()
 
 if "last_saved_analysis" not in st.session_state:
@@ -590,9 +609,18 @@ if should_analyze:
         else:
             raw = pd.read_csv(io.BytesIO(csv_bytes), sep=None, engine="python")
             data = normalize_columns(raw)
-        frame = add_features(data, int(horizon))
+        selected_data = data.tail(int(analysis_candles)).reset_index(drop=True)
+        if len(selected_data) < int(analysis_candles):
+            st.warning(
+                f"Veri kaynağı {analysis_candles:,} yerine yalnızca "
+                f"{len(selected_data):,} gerçek mum sağladı. Analiz mevcut "
+                "mumlarla yapılıyor; yapay mum eklenmiyor."
+            )
+        frame = add_features(selected_data, int(horizon))
         with st.spinner("Modeller eğitiliyor..."):
-            probability, metrics, model_names = train_and_predict(frame, int(lookback), epochs)
+            probability, metrics, model_names = train_and_predict(
+                frame, int(lookback), epochs, int(analysis_candles)
+            )
         indicators = latest_indicators(frame)
         signal = "YUKARI" if probability >= .5 else "AŞAĞI"
         confidence = probability if signal == "YUKARI" else 1 - probability
@@ -610,10 +638,11 @@ if should_analyze:
             "Test doğruluğu": round(metrics["Doğruluk"], 4),
             "Test precision": round(metrics["Precision"], 4),
             "Test recall": round(metrics["Recall"], 4),
-            "Mum sayısı": len(data),
+            "İndirilen mum sayısı": len(data),
+            "Analiz edilen mum sayısı": len(selected_data),
             **indicators,
         }
-        excel_bytes = append_excel(record, data)
+        excel_bytes = append_excel(record, selected_data)
         st.session_state.last_saved_analysis = analysis_key
 
         # Kullanıcının ilk gördüğü bölüm: önceliklendirilmiş işlem listesi.
