@@ -417,17 +417,38 @@ def train_and_predict(frame, lookback, epochs, max_windows=6000):
         )
         names.append(name)
 
-    ensemble = np.mean(probabilities, axis=0)
+    # Her modelin yakın geçmiş test başarısına göre dinamik ağırlıklandırma.
+    model_scores = [
+        accuracy_score(y_test, (model_probability >= 0.5).astype(int))
+        for model_probability in probabilities
+    ]
+    model_weights = np.array(
+        [max(0.05, score - 0.45) for score in model_scores], dtype=float
+    )
+    model_weights /= model_weights.sum()
+    ensemble = np.average(np.vstack(probabilities), axis=0, weights=model_weights)
     pred = (ensemble >= .5).astype(int)
+    disagreement = float(np.mean(np.std(np.vstack(probabilities), axis=0)))
     metrics = {
         "Doğruluk": accuracy_score(y_test, pred),
         "Precision": precision_score(y_test, pred, zero_division=0),
         "Recall": recall_score(y_test, pred, zero_division=0),
         "Test örneği": len(y_test),
+        "Model anlaşmazlığı": round(disagreement, 4),
     }
 
-    probability = float(np.mean(latest_probs))
-    return probability, metrics, names
+    probability = float(np.average(latest_probs, weights=model_weights))
+    model_details = {
+        name: {
+            "test_doğruluğu": round(float(score), 4),
+            "zeka_ağırlığı": round(float(weight), 4),
+            "yukarı_olasılığı": round(float(latest), 4),
+        }
+        for name, score, weight, latest in zip(
+            names, model_scores, model_weights, latest_probs
+        )
+    }
+    return probability, metrics, names, model_details
 
 
 def append_excel(record: dict, market_data: pd.DataFrame | None = None) -> bytes:
@@ -523,7 +544,7 @@ def latest_indicators(frame: pd.DataFrame) -> dict:
 
 st.set_page_config(page_title="Binomo DL Araştırma", layout="wide")
 st.title("Binomo Derin Öğrenme Araştırması")
-st.caption("Sürüm: CLOUD-SAFE-2026.07.30.5 — 30K mum")
+st.caption("Sürüm: CLOUD-SAFE-2026.07.30.6 — Adaptive AI")
 st.warning("Araştırma amaçlıdır. Otomatik işlem yapmaz; yatırım tavsiyesi veya kazanç garantisi değildir.")
 data_source = st.radio(
     "Veri kaynağı",
@@ -618,12 +639,16 @@ if should_analyze:
             )
         frame = add_features(selected_data, int(horizon))
         with st.spinner("Modeller eğitiliyor..."):
-            probability, metrics, model_names = train_and_predict(
+            probability, metrics, model_names, model_details = train_and_predict(
                 frame, int(lookback), epochs, int(analysis_candles)
             )
         indicators = latest_indicators(frame)
-        signal = "YUKARI" if probability >= .5 else "AŞAĞI"
-        confidence = probability if signal == "YUKARI" else 1 - probability
+        directional_confidence = max(probability, 1 - probability)
+        if directional_confidence < 0.55:
+            signal = "BEKLE"
+        else:
+            signal = "YUKARI" if probability >= .5 else "AŞAĞI"
+        confidence = directional_confidence
         record = {
             "Zaman": datetime.now().astimezone().isoformat(timespec="seconds"),
             "Varlık": asset,
@@ -635,6 +660,10 @@ if should_analyze:
             "Tahmin ufku (mum)": horizon,
             "Model sayısı": len(model_names),
             "Modeller": ", ".join(model_names),
+            "AI karar nedeni": (
+                "Düşük model uzlaşması" if signal == "BEKLE"
+                else "Dinamik ağırlıklı model uzlaşması"
+            ),
             "Test doğruluğu": round(metrics["Doğruluk"], 4),
             "Test precision": round(metrics["Precision"], 4),
             "Test recall": round(metrics["Recall"], 4),
@@ -670,6 +699,14 @@ if should_analyze:
             f"Sonuç: {signal} — model güveni %{confidence * 100:.1f}"
         )
         st.json(metrics)
+        with st.expander("Zeka motoru — model ağırlıkları"):
+            st.dataframe(
+                pd.DataFrame(model_details).T.reset_index(
+                    names="Model"
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
         st.subheader("Son mum teknik göstergeleri")
         st.dataframe(pd.DataFrame([indicators]), use_container_width=True, hide_index=True)
         st.caption("Kullanılan modeller: " + ", ".join(model_names))
