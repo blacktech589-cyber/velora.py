@@ -381,7 +381,7 @@ def train_and_predict(frame, lookback, epochs):
             "Mum aralığını veya tahmin ufkunu değiştirin."
         )
     # Cloud belleğini korurken en yeni piyasa rejimine öncelik verir.
-    max_windows = 3500
+    max_windows = 1200
     if len(X) > max_windows:
         X, y = X[-max_windows:], y[-max_windows:]
     split = int(len(X) * .8)
@@ -395,9 +395,9 @@ def train_and_predict(frame, lookback, epochs):
 
     classical = [
         ("DeepMLP", MLPClassifier(
-            hidden_layer_sizes=(128, 64, 32), activation="relu",
+            hidden_layer_sizes=(64, 32), activation="relu",
             alpha=0.001, batch_size=64,
-            max_iter=max(80, int(epochs) * 6),
+            max_iter=max(40, int(epochs) * 3),
             early_stopping=True, validation_fraction=0.15,
             n_iter_no_change=10, random_state=42,
         )),
@@ -566,7 +566,7 @@ else:
 c4, c5 = st.columns(2)
 lookback = c4.number_input("Model penceresi (mum)", 20, 120, 40)
 epochs = c5.slider("DL epoch", 5, 60, 15)
-force_run = st.button("Verileri yenile, analiz et ve Excel'e kaydet", type="primary")
+force_run = st.button("Analizi başlat ve Excel'e kaydet", type="primary")
 
 csv_bytes = None
 csv_source = None
@@ -595,10 +595,9 @@ if csv_bytes:
 if "last_saved_analysis" not in st.session_state:
     st.session_state.last_saved_analysis = None
 
-should_analyze = bool(
-    csv_bytes
-    and (force_run or analysis_key != st.session_state.last_saved_analysis)
-)
+# Community Cloud'da sayfa açılışında ağır model eğitimi süreci düşürebilir.
+# Veri otomatik indirilir; eğitim kullanıcı düğmeye bastığında bir kez çalışır.
+should_analyze = bool(csv_bytes and force_run)
 
 if should_analyze:
     try:
@@ -672,3 +671,8 @@ elif csv_bytes and st.session_state.last_saved_analysis == analysis_key:
     if not existing.empty:
         st.subheader("Öncelikli işlemler")
         st.dataframe(existing, use_container_width=True, hide_index=True)
+elif csv_bytes:
+    st.success(
+        "Piyasa verisi hazır. Model eğitimi için "
+        "'Analizi başlat ve Excel'e kaydet' düğmesine basın."
+    )
