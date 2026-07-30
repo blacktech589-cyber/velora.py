@@ -9,10 +9,23 @@ import io
 import hashlib
 import json
 import logging
+import os
+import warnings
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+# Streamlit Cloud'da BLAS/joblib'in aşırı işçi oluşturmasını engeller.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+warnings.filterwarnings(
+    "ignore",
+    message=r".*sklearn\.utils\.parallel\.delayed.*",
+    category=UserWarning,
+)
 
 import joblib
 import numpy as np
@@ -337,16 +350,16 @@ def sequences(frame: pd.DataFrame, lookback: int):
 def build_dl_models(shape):
     early = EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True)
     lstm = Sequential([
-        Input(shape=shape), LSTM(48), Dropout(.2), Dense(24, activation="relu"),
+        Input(shape=shape), LSTM(32), Dropout(.2), Dense(16, activation="relu"),
         Dense(1, activation="sigmoid")
     ], name="LSTM")
     gru = Sequential([
-        Input(shape=shape), GRU(48), Dropout(.2), Dense(24, activation="relu"),
+        Input(shape=shape), GRU(32), Dropout(.2), Dense(16, activation="relu"),
         Dense(1, activation="sigmoid")
     ], name="GRU")
     inp = Input(shape=shape)
-    z = Conv1D(48, 3, padding="causal", activation="relu")(inp)
-    z = Conv1D(24, 3, padding="causal", activation="relu")(z)
+    z = Conv1D(32, 3, padding="causal", activation="relu")(inp)
+    z = Conv1D(16, 3, padding="causal", activation="relu")(z)
     z = GlobalAveragePooling1D()(z)
     cnn = Model(inp, Dense(1, activation="sigmoid")(z), name="CNN1D")
     for model in (lstm, gru, cnn):
@@ -366,6 +379,10 @@ def train_and_predict(frame, lookback, epochs):
             "Seçilen dönemde fiyat yalnızca tek yönde hareket etmiş. "
             "Mum aralığını veya tahmin ufkunu değiştirin."
         )
+    # Cloud belleğini korurken en yeni piyasa rejimine öncelik verir.
+    max_windows = 3500
+    if len(X) > max_windows:
+        X, y = X[-max_windows:], y[-max_windows:]
     split = int(len(X) * .8)
     if split < 50 or len(X) - split < 20:
         raise ValueError("Zaman bazlı test bölümü için daha fazla mum gerekiyor.")
@@ -373,20 +390,23 @@ def train_and_predict(frame, lookback, epochs):
     flat_train = X_train.reshape(len(X_train), -1)
     flat_test = X_test.reshape(len(X_test), -1)
     latest_seq = X[-1:]
-    probabilities, names = [], []
+    probabilities, latest_probs, names = [], [], []
 
     classical = [
         ("RandomForest", RandomForestClassifier(
-            n_estimators=300, min_samples_leaf=3, class_weight="balanced",
-            random_state=42, n_jobs=-1)),
+            n_estimators=160, min_samples_leaf=3, class_weight="balanced",
+            random_state=42, n_jobs=1)),
         ("ExtraTrees", ExtraTreesClassifier(
-            n_estimators=300, min_samples_leaf=3, class_weight="balanced",
-            random_state=42, n_jobs=-1)),
+            n_estimators=160, min_samples_leaf=3, class_weight="balanced",
+            random_state=42, n_jobs=1)),
     ]
     for name, estimator in classical:
         pipe = Pipeline([("imputer", SimpleImputer()), ("scale", StandardScaler()), ("model", estimator)])
         pipe.fit(flat_train, y_train)
         probabilities.append(pipe.predict_proba(flat_test)[:, 1])
+        latest_probs.append(
+            float(pipe.predict_proba(latest_seq.reshape(1, -1))[0, 1])
+        )
         names.append(name)
         joblib.dump(pipe, MODEL_DIR / f"{name}.joblib")
 
@@ -398,8 +418,11 @@ def train_and_predict(frame, lookback, epochs):
                 callbacks=[early], verbose=0, shuffle=False,
             )
             probabilities.append(model.predict(X_test, verbose=0).ravel())
+            latest_probs.append(float(model.predict(latest_seq, verbose=0)[0, 0]))
             names.append(model.name)
             model.save(MODEL_DIR / f"{model.name}.keras")
+        # Streamlit yeniden çalıştırmalarında TensorFlow grafiklerini biriktirme.
+        tf.keras.backend.clear_session()
 
     ensemble = np.mean(probabilities, axis=0)
     pred = (ensemble >= .5).astype(int)
@@ -410,13 +433,6 @@ def train_and_predict(frame, lookback, epochs):
         "Test örneği": len(y_test),
     }
 
-    latest_probs = []
-    for name, estimator in classical:
-        pipe = joblib.load(MODEL_DIR / f"{name}.joblib")
-        latest_probs.append(float(pipe.predict_proba(latest_seq.reshape(1, -1))[0, 1]))
-    if TF_AVAILABLE:
-        for model in dl_models:
-            latest_probs.append(float(model.predict(latest_seq, verbose=0)[0, 0]))
     probability = float(np.mean(latest_probs))
     return probability, metrics, names
 
@@ -541,7 +557,7 @@ else:
     interval = c3.text_input("Mum aralığı", "CSV")
 c4, c5 = st.columns(2)
 lookback = c4.number_input("Model penceresi (mum)", 20, 120, 40)
-epochs = c5.slider("DL epoch", 5, 100, 25)
+epochs = c5.slider("DL epoch", 5, 60, 15)
 force_run = st.button("Verileri yenile, analiz et ve Excel'e kaydet", type="primary")
 
 csv_bytes = None
