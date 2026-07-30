@@ -697,6 +697,78 @@ def latest_indicators(frame: pd.DataFrame) -> dict:
     }
 
 
+def analyze_10_20_trend(frame: pd.DataFrame) -> dict:
+    """10/20 mum ortalaması ve ikinci yön mumunu analiz eder."""
+    if len(frame) < 22:
+        return {
+            "trend_signal": "BEKLE",
+            "second_candle": "YETERSİZ VERİ",
+            "trend_reason": "Trend analizi için en az 22 mum gerekir.",
+            "sma10": np.nan,
+            "sma20": np.nan,
+        }
+
+    close = frame["close"].astype(float)
+    open_price = frame["open"].astype(float)
+    last_close = float(close.iloc[-1])
+    sma10 = float(close.tail(10).mean())
+    sma20 = float(close.tail(20).mean())
+
+    # Kullanıcının istediği ortalamaya dönüş stratejisi:
+    # iki ortalamanın üstünde SELL, altında BUY.
+    if last_close > sma10 and last_close > sma20:
+        mean_reversion_signal = "AŞAĞI"
+        mean_reversion_reason = "Fiyat SMA10 ve SMA20 üzerinde: SELL"
+    elif last_close < sma10 and last_close < sma20:
+        mean_reversion_signal = "YUKARI"
+        mean_reversion_reason = "Fiyat SMA10 ve SMA20 altında: BUY"
+    else:
+        mean_reversion_signal = "BEKLE"
+        mean_reversion_reason = "Fiyat SMA10/SMA20 arasında"
+
+    bullish = close > open_price
+    bearish = close < open_price
+    rising_closes = close.diff() > 0
+    falling_closes = close.diff() < 0
+
+    if (
+        bool(bullish.iloc[-2]) and bool(bullish.iloc[-1])
+        and bool(rising_closes.iloc[-2]) and bool(rising_closes.iloc[-1])
+    ):
+        second_candle = "2. YÜKSELİŞ MUMU"
+        candle_signal = "YUKARI"
+    elif (
+        bool(bearish.iloc[-2]) and bool(bearish.iloc[-1])
+        and bool(falling_closes.iloc[-2]) and bool(falling_closes.iloc[-1])
+    ):
+        second_candle = "2. DÜŞÜŞ MUMU"
+        candle_signal = "AŞAĞI"
+    else:
+        second_candle = "TEYİT YOK"
+        candle_signal = "BEKLE"
+
+    if mean_reversion_signal == candle_signal and candle_signal != "BEKLE":
+        trend_signal = candle_signal
+        trend_reason = mean_reversion_reason + " ve ikinci mum teyitli"
+    elif candle_signal == "BEKLE":
+        trend_signal = mean_reversion_signal
+        trend_reason = mean_reversion_reason + "; ikinci mum teyidi yok"
+    else:
+        trend_signal = "BEKLE"
+        trend_reason = (
+            mean_reversion_reason
+            + f"; {second_candle} ile çelişiyor"
+        )
+
+    return {
+        "trend_signal": trend_signal,
+        "second_candle": second_candle,
+        "trend_reason": trend_reason,
+        "sma10": sma10,
+        "sma20": sma20,
+    }
+
+
 def enterprise_context(
     frame: pd.DataFrame,
     probability: float,
@@ -789,7 +861,7 @@ def render_live_market(asset_name: str, symbol: str, interval: str):
 
 st.set_page_config(page_title="Binomo DL Araştırma", layout="wide")
 st.title("Binomo Derin Öğrenme Araştırması")
-st.caption("Sürüm: ENTERPRISE-AI-2026.07.30.16 — Governed Intelligence")
+st.caption("Sürüm: ENTERPRISE-AI-2026.07.30.17 — Trend 10/20")
 st.warning("Araştırma amaçlıdır. Otomatik işlem yapmaz; yatırım tavsiyesi veya kazanç garantisi değildir.")
 render_auto_top_signal()
 render_best_accuracy_panel()
@@ -892,8 +964,23 @@ if should_analyze:
                 frame, int(lookback), epochs, int(analysis_candles)
             )
         indicators = latest_indicators(frame)
+        trend_analysis = analyze_10_20_trend(frame)
         enterprise = enterprise_context(frame, probability, metrics)
-        signal = enterprise["decision"]
+        ai_signal = enterprise["decision"]
+        if (
+            ai_signal in {"YUKARI", "AŞAĞI"}
+            and trend_analysis["trend_signal"] in {"YUKARI", "AŞAĞI"}
+            and ai_signal != trend_analysis["trend_signal"]
+        ):
+            signal = "BEKLE"
+            combined_reason = "AI ve 10/20 trend stratejisi çelişiyor"
+        else:
+            signal = ai_signal
+            combined_reason = (
+                "AI ve trend filtresi uyumlu"
+                if trend_analysis["trend_signal"] == ai_signal
+                else enterprise["reason"]
+            )
         confidence = enterprise["directional_confidence"]
         best_model_name = max(
             model_details,
@@ -914,8 +1001,14 @@ if should_analyze:
             "En başarılı model": best_model_name,
             "En başarılı model doğruluğu": best_model_accuracy,
             "AI karar nedeni": (
-                enterprise["reason"]
+                combined_reason
             ),
+            "Ham AI sinyali": ai_signal,
+            "10/20 trend sinyali": trend_analysis["trend_signal"],
+            "İkinci mum durumu": trend_analysis["second_candle"],
+            "Trend açıklaması": trend_analysis["trend_reason"],
+            "SMA 10": round(float(trend_analysis["sma10"]), 6),
+            "SMA 20": round(float(trend_analysis["sma20"]), 6),
             "Piyasa rejimi": enterprise["regime"],
             "Veri kalite puanı": round(enterprise["quality_score"], 2),
             "Dinamik güven eşiği": round(
@@ -953,7 +1046,14 @@ if should_analyze:
             f"%{enterprise['adaptive_threshold'] * 100:.1f}",
         )
         e4.metric("Denetim ID", enterprise["audit_id"])
-        st.info("Karar açıklaması: " + enterprise["reason"])
+        st.info("Birleşik karar açıklaması: " + combined_reason)
+        st.subheader("10/20 mum trend stratejisi")
+        t1, t2, t3, t4 = st.columns(4)
+        t1.metric("Trend sinyali", trend_analysis["trend_signal"])
+        t2.metric("İkinci mum", trend_analysis["second_candle"])
+        t3.metric("SMA 10", f"{trend_analysis['sma10']:.6f}")
+        t4.metric("SMA 20", f"{trend_analysis['sma20']:.6f}")
+        st.info(trend_analysis["trend_reason"])
         with st.expander("Zeka motoru — model ağırlıkları"):
             st.dataframe(
                 pd.DataFrame(model_details).T.reset_index(
