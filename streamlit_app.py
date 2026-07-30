@@ -135,6 +135,26 @@ MARKET_SYMBOLS = {
     "Google": "GOOGL",
 }
 
+# Binomo ekranında görülebilen normal Forex varlıkları. Harici veri
+# servisindeki karşılıkları örneğin CAD/JPY -> CADJPY=X biçimindedir.
+FOREX_PAIRS = [
+    "EUR/USD", "CAD/JPY", "AUD/ZAR", "GBP/NOK", "EUR/HUF", "GBP/SGD",
+    "CAD/DKK", "EUR/ILS", "USD/MXN", "AUD/USD", "EUR/NOK", "AUD/JPY",
+    "CAD/MXN", "EUR/ZAR", "GBP/HKD", "CHF/JPY", "USD/SEK", "CAD/SEK",
+    "USD/ILS", "CAD/NOK", "EUR/SEK", "AUD/SGD", "USD/PLN", "CAD/SGD",
+    "GBP/MXN", "CHF/DKK", "AUD/DKK", "EUR/SGD", "GBP/CZK", "GBP/PLN",
+    "AUD/HUF", "EUR/NZD", "EUR/MXN", "NZD/JPY", "USD/JPY", "CHF/NOK",
+    "USD/HUF", "AUD/NOK", "GBP/DKK", "GBP/TRY", "AUD/SEK", "CHF/PLN",
+    "USD/CAD", "CHF/SEK", "NOK/JPY", "NOK/SEK", "CHF/SGD", "NZD/CAD",
+    "NZD/DKK", "NZD/NOK", "GBP/NZD", "NZD/HUF", "NZD/SEK", "NZD/SGD",
+    "SEK/JPY", "SGD/HKD", "SGD/JPY", "USD/CHF", "AUD/CAD", "USD/CZK",
+    "NZD/CHF", "GBP/CAD", "AUD/NZD", "USD/ZAR", "AUD/CHF", "GBP/USD",
+    "EUR/PLN", "GBP/HUF", "ZAR/JPY", "CHF/HUF", "GBP/CHF", "USD/DKK",
+    "EUR/CHF", "GBP/AUD", "EUR/GBP", "EUR/JPY",
+]
+for forex_pair in FOREX_PAIRS:
+    MARKET_SYMBOLS.setdefault(forex_pair, forex_pair.replace("/", "") + "=X")
+
 INTERVAL_PERIODS = {
     "1m": "7d",
     "5m": "60d",
@@ -523,9 +543,13 @@ else:
     asset = c1.text_input("Varlık", "EUR/USD")
     horizon = c2.number_input("Tahmin ufku (mum)", 1, 20, 1)
     interval = c3.text_input("Mum aralığı", "CSV")
-c4, c5 = st.columns(2)
+c4, c5, c6 = st.columns(3)
 lookback = c4.number_input("Model penceresi (mum)", 20, 120, 40)
 epochs = c5.slider("DL epoch", 5, 60, 15)
+payout_rate = c6.number_input(
+    "Binomo ödeme oranı (%)", min_value=0, max_value=100, value=82,
+    help="Platformda görünen oranı elle girin; model güveninden farklıdır.",
+)
 force_run = st.button("Analizi başlat ve Excel'e kaydet", type="primary")
 
 csv_bytes = None
@@ -579,6 +603,7 @@ if should_analyze:
             "Model olasılığı": round(probability, 4),
             "Güven": round(confidence, 4),
             "Güven yüzdesi": f"%{confidence * 100:.1f}",
+            "Binomo ödeme oranı (%)": payout_rate,
             "Tahmin ufku (mum)": horizon,
             "Model sayısı": len(model_names),
             "Modeller": ", ".join(model_names),
