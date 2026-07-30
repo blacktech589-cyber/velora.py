@@ -697,6 +697,56 @@ def latest_indicators(frame: pd.DataFrame) -> dict:
     }
 
 
+def enterprise_context(
+    frame: pd.DataFrame,
+    probability: float,
+    metrics: dict,
+) -> dict:
+    """Kararı veri kalitesi, rejim ve belirsizlik açısından denetler."""
+    feature_frame = frame[FEATURES].replace([np.inf, -np.inf], np.nan)
+    missing_ratio = float(feature_frame.isna().mean().mean())
+    quality_score = max(0.0, min(100.0, (1 - missing_ratio) * 100))
+    latest = frame.iloc[-1]
+    adx = float(latest.get("adx_14", 0) * 100)
+    volatility = float(latest.get("volatility_20", 0))
+    median_volatility = float(
+        frame["volatility_20"].dropna().median()
+        if frame["volatility_20"].notna().any() else 0
+    )
+    if adx >= 25:
+        regime = "Güçlü trend"
+    elif volatility > median_volatility * 1.5:
+        regime = "Yüksek volatilite"
+    else:
+        regime = "Yatay / zayıf trend"
+    disagreement = float(metrics.get("Model anlaşmazlığı", 0))
+    adaptive_threshold = min(0.70, 0.55 + disagreement)
+    directional_confidence = max(probability, 1 - probability)
+    if quality_score < 90:
+        decision = "BEKLE"
+        reason = "Veri kalite puanı yetersiz"
+    elif directional_confidence < adaptive_threshold:
+        decision = "BEKLE"
+        reason = "Dinamik güven eşiği aşılmadı"
+    else:
+        decision = "YUKARI" if probability >= 0.5 else "AŞAĞI"
+        reason = "Kalite ve model uzlaşması yeterli"
+    audit_payload = (
+        f"{frame['time'].iloc[-1]}|{probability:.8f}|{decision}|"
+        f"{quality_score:.4f}|{regime}"
+    )
+    audit_id = hashlib.sha256(audit_payload.encode("utf-8")).hexdigest()[:16]
+    return {
+        "decision": decision,
+        "reason": reason,
+        "quality_score": quality_score,
+        "regime": regime,
+        "adaptive_threshold": adaptive_threshold,
+        "directional_confidence": directional_confidence,
+        "audit_id": audit_id,
+    }
+
+
 @st.fragment(run_every="20s")
 def render_live_market(asset_name: str, symbol: str, interval: str):
     """Son fiyat ve hızlı teknik göstergeleri sürekli günceller."""
@@ -739,7 +789,7 @@ def render_live_market(asset_name: str, symbol: str, interval: str):
 
 st.set_page_config(page_title="Binomo DL Araştırma", layout="wide")
 st.title("Binomo Derin Öğrenme Araştırması")
-st.caption("Sürüm: CLOUD-SAFE-2026.07.30.15 — Click Next")
+st.caption("Sürüm: ENTERPRISE-AI-2026.07.30.16 — Governed Intelligence")
 st.warning("Araştırma amaçlıdır. Otomatik işlem yapmaz; yatırım tavsiyesi veya kazanç garantisi değildir.")
 render_auto_top_signal()
 render_best_accuracy_panel()
@@ -842,12 +892,9 @@ if should_analyze:
                 frame, int(lookback), epochs, int(analysis_candles)
             )
         indicators = latest_indicators(frame)
-        directional_confidence = max(probability, 1 - probability)
-        if directional_confidence < 0.55:
-            signal = "BEKLE"
-        else:
-            signal = "YUKARI" if probability >= .5 else "AŞAĞI"
-        confidence = directional_confidence
+        enterprise = enterprise_context(frame, probability, metrics)
+        signal = enterprise["decision"]
+        confidence = enterprise["directional_confidence"]
         best_model_name = max(
             model_details,
             key=lambda name: model_details[name]["test_doğruluğu"],
@@ -867,9 +914,14 @@ if should_analyze:
             "En başarılı model": best_model_name,
             "En başarılı model doğruluğu": best_model_accuracy,
             "AI karar nedeni": (
-                "Düşük model uzlaşması" if signal == "BEKLE"
-                else "Dinamik ağırlıklı model uzlaşması"
+                enterprise["reason"]
             ),
+            "Piyasa rejimi": enterprise["regime"],
+            "Veri kalite puanı": round(enterprise["quality_score"], 2),
+            "Dinamik güven eşiği": round(
+                enterprise["adaptive_threshold"], 4
+            ),
+            "Denetim kimliği": enterprise["audit_id"],
             "Test doğruluğu": round(metrics["Doğruluk"], 4),
             "Test precision": round(metrics["Precision"], 4),
             "Test recall": round(metrics["Recall"], 4),
@@ -890,6 +942,18 @@ if should_analyze:
             f"Sonuç: {signal} — model güveni %{confidence * 100:.1f}"
         )
         st.json(metrics)
+        st.subheader("Enterprise karar denetimi")
+        e1, e2, e3, e4 = st.columns(4)
+        e1.metric("Piyasa rejimi", enterprise["regime"])
+        e2.metric(
+            "Veri kalitesi", f"%{enterprise['quality_score']:.1f}"
+        )
+        e3.metric(
+            "Dinamik eşik",
+            f"%{enterprise['adaptive_threshold'] * 100:.1f}",
+        )
+        e4.metric("Denetim ID", enterprise["audit_id"])
+        st.info("Karar açıklaması: " + enterprise["reason"])
         with st.expander("Zeka motoru — model ağırlıkları"):
             st.dataframe(
                 pd.DataFrame(model_details).T.reset_index(
