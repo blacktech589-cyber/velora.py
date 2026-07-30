@@ -7,9 +7,12 @@ from __future__ import annotations
 
 import io
 import hashlib
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import joblib
 import numpy as np
@@ -66,6 +69,120 @@ FEATURES = [
     # Hacim
     "volume_change", "obv_change", "mfi_14", "vwap_ratio",
 ]
+
+MARKET_SYMBOLS = {
+    "Crypto IDX (piyasa vekili: Bitcoin)": "BTC-USD",
+    "Bitcoin (OTC vekili)": "BTC-USD",
+    "Ethereum (OTC vekili)": "ETH-USD",
+    "Solana (OTC vekili)": "SOL-USD",
+    "FC Barcelona Token (OTC vekili)": "BAR-USD",
+    "Cardano (OTC vekili)": "ADA-USD",
+    "Chainlink (OTC vekili)": "LINK-USD",
+    "Bitcoin Cash (OTC vekili)": "BCH-USD",
+    "Kusama (OTC vekili)": "KSM-USD",
+    "Aave (OTC vekili)": "AAVE-USD",
+    "PancakeSwap (OTC vekili)": "CAKE-USD",
+    "Uniswap (OTC vekili)": "UNI-USD",
+    "EUR/USD": "EURUSD=X",
+    "EUR/USD (OTC vekili)": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "GBP/USD (OTC vekili)": "GBPUSD=X",
+    "USD/JPY": "JPY=X",
+    "USD/JPY (OTC vekili)": "JPY=X",
+    "USD/CHF": "CHF=X",
+    "AUD/USD": "AUDUSD=X",
+    "AUD/USD (OTC vekili)": "AUDUSD=X",
+    "USD/CAD": "CAD=X",
+    "USD/CAD (OTC vekili)": "CAD=X",
+    "NZD/USD": "NZDUSD=X",
+    "NZD/USD (OTC vekili)": "NZDUSD=X",
+    "EUR/GBP": "EURGBP=X",
+    "EUR/GBP (OTC vekili)": "EURGBP=X",
+    "EUR/JPY": "EURJPY=X",
+    "GBP/JPY": "GBPJPY=X",
+    "GBP/JPY (OTC vekili)": "GBPJPY=X",
+    "GBP/CHF (OTC vekili)": "GBPCHF=X",
+    "CHF/JPY (OTC vekili)": "CHFJPY=X",
+    "EUR/CAD (OTC vekili)": "EURCAD=X",
+    "AUD/CAD (OTC vekili)": "AUDCAD=X",
+    "GBP/NZD (OTC vekili)": "GBPNZD=X",
+    "AUD/JPY": "AUDJPY=X",
+    "EUR/CHF": "EURCHF=X",
+    "GBP/AUD": "GBPAUD=X",
+    "Bitcoin/USD": "BTC-USD",
+    "Ethereum/USD": "ETH-USD",
+    "Solana/USD": "SOL-USD",
+    "Gold": "GC=F",
+    "Silver": "SI=F",
+    "Oil (WTI)": "CL=F",
+    "Natural Gas": "NG=F",
+    "S&P 500": "^GSPC",
+    "NASDAQ 100": "^NDX",
+    "DAX 40": "^GDAXI",
+    "Apple": "AAPL",
+    "Microsoft": "MSFT",
+    "Nvidia": "NVDA",
+    "Tesla": "TSLA",
+    "Amazon": "AMZN",
+    "Meta": "META",
+    "Google": "GOOGL",
+}
+
+INTERVAL_PERIODS = {
+    "1m": "7d",
+    "5m": "60d",
+    "15m": "60d",
+    "30m": "60d",
+    "1h": "2y",
+    "1d": "10y",
+}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def download_market_data(symbol: str, interval: str) -> pd.DataFrame:
+    """Ek paket gerektirmeden harici piyasa kaynağından OHLCV indirir."""
+    encoded_symbol = urlencode({"symbol": symbol}).split("=", 1)[1]
+    query = urlencode({
+        "interval": interval,
+        "range": INTERVAL_PERIODS[interval],
+        "includePrePost": "false",
+        "events": "div,splits",
+    })
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded_symbol}?{query}"
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        raise ValueError(f"Piyasa veri servisine erişilemedi: {exc}") from exc
+
+    chart = payload.get("chart", {})
+    if chart.get("error"):
+        raise ValueError(str(chart["error"]))
+    results = chart.get("result") or []
+    if not results:
+        raise ValueError(f"{symbol} için çevrim içi veri bulunamadı.")
+    result = results[0]
+    timestamps = result.get("timestamp") or []
+    quotes = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+    if not timestamps or not quotes:
+        raise ValueError(f"{symbol} için mum verisi boş döndü.")
+    size = len(timestamps)
+    downloaded = pd.DataFrame({
+        "time": pd.to_datetime(timestamps, unit="s", utc=True),
+        "open": quotes.get("open", [None] * size),
+        "high": quotes.get("high", [None] * size),
+        "low": quotes.get("low", [None] * size),
+        "close": quotes.get("close", [None] * size),
+        "volume": quotes.get("volume", [0] * size),
+    })
+    return normalize_columns(downloaded)
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -178,13 +295,20 @@ def add_features(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
     x["natr_14"] = x["atr_14"]
     x["adx_14"], x["plus_di"], x["minus_di"] = directional_index(x)
     x["range_ratio"] = (x["high"] - x["low"]) / close.replace(0, np.nan)
-    x["volume_change"] = x["volume"].pct_change().replace([np.inf, -np.inf], np.nan)
+    # Forex kaynaklarında gerçek hacim bulunmayabilir. Böyle bir durumda
+    # hacim-tabanlı özellikleri sıfır/nötr üretmek eğitim satırlarını korur.
+    has_volume = bool((x["volume"].fillna(0) > 0).any())
+    effective_volume = x["volume"].fillna(0) if has_volume else pd.Series(1.0, index=x.index)
+    x["volume_change"] = effective_volume.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0)
     direction = np.sign(close.diff()).fillna(0)
-    obv = (direction * x["volume"]).cumsum()
-    x["obv_change"] = obv.pct_change(5).replace([np.inf, -np.inf], np.nan)
-    x["mfi_14"] = money_flow_index(x)
-    cumulative_volume = x["volume"].replace(0, np.nan).cumsum()
-    vwap = (typical * x["volume"]).cumsum() / cumulative_volume
+    obv = (direction * effective_volume).cumsum()
+    x["obv_change"] = obv.diff(5) / (obv.abs().rolling(20).mean() + 1e-9)
+    if has_volume:
+        x["mfi_14"] = money_flow_index(x)
+    else:
+        x["mfi_14"] = 0.5
+    cumulative_volume = effective_volume.cumsum()
+    vwap = (typical * effective_volume).cumsum() / cumulative_volume
     x["vwap_ratio"] = close / vwap.replace(0, np.nan) - 1
     future_return = close.shift(-horizon) / close - 1
     x["target"] = np.where(future_return.notna(), (future_return > 0).astype(int), np.nan)
@@ -199,10 +323,11 @@ def sequences(frame: pd.DataFrame, lookback: int):
         if np.isnan(labels[end]):
             continue
         window = values[end - lookback + 1:end + 1]
-        if np.isnan(window).all(axis=0).any():
-            continue
         med = np.nanmedian(window, axis=0)
+        # Tamamen boş kalan opsiyonel bir gösterge nötr (0) kabul edilir.
+        med = np.nan_to_num(med, nan=0.0, posinf=0.0, neginf=0.0)
         window = np.where(np.isnan(window), med, window)
+        window = np.nan_to_num(window, nan=0.0, posinf=0.0, neginf=0.0)
         xs.append(window)
         ys.append(int(labels[end]))
         rows.append(end)
@@ -231,8 +356,16 @@ def build_dl_models(shape):
 
 def train_and_predict(frame, lookback, epochs):
     X, y, row_ids = sequences(frame, lookback)
-    if len(X) < 100 or len(np.unique(y)) < 2:
-        raise ValueError("Yeterli ve iki sınıfı da içeren eğitim örneği bulunamadı.")
+    if len(X) < 100:
+        raise ValueError(
+            f"Yalnızca {len(X)} eğitim penceresi oluştu. Daha uzun bir mum "
+            "aralığı seçin (15m, 30m veya 1h önerilir)."
+        )
+    if len(np.unique(y)) < 2:
+        raise ValueError(
+            "Seçilen dönemde fiyat yalnızca tek yönde hareket etmiş. "
+            "Mum aralığını veya tahmin ufkunu değiştirin."
+        )
     split = int(len(X) * .8)
     if split < 50 or len(X) - split < 20:
         raise ValueError("Zaman bazlı test bölümü için daha fazla mum gerekiyor.")
@@ -288,7 +421,7 @@ def train_and_predict(frame, lookback, epochs):
     return probability, metrics, names
 
 
-def append_excel(record: dict) -> bytes:
+def append_excel(record: dict, market_data: pd.DataFrame | None = None) -> bytes:
     new = pd.DataFrame([record])
     if OUTPUT_FILE.exists():
         old = pd.read_excel(OUTPUT_FILE, sheet_name="Sinyaller")
@@ -330,6 +463,11 @@ def append_excel(record: dict) -> bytes:
             "Veri": "Kullanıcının yüklediği geçmiş OHLC mum verisi",
             "Doğrulama": "Son %20 veri, zaman sırası korunarak test edilir.",
         }]).to_excel(writer, sheet_name="Açıklama", index=False)
+        if market_data is not None and not market_data.empty:
+            export_data = market_data.tail(5000).copy()
+            # Excel saat dilimli datetime değerlerini kabul etmez.
+            export_data["time"] = export_data["time"].dt.tz_localize(None)
+            export_data.to_excel(writer, sheet_name="Piyasa_Verisi", index=False)
     return OUTPUT_FILE.read_bytes()
 
 
@@ -375,23 +513,49 @@ def latest_indicators(frame: pd.DataFrame) -> dict:
 
 
 st.set_page_config(page_title="Binomo DL Araştırma", layout="wide")
-st.title("Binomo CSV Derin Öğrenme Araştırması")
+st.title("Binomo Derin Öğrenme Araştırması")
 st.warning("Araştırma amaçlıdır. Otomatik işlem yapmaz; yatırım tavsiyesi veya kazanç garantisi değildir.")
-uploaded = st.file_uploader("Binomo mum verisi CSV", type=["csv"])
-st.caption(
-    "CSV yüklenince analiz otomatik başlar. Alternatif olarak "
-    f"`{AUTO_CSV_FILE.name}` dosyasını uygulamayla aynı klasöre koyabilirsiniz."
+data_source = st.radio(
+    "Veri kaynağı",
+    ["Çevrim içi veriyi kendisi indir", "CSV kullan"],
+    horizontal=True,
 )
+uploaded = None
+interval = "15m"
+if data_source == "CSV kullan":
+    uploaded = st.file_uploader("Mum verisi CSV", type=["csv"])
+else:
+    st.info(
+        "Veriler harici piyasa kaynağından otomatik indirilir. "
+        "Binomo OTC fiyatları halka açık olmadığından OTC seçimlerinde "
+        "normal piyasa karşılığı (vekil sembol) kullanılır."
+    )
 c1, c2, c3 = st.columns(3)
-asset = c1.text_input("Varlık", "EUR/USD")
-horizon = c2.number_input("Tahmin ufku (mum)", 1, 20, 1)
-lookback = c3.number_input("Model penceresi (mum)", 20, 120, 40)
-epochs = st.slider("DL epoch", 5, 100, 25)
-force_run = st.button("Aynı veriyi yeniden analiz et")
+if data_source == "Çevrim içi veriyi kendisi indir":
+    asset = c1.selectbox("Varlık", list(MARKET_SYMBOLS), index=0)
+    interval = c2.selectbox("Mum aralığı", list(INTERVAL_PERIODS), index=2)
+    horizon = c3.number_input("Tahmin ufku (mum)", 1, 20, 1)
+else:
+    asset = c1.text_input("Varlık", "EUR/USD")
+    horizon = c2.number_input("Tahmin ufku (mum)", 1, 20, 1)
+    interval = c3.text_input("Mum aralığı", "CSV")
+c4, c5 = st.columns(2)
+lookback = c4.number_input("Model penceresi (mum)", 20, 120, 40)
+epochs = c5.slider("DL epoch", 5, 100, 25)
+force_run = st.button("Verileri yenile, analiz et ve Excel'e kaydet", type="primary")
 
 csv_bytes = None
 csv_source = None
-if uploaded is not None:
+online_data = None
+if data_source == "Çevrim içi veriyi kendisi indir":
+    try:
+        online_data = download_market_data(MARKET_SYMBOLS[asset], interval)
+        csv_bytes = online_data.to_csv(index=False).encode("utf-8")
+        csv_source = f"{MARKET_SYMBOLS[asset]} ({interval})"
+        st.caption(f"{len(online_data):,} mum otomatik indirildi.")
+    except Exception as exc:
+        st.error(f"Çevrim içi veri alınamadı: {exc}")
+elif uploaded is not None:
     csv_bytes = uploaded.getvalue()
     csv_source = uploaded.name
 elif AUTO_CSV_FILE.exists():
@@ -414,8 +578,11 @@ should_analyze = bool(
 
 if should_analyze:
     try:
-        raw = pd.read_csv(io.BytesIO(csv_bytes), sep=None, engine="python")
-        data = normalize_columns(raw)
+        if online_data is not None:
+            data = online_data
+        else:
+            raw = pd.read_csv(io.BytesIO(csv_bytes), sep=None, engine="python")
+            data = normalize_columns(raw)
         frame = add_features(data, int(horizon))
         with st.spinner("Modeller eğitiliyor..."):
             probability, metrics, model_names = train_and_predict(frame, int(lookback), epochs)
@@ -437,7 +604,7 @@ if should_analyze:
             "Mum sayısı": len(data),
             **indicators,
         }
-        excel_bytes = append_excel(record)
+        excel_bytes = append_excel(record, data)
         st.session_state.last_saved_analysis = analysis_key
 
         # Kullanıcının ilk gördüğü bölüm: önceliklendirilmiş işlem listesi.
