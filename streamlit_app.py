@@ -470,7 +470,7 @@ def prioritized_signal_table() -> pd.DataFrame:
     if "Test doğruluğu" in history:
         history["Test doğruluğu"] = history["Test doğruluğu"] * 100
     visible = [
-        "Öncelik", "Varlık", "Sinyal", "Güven", "Model olasılığı",
+        "Öncelik", "Varlık", "Sinyal", "Güven yüzdesi", "Güven", "Model olasılığı",
         "Tahmin ufku (mum)", "Test doğruluğu", "Zaman",
     ]
     return history[[column for column in visible if column in history.columns]]
@@ -578,6 +578,7 @@ if should_analyze:
             "Sinyal": signal,
             "Model olasılığı": round(probability, 4),
             "Güven": round(confidence, 4),
+            "Güven yüzdesi": f"%{confidence * 100:.1f}",
             "Tahmin ufku (mum)": horizon,
             "Model sayısı": len(model_names),
             "Modeller": ", ".join(model_names),
