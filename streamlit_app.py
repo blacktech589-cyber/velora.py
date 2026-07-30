@@ -7,15 +7,17 @@ from __future__ import annotations
 
 import io
 import hashlib
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
-import yfinance as yf
 from openpyxl.formatting.rule import ColorScaleRule
 from openpyxl.styles import Alignment, Font, PatternFill
 from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
@@ -110,25 +112,47 @@ INTERVAL_PERIODS = {
 
 @st.cache_data(ttl=300, show_spinner=False)
 def download_market_data(symbol: str, interval: str) -> pd.DataFrame:
-    """Harici piyasa kaynağından OHLCV mumlarını indirir."""
-    downloaded = yf.download(
-        symbol,
-        period=INTERVAL_PERIODS[interval],
-        interval=interval,
-        auto_adjust=False,
-        progress=False,
-        threads=False,
+    """Ek paket gerektirmeden harici piyasa kaynağından OHLCV indirir."""
+    encoded_symbol = urlencode({"symbol": symbol}).split("=", 1)[1]
+    query = urlencode({
+        "interval": interval,
+        "range": INTERVAL_PERIODS[interval],
+        "includePrePost": "false",
+        "events": "div,splits",
+    })
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded_symbol}?{query}"
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+        },
     )
-    if downloaded.empty:
-        raise ValueError(f"{symbol} için çevrim içi veri alınamadı.")
-    if isinstance(downloaded.columns, pd.MultiIndex):
-        downloaded.columns = downloaded.columns.get_level_values(0)
-    downloaded = downloaded.reset_index()
-    downloaded.columns = [str(column).lower().replace(" ", "_") for column in downloaded.columns]
-    time_column = "datetime" if "datetime" in downloaded.columns else "date"
-    downloaded = downloaded.rename(columns={
-        time_column: "time",
-        "adj_close": "adjusted_close",
+    try:
+        with urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        raise ValueError(f"Piyasa veri servisine erişilemedi: {exc}") from exc
+
+    chart = payload.get("chart", {})
+    if chart.get("error"):
+        raise ValueError(str(chart["error"]))
+    results = chart.get("result") or []
+    if not results:
+        raise ValueError(f"{symbol} için çevrim içi veri bulunamadı.")
+    result = results[0]
+    timestamps = result.get("timestamp") or []
+    quotes = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+    if not timestamps or not quotes:
+        raise ValueError(f"{symbol} için mum verisi boş döndü.")
+    size = len(timestamps)
+    downloaded = pd.DataFrame({
+        "time": pd.to_datetime(timestamps, unit="s", utc=True),
+        "open": quotes.get("open", [None] * size),
+        "high": quotes.get("high", [None] * size),
+        "low": quotes.get("low", [None] * size),
+        "close": quotes.get("close", [None] * size),
+        "volume": quotes.get("volume", [0] * size),
     })
     return normalize_columns(downloaded)
 
