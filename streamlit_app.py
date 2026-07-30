@@ -588,6 +588,40 @@ def render_clickable_ranking(table: pd.DataFrame, key: str):
     return event
 
 
+@st.fragment(run_every="20s")
+def render_auto_top_signal():
+    """En yüksek model güvenini 20 saniyede bir yeniden okur."""
+    if not OUTPUT_FILE.exists():
+        st.info("Henüz kaydedilmiş bir AI işlemi bulunmuyor.")
+        return
+    history = pd.read_excel(OUTPUT_FILE, sheet_name="Sinyaller")
+    if history.empty or "Güven" not in history:
+        st.info("Henüz karşılaştırılabilir işlem bulunmuyor.")
+        return
+    history["Güven"] = pd.to_numeric(history["Güven"], errors="coerce")
+    history = history.dropna(subset=["Güven"])
+    if history.empty:
+        return
+    top = history.sort_values(
+        ["Güven", "Zaman"], ascending=[False, False]
+    ).iloc[0]
+    confidence_percent = float(top["Güven"]) * 100
+    st.subheader("🏆 En yüksek güvenli işlem")
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("Varlık", str(top.get("Varlık", "-")))
+    a2.metric("Sinyal", str(top.get("Sinyal", "-")))
+    a3.metric("Güven yüzdesi", f"%{confidence_percent:.1f}")
+    a4.metric(
+        "Binomo ödeme",
+        f"%{float(top.get('Binomo ödeme oranı (%)', 0)):.1f}",
+    )
+    st.progress(min(max(confidence_percent / 100, 0.0), 1.0))
+    st.caption(
+        "Bu bölüm 20 saniyede bir yenilenir · Son kontrol: "
+        + datetime.now().astimezone().strftime("%H:%M:%S")
+    )
+
+
 def latest_indicators(frame: pd.DataFrame) -> dict:
     row = frame.iloc[-1]
     return {
@@ -609,8 +643,9 @@ def latest_indicators(frame: pd.DataFrame) -> dict:
 
 st.set_page_config(page_title="Binomo DL Araştırma", layout="wide")
 st.title("Binomo Derin Öğrenme Araştırması")
-st.caption("Sürüm: CLOUD-SAFE-2026.07.30.7 — Click & Compare")
+st.caption("Sürüm: CLOUD-SAFE-2026.07.30.8 — Auto Top 20s")
 st.warning("Araştırma amaçlıdır. Otomatik işlem yapmaz; yatırım tavsiyesi veya kazanç garantisi değildir.")
+render_auto_top_signal()
 data_source = st.radio(
     "Veri kaynağı",
     ["Çevrim içi veriyi kendisi indir", "CSV kullan"],
