@@ -15,6 +15,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
+import yfinance as yf
 from openpyxl.formatting.rule import ColorScaleRule
 from openpyxl.styles import Alignment, Font, PatternFill
 from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
@@ -66,6 +67,70 @@ FEATURES = [
     # Hacim
     "volume_change", "obv_change", "mfi_14", "vwap_ratio",
 ]
+
+MARKET_SYMBOLS = {
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "USD/JPY": "JPY=X",
+    "USD/CHF": "CHF=X",
+    "AUD/USD": "AUDUSD=X",
+    "USD/CAD": "CAD=X",
+    "NZD/USD": "NZDUSD=X",
+    "EUR/GBP": "EURGBP=X",
+    "EUR/JPY": "EURJPY=X",
+    "GBP/JPY": "GBPJPY=X",
+    "Bitcoin/USD": "BTC-USD",
+    "Ethereum/USD": "ETH-USD",
+    "Solana/USD": "SOL-USD",
+    "Gold": "GC=F",
+    "Silver": "SI=F",
+    "Oil (WTI)": "CL=F",
+    "Natural Gas": "NG=F",
+    "S&P 500": "^GSPC",
+    "NASDAQ 100": "^NDX",
+    "DAX 40": "^GDAXI",
+    "Apple": "AAPL",
+    "Microsoft": "MSFT",
+    "Nvidia": "NVDA",
+    "Tesla": "TSLA",
+    "Amazon": "AMZN",
+    "Meta": "META",
+    "Google": "GOOGL",
+}
+
+INTERVAL_PERIODS = {
+    "1m": "7d",
+    "5m": "60d",
+    "15m": "60d",
+    "30m": "60d",
+    "1h": "2y",
+    "1d": "10y",
+}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def download_market_data(symbol: str, interval: str) -> pd.DataFrame:
+    """Harici piyasa kaynağından OHLCV mumlarını indirir."""
+    downloaded = yf.download(
+        symbol,
+        period=INTERVAL_PERIODS[interval],
+        interval=interval,
+        auto_adjust=False,
+        progress=False,
+        threads=False,
+    )
+    if downloaded.empty:
+        raise ValueError(f"{symbol} için çevrim içi veri alınamadı.")
+    if isinstance(downloaded.columns, pd.MultiIndex):
+        downloaded.columns = downloaded.columns.get_level_values(0)
+    downloaded = downloaded.reset_index()
+    downloaded.columns = [str(column).lower().replace(" ", "_") for column in downloaded.columns]
+    time_column = "datetime" if "datetime" in downloaded.columns else "date"
+    downloaded = downloaded.rename(columns={
+        time_column: "time",
+        "adj_close": "adjusted_close",
+    })
+    return normalize_columns(downloaded)
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -288,7 +353,7 @@ def train_and_predict(frame, lookback, epochs):
     return probability, metrics, names
 
 
-def append_excel(record: dict) -> bytes:
+def append_excel(record: dict, market_data: pd.DataFrame | None = None) -> bytes:
     new = pd.DataFrame([record])
     if OUTPUT_FILE.exists():
         old = pd.read_excel(OUTPUT_FILE, sheet_name="Sinyaller")
@@ -330,6 +395,11 @@ def append_excel(record: dict) -> bytes:
             "Veri": "Kullanıcının yüklediği geçmiş OHLC mum verisi",
             "Doğrulama": "Son %20 veri, zaman sırası korunarak test edilir.",
         }]).to_excel(writer, sheet_name="Açıklama", index=False)
+        if market_data is not None and not market_data.empty:
+            export_data = market_data.tail(5000).copy()
+            # Excel saat dilimli datetime değerlerini kabul etmez.
+            export_data["time"] = export_data["time"].dt.tz_localize(None)
+            export_data.to_excel(writer, sheet_name="Piyasa_Verisi", index=False)
     return OUTPUT_FILE.read_bytes()
 
 
@@ -375,23 +445,48 @@ def latest_indicators(frame: pd.DataFrame) -> dict:
 
 
 st.set_page_config(page_title="Binomo DL Araştırma", layout="wide")
-st.title("Binomo CSV Derin Öğrenme Araştırması")
+st.title("Binomo Derin Öğrenme Araştırması")
 st.warning("Araştırma amaçlıdır. Otomatik işlem yapmaz; yatırım tavsiyesi veya kazanç garantisi değildir.")
-uploaded = st.file_uploader("Binomo mum verisi CSV", type=["csv"])
-st.caption(
-    "CSV yüklenince analiz otomatik başlar. Alternatif olarak "
-    f"`{AUTO_CSV_FILE.name}` dosyasını uygulamayla aynı klasöre koyabilirsiniz."
+data_source = st.radio(
+    "Veri kaynağı",
+    ["Çevrim içi veriyi kendisi indir", "CSV kullan"],
+    horizontal=True,
 )
+uploaded = None
+interval = "15m"
+if data_source == "CSV kullan":
+    uploaded = st.file_uploader("Mum verisi CSV", type=["csv"])
+else:
+    st.info(
+        "Veriler harici piyasa kaynağından otomatik indirilir. "
+        "Binomo OTC fiyatlarıyla birebir aynı olmayabilir."
+    )
 c1, c2, c3 = st.columns(3)
-asset = c1.text_input("Varlık", "EUR/USD")
-horizon = c2.number_input("Tahmin ufku (mum)", 1, 20, 1)
-lookback = c3.number_input("Model penceresi (mum)", 20, 120, 40)
-epochs = st.slider("DL epoch", 5, 100, 25)
-force_run = st.button("Aynı veriyi yeniden analiz et")
+if data_source == "Çevrim içi veriyi kendisi indir":
+    asset = c1.selectbox("Varlık", list(MARKET_SYMBOLS), index=0)
+    interval = c2.selectbox("Mum aralığı", list(INTERVAL_PERIODS), index=2)
+    horizon = c3.number_input("Tahmin ufku (mum)", 1, 20, 1)
+else:
+    asset = c1.text_input("Varlık", "EUR/USD")
+    horizon = c2.number_input("Tahmin ufku (mum)", 1, 20, 1)
+    interval = c3.text_input("Mum aralığı", "CSV")
+c4, c5 = st.columns(2)
+lookback = c4.number_input("Model penceresi (mum)", 20, 120, 40)
+epochs = c5.slider("DL epoch", 5, 100, 25)
+force_run = st.button("Verileri yenile, analiz et ve Excel'e kaydet", type="primary")
 
 csv_bytes = None
 csv_source = None
-if uploaded is not None:
+online_data = None
+if data_source == "Çevrim içi veriyi kendisi indir":
+    try:
+        online_data = download_market_data(MARKET_SYMBOLS[asset], interval)
+        csv_bytes = online_data.to_csv(index=False).encode("utf-8")
+        csv_source = f"{MARKET_SYMBOLS[asset]} ({interval})"
+        st.caption(f"{len(online_data):,} mum otomatik indirildi.")
+    except Exception as exc:
+        st.error(f"Çevrim içi veri alınamadı: {exc}")
+elif uploaded is not None:
     csv_bytes = uploaded.getvalue()
     csv_source = uploaded.name
 elif AUTO_CSV_FILE.exists():
@@ -414,8 +509,11 @@ should_analyze = bool(
 
 if should_analyze:
     try:
-        raw = pd.read_csv(io.BytesIO(csv_bytes), sep=None, engine="python")
-        data = normalize_columns(raw)
+        if online_data is not None:
+            data = online_data
+        else:
+            raw = pd.read_csv(io.BytesIO(csv_bytes), sep=None, engine="python")
+            data = normalize_columns(raw)
         frame = add_features(data, int(horizon))
         with st.spinner("Modeller eğitiliyor..."):
             probability, metrics, model_names = train_and_predict(frame, int(lookback), epochs)
@@ -437,7 +535,7 @@ if should_analyze:
             "Mum sayısı": len(data),
             **indicators,
         }
-        excel_bytes = append_excel(record)
+        excel_bytes = append_excel(record, data)
         st.session_state.last_saved_analysis = analysis_key
 
         # Kullanıcının ilk gördüğü bölüm: önceliklendirilmiş işlem listesi.
