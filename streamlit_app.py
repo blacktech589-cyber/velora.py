@@ -461,8 +461,18 @@ def append_excel(record: dict, market_data: pd.DataFrame | None = None) -> bytes
     # En yüksek güvenli işlemler her zaman ilk sırada görünür.
     data = data.drop(columns=["Öncelik"], errors="ignore")
     data["Güven"] = pd.to_numeric(data["Güven"], errors="coerce")
+    payout_source = data.get(
+        "Binomo ödeme oranı (%)",
+        pd.Series(0.0, index=data.index),
+    )
+    payout = pd.to_numeric(payout_source, errors="coerce").fillna(0)
+    data["Karşılaştırma puanı"] = (
+        data["Güven"] * payout - (1 - data["Güven"]) * 100
+    ).round(2)
     data = data.sort_values(
-        ["Güven", "Zaman"], ascending=[False, False], na_position="last"
+        ["Karşılaştırma puanı", "Güven", "Zaman"],
+        ascending=[False, False, False],
+        na_position="last",
     ).reset_index(drop=True)
     data.insert(0, "Öncelik", np.arange(1, len(data) + 1))
     with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
@@ -507,8 +517,20 @@ def prioritized_signal_table() -> pd.DataFrame:
         return pd.DataFrame()
     history = pd.read_excel(OUTPUT_FILE, sheet_name="Sinyaller")
     history["Güven"] = pd.to_numeric(history["Güven"], errors="coerce")
+    payout_source = history.get(
+        "Binomo ödeme oranı (%)",
+        pd.Series(0.0, index=history.index),
+    )
+    payout = pd.to_numeric(payout_source, errors="coerce").fillna(0)
+    # Bir birim risk için ikili işlem beklenen değeri:
+    # kazanma_olasılığı * ödeme - kaybetme_olasılığı * 100
+    history["Karşılaştırma puanı"] = (
+        history["Güven"] * payout - (1 - history["Güven"]) * 100
+    ).round(2)
     history = history.sort_values(
-        ["Güven", "Zaman"], ascending=[False, False], na_position="last"
+        ["Karşılaştırma puanı", "Güven", "Zaman"],
+        ascending=[False, False, False],
+        na_position="last",
     ).reset_index(drop=True)
     history["Öncelik"] = np.arange(1, len(history) + 1)
     history["Güven"] = history["Güven"] * 100
@@ -517,10 +539,53 @@ def prioritized_signal_table() -> pd.DataFrame:
     if "Test doğruluğu" in history:
         history["Test doğruluğu"] = history["Test doğruluğu"] * 100
     visible = [
-        "Öncelik", "Varlık", "Sinyal", "Güven yüzdesi", "Güven", "Model olasılığı",
+        "Öncelik", "Varlık", "Sinyal", "Karşılaştırma puanı",
+        "Güven yüzdesi", "Güven", "Binomo ödeme oranı (%)", "Model olasılığı",
         "Tahmin ufku (mum)", "Test doğruluğu", "Zaman",
     ]
     return history[[column for column in visible if column in history.columns]]
+
+
+def render_clickable_ranking(table: pd.DataFrame, key: str):
+    """Sıralamayı gösterir ve tıklanan işlemin ayrıntısını açar."""
+    event = st.dataframe(
+        table,
+        use_container_width=True,
+        hide_index=True,
+        key=key,
+        on_select="rerun",
+        selection_mode="single-row",
+        column_config={
+            "Güven": st.column_config.ProgressColumn(
+                "Güven", min_value=0.0, max_value=100.0, format="%.1f%%"
+            ),
+            "Model olasılığı": st.column_config.NumberColumn(
+                "Yukarı olasılığı", format="%.1f%%"
+            ),
+            "Test doğruluğu": st.column_config.NumberColumn(
+                "Test doğruluğu", format="%.1f%%"
+            ),
+            "Karşılaştırma puanı": st.column_config.NumberColumn(
+                "Beklenen değer", format="%.2f"
+            ),
+        },
+    )
+    selected_rows = event.selection.rows
+    if selected_rows:
+        selected = table.iloc[int(selected_rows[0])]
+        st.subheader(f"Seçilen işlem: {selected.get('Varlık', '-')}")
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("Sinyal", str(selected.get("Sinyal", "-")))
+        d2.metric("Güven", str(selected.get("Güven yüzdesi", "-")))
+        d3.metric(
+            "Ödeme",
+            f"%{float(selected.get('Binomo ödeme oranı (%)', 0)):.1f}",
+        )
+        d4.metric(
+            "Karşılaştırma",
+            f"{float(selected.get('Karşılaştırma puanı', 0)):.2f}",
+        )
+    return event
 
 
 def latest_indicators(frame: pd.DataFrame) -> dict:
@@ -544,7 +609,7 @@ def latest_indicators(frame: pd.DataFrame) -> dict:
 
 st.set_page_config(page_title="Binomo DL Araştırma", layout="wide")
 st.title("Binomo Derin Öğrenme Araştırması")
-st.caption("Sürüm: CLOUD-SAFE-2026.07.30.6 — Adaptive AI")
+st.caption("Sürüm: CLOUD-SAFE-2026.07.30.7 — Click & Compare")
 st.warning("Araştırma amaçlıdır. Otomatik işlem yapmaz; yatırım tavsiyesi veya kazanç garantisi değildir.")
 data_source = st.radio(
     "Veri kaynağı",
@@ -678,22 +743,7 @@ if should_analyze:
         st.subheader("Öncelikli işlemler")
         st.caption("En yüksek güven yüzdesi ilk sıradadır.")
         priority_table = prioritized_signal_table()
-        st.dataframe(
-            priority_table,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Güven": st.column_config.ProgressColumn(
-                    "Güven", min_value=0.0, max_value=100.0, format="%.1f%%"
-                ),
-                "Model olasılığı": st.column_config.NumberColumn(
-                    "Yukarı olasılığı", format="%.1f%%"
-                ),
-                "Test doğruluğu": st.column_config.NumberColumn(
-                    "Test doğruluğu", format="%.1f%%"
-                ),
-            },
-        )
+        render_clickable_ranking(priority_table, "priority_after_analysis")
         st.success(
             f"{csv_source} otomatik analiz edildi ve Excel'e kaydedildi. "
             f"Sonuç: {signal} — model güveni %{confidence * 100:.1f}"
@@ -722,7 +772,7 @@ elif csv_bytes and st.session_state.last_saved_analysis == analysis_key:
     existing = prioritized_signal_table()
     if not existing.empty:
         st.subheader("Öncelikli işlemler")
-        st.dataframe(existing, use_container_width=True, hide_index=True)
+        render_clickable_ranking(existing, "priority_existing")
 elif csv_bytes:
     st.success(
         "Piyasa verisi hazır. Model eğitimi için "
