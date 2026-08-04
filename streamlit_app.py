@@ -591,7 +591,7 @@ def render_clickable_ranking(table: pd.DataFrame, key: str):
 
 @st.fragment(run_every="40s")
 def render_auto_top_signal():
-    """Güven yüzdesine göre sıralı işlemleri 40 saniyede bir gösterir."""
+    """En az 10 farklı varlığı, 40 saniyede bir otomatik yenileyerek gösterir."""
     if not OUTPUT_FILE.exists():
         st.info("Henüz kaydedilmiş bir AI işlemi bulunmuyor.")
         return
@@ -603,35 +603,48 @@ def render_auto_top_signal():
     history = history.dropna(subset=["Güven"])
     if history.empty:
         return
-    ranked = history.sort_values(
-        ["Güven", "Zaman"], ascending=[False, False]
-    ).head(20).reset_index(drop=True)
-    if "top_signal_manual_offset" not in st.session_state:
-        st.session_state.top_signal_manual_offset = 0
-    if st.button(
-        "Sonraki yüksek yüzde →",
-        key="next_top_confidence",
-        use_container_width=True,
-    ):
-        st.session_state.top_signal_manual_offset += 1
-    rotation_index = (
-        int(time.time()) // 40 + st.session_state.top_signal_manual_offset
-    ) % len(ranked)
-    top = ranked.iloc[rotation_index]
-    confidence_percent = float(top["Güven"]) * 100
-    st.subheader("🏆 En yüksek güvenli işlem")
-    a1, a2, a3, a4 = st.columns(4)
-    a1.metric("Varlık", str(top.get("Varlık", "-")))
-    a2.metric("Sinyal", str(top.get("Sinyal", "-")))
-    a3.metric("Güven yüzdesi", f"%{confidence_percent:.1f}")
-    a4.metric(
-        "Binomo ödeme",
-        f"%{float(top.get('Binomo ödeme oranı (%)', 0)):.1f}",
+    # Her para biriminin yalnızca en güncel sonucunu kullan; aynı varlığın eski
+    # kayıtları listenin on farklı öneriye ulaşmasını engellemesin.
+    history = history.sort_values("Zaman", ascending=False)
+    ranked = (
+        history.drop_duplicates(subset=["Varlık"], keep="first")
+        .sort_values(["Güven", "Zaman"], ascending=[False, False])
+        .reset_index(drop=True)
     )
-    st.progress(min(max(confidence_percent / 100, 0.0), 1.0))
+    page_size = 10
+    page_count = max(1, int(np.ceil(len(ranked) / page_size)))
+    page_index = (int(time.time()) // 40) % page_count
+    start = page_index * page_size
+    visible = ranked.iloc[start:start + page_size].copy()
+    # Son sayfada 10 satırdan az kaldığında listenin başındaki en yüksek
+    # yüzdeli varlıklarla tamamla. Varlık sayısı 10'dan azsa sahte öneri üretme.
+    if len(visible) < page_size and len(ranked) >= page_size:
+        visible = pd.concat([
+            visible,
+            ranked.iloc[:page_size - len(visible)],
+        ], ignore_index=True)
+    visible["Güven yüzdesi"] = visible["Güven"].map(
+        lambda value: f"%{float(value) * 100:.1f}"
+    )
+    visible.insert(0, "Sıra", np.arange(1, len(visible) + 1))
+    columns = [
+        "Sıra", "Varlık", "Sinyal", "Güven yüzdesi",
+        "Binomo ödeme oranı (%)", "Zaman",
+    ]
+    st.subheader("🏆 Otomatik yüksek güvenli 10 para birimi")
+    st.dataframe(
+        visible[[column for column in columns if column in visible.columns]],
+        use_container_width=True,
+        hide_index=True,
+    )
+    if len(ranked) < page_size:
+        st.warning(
+            f"Şu anda {len(ranked)} farklı varlık için kayıt var. "
+            "10 öneriye ulaşmak için farklı para birimlerinin analiz edilmesi gerekir."
+        )
     st.caption(
-        f"40 saniyede bir değişir · Sıra {rotation_index + 1}/{len(ranked)} · "
-        "En yüksek güven yüzdeleri önceliklidir · "
+        f"40 saniyede bir otomatik değişir · Grup {page_index + 1}/{page_count} · "
+        "Tıklama gerekmez · En yüksek güven yüzdeleri önceliklidir · "
         + datetime.now().astimezone().strftime("%H:%M:%S")
     )
 
@@ -697,123 +710,10 @@ def latest_indicators(frame: pd.DataFrame) -> dict:
     }
 
 
-def analyze_10_20_trend(frame: pd.DataFrame) -> dict:
-    """10/20 mum ortalaması ve ikinci yön mumunu analiz eder."""
-    if len(frame) < 22:
-        return {
-            "trend_signal": "BEKLE",
-            "second_candle": "YETERSİZ VERİ",
-            "trend_reason": "Trend analizi için en az 22 mum gerekir.",
-            "sma10": np.nan,
-            "sma20": np.nan,
-            "range_position": np.nan,
-            "price_zone": "YETERSİZ VERİ",
-            "alternating_pattern": "YETERSİZ VERİ",
-        }
-
-    close = frame["close"].astype(float)
-    open_price = frame["open"].astype(float)
-    last_close = float(close.iloc[-1])
-    sma10 = float(close.tail(10).mean())
-    sma20 = float(close.tail(20).mean())
-    low20 = float(frame["low"].tail(20).min())
-    high20 = float(frame["high"].tail(20).max())
-    price_range = high20 - low20
-    range_position = (
-        (last_close - low20) / price_range
-        if price_range > 0 else 0.5
-    )
-
-    # Öncelik fiyat bölgesindedir: dipte BUY, tepede SELL.
-    if range_position <= 0.20:
-        mean_reversion_signal = "YUKARI"
-        price_zone = "DİP BÖLGESİ"
-        mean_reversion_reason = (
-            f"Fiyat son 20 mum aralığının alt %{range_position * 100:.1f} "
-            "bölgesinde: BUY"
-        )
-    elif range_position >= 0.80:
-        mean_reversion_signal = "AŞAĞI"
-        price_zone = "TEPE BÖLGESİ"
-        mean_reversion_reason = (
-            f"Fiyat son 20 mum aralığının üst %{range_position * 100:.1f} "
-            "bölgesinde: SELL"
-        )
-    elif last_close < sma10 and last_close < sma20:
-        mean_reversion_signal = "YUKARI"
-        price_zone = "ORTA-ALT BÖLGE"
-        mean_reversion_reason = "Fiyat SMA10 ve SMA20 altında: BUY"
-    elif last_close > sma10 and last_close > sma20:
-        mean_reversion_signal = "AŞAĞI"
-        price_zone = "ORTA-ÜST BÖLGE"
-        mean_reversion_reason = "Fiyat SMA10 ve SMA20 üzerinde: SELL"
-    else:
-        mean_reversion_signal = "BEKLE"
-        price_zone = "ORTA BÖLGE"
-        mean_reversion_reason = "Fiyat SMA10/SMA20 arasında"
-
-    bullish = close > open_price
-    bearish = close < open_price
-    rising_closes = close.diff() > 0
-    falling_closes = close.diff() < 0
-
-    if (
-        bool(bullish.iloc[-2]) and bool(bullish.iloc[-1])
-        and bool(rising_closes.iloc[-2]) and bool(rising_closes.iloc[-1])
-    ):
-        second_candle = "2. YÜKSELİŞ MUMU"
-        candle_signal = "YUKARI"
-        alternating_pattern = "ARDIŞIK YÜKSELİŞ"
-    elif (
-        bool(bearish.iloc[-2]) and bool(bearish.iloc[-1])
-        and bool(falling_closes.iloc[-2]) and bool(falling_closes.iloc[-1])
-    ):
-        second_candle = "2. DÜŞÜŞ MUMU"
-        candle_signal = "AŞAĞI"
-        alternating_pattern = "ARDIŞIK DÜŞÜŞ"
-    elif bool(bearish.iloc[-2]) and bool(bullish.iloc[-1]):
-        second_candle = "DÜŞÜŞ → YÜKSELİŞ"
-        candle_signal = "YUKARI"
-        alternating_pattern = "DÖNÜŞ BUY"
-    elif bool(bullish.iloc[-2]) and bool(bearish.iloc[-1]):
-        second_candle = "YÜKSELİŞ → DÜŞÜŞ"
-        candle_signal = "AŞAĞI"
-        alternating_pattern = "DÖNÜŞ SELL"
-    else:
-        second_candle = "TEYİT YOK"
-        candle_signal = "BEKLE"
-        alternating_pattern = "DÖNÜŞ YOK"
-
-    if mean_reversion_signal == candle_signal and candle_signal != "BEKLE":
-        trend_signal = candle_signal
-        trend_reason = mean_reversion_reason + " ve ikinci mum teyitli"
-    elif candle_signal == "BEKLE":
-        trend_signal = mean_reversion_signal
-        trend_reason = mean_reversion_reason + "; ikinci mum teyidi yok"
-    else:
-        trend_signal = "BEKLE"
-        trend_reason = (
-            mean_reversion_reason
-            + f"; {second_candle} ile çelişiyor"
-        )
-
-    return {
-        "trend_signal": trend_signal,
-        "second_candle": second_candle,
-        "trend_reason": trend_reason,
-        "sma10": sma10,
-        "sma20": sma20,
-        "range_position": range_position,
-        "price_zone": price_zone,
-        "alternating_pattern": alternating_pattern,
-    }
-
-
 def enterprise_context(
     frame: pd.DataFrame,
     probability: float,
     metrics: dict,
-    minimum_confidence: float = 0.65,
 ) -> dict:
     """Kararı veri kalitesi, rejim ve belirsizlik açısından denetler."""
     feature_frame = frame[FEATURES].replace([np.inf, -np.inf], np.nan)
@@ -833,10 +733,7 @@ def enterprise_context(
     else:
         regime = "Yatay / zayıf trend"
     disagreement = float(metrics.get("Model anlaşmazlığı", 0))
-    minimum_confidence = max(0.55, min(0.85, minimum_confidence))
-    adaptive_threshold = min(
-        0.85, minimum_confidence + min(disagreement, 0.10)
-    )
+    adaptive_threshold = min(0.70, 0.55 + disagreement)
     directional_confidence = max(probability, 1 - probability)
     if quality_score < 90:
         decision = "BEKLE"
@@ -903,31 +800,44 @@ def render_live_market(asset_name: str, symbol: str, interval: str):
         st.warning(f"Canlı veri geçici olarak yenilenemedi: {exc}")
 
 
+@st.fragment(run_every="40s")
+def auto_advance_market():
+    """Her 40 saniyede sıradaki varlığa geçip tam analizi yeniden çalıştırır."""
+    now = time.time()
+    last_change = st.session_state.get("auto_market_last_change")
+    if last_change is None:
+        st.session_state.auto_market_last_change = now
+        return
+    if now - float(last_change) >= 38:
+        st.session_state.auto_market_index = (
+            int(st.session_state.get("auto_market_index", 0)) + 1
+        ) % len(MARKET_SYMBOLS)
+        st.session_state.auto_market_last_change = now
+        st.rerun()
+
+
 st.set_page_config(page_title="Binomo DL Araştırma", layout="wide")
 st.title("Binomo Derin Öğrenme Araştırması")
-st.caption("Sürüm: ENTERPRISE-AI-2026.07.30.20 — Reversal Candles")
+st.caption("Sürüm: ENTERPRISE-AI-2026.07.30.16 — Governed Intelligence")
 st.warning("Araştırma amaçlıdır. Otomatik işlem yapmaz; yatırım tavsiyesi veya kazanç garantisi değildir.")
 render_auto_top_signal()
 render_best_accuracy_panel()
-data_source = st.radio(
-    "Veri kaynağı",
-    ["Çevrim içi veriyi kendisi indir", "CSV kullan"],
-    horizontal=True,
-)
+auto_advance_market()
+data_source = "Çevrim içi veriyi kendisi indir"
 uploaded = None
 interval = "15m"
-if data_source == "CSV kullan":
-    uploaded = st.file_uploader("Mum verisi CSV", type=["csv"])
-else:
-    st.info(
-        "Veriler harici piyasa kaynağından otomatik indirilir. "
-        "Binomo OTC fiyatları halka açık olmadığından OTC seçimlerinde "
-        "normal piyasa karşılığı (vekil sembol) kullanılır."
-    )
+st.info(
+    "Tam otomatik tarama etkin: Her 40 saniyede sıradaki varlık analiz edilir "
+    "ve sonuç Excel'e kaydedilir. Binomo OTC seçimlerinde normal piyasa "
+    "karşılığı (vekil sembol) kullanılır."
+)
 c1, c2, c3 = st.columns(3)
 if data_source == "Çevrim içi veriyi kendisi indir":
-    asset = c1.selectbox("Varlık", list(MARKET_SYMBOLS), index=0)
-    interval = c2.selectbox("Mum aralığı", list(INTERVAL_PERIODS), index=0)
+    market_names = list(MARKET_SYMBOLS)
+    market_index = int(st.session_state.get("auto_market_index", 0)) % len(market_names)
+    asset = market_names[market_index]
+    c1.metric("Otomatik taranan varlık", asset)
+    interval = c2.selectbox("Mum aralığı", list(INTERVAL_PERIODS), index=2)
     horizon = c3.number_input("Tahmin ufku (mum)", 1, 20, 1)
 else:
     asset = c1.text_input("Varlık", "EUR/USD")
@@ -935,20 +845,12 @@ else:
     interval = c3.text_input("Mum aralığı", "CSV")
 if data_source == "Çevrim içi veriyi kendisi indir":
     render_live_market(asset, MARKET_SYMBOLS[asset], interval)
-c4, c5, c6, c7 = st.columns(4)
-lookback = c4.number_input("Model penceresi (mum)", 20, 120, 90)
+c4, c5, c6 = st.columns(3)
+lookback = c4.number_input("Model penceresi (mum)", 20, 120, 40)
 epochs = c5.slider("DL epoch", 5, 60, 15)
 payout_rate = c6.number_input(
     "Binomo ödeme oranı (%)", min_value=0, max_value=100, value=82,
     help="Platformda görünen oranı elle girin; model güveninden farklıdır.",
-)
-minimum_confidence_percent = c7.slider(
-    "Minimum karar güveni (%)",
-    min_value=55,
-    max_value=85,
-    value=65,
-    step=1,
-    help="Bu eşik aşılmazsa sistem YUKARI/AŞAĞI yerine BEKLE verir.",
 )
 analysis_candles = st.slider(
     "Analiz edilecek son mum sayısı",
@@ -961,8 +863,6 @@ analysis_candles = st.slider(
         "belleği için zaman geneline yayılmış en fazla 6.000 pencere kullanır."
     ),
 )
-force_run = st.button("Analizi başlat ve Excel'e kaydet", type="primary")
-
 csv_bytes = None
 csv_source = None
 online_data = None
@@ -985,17 +885,19 @@ elif AUTO_CSV_FILE.exists():
 analysis_key = None
 if csv_bytes:
     settings = (
-        f"{asset}|{horizon}|{lookback}|{epochs}|{analysis_candles}|"
-        f"{minimum_confidence_percent}"
+        f"{asset}|{horizon}|{lookback}|{epochs}|{analysis_candles}"
     ).encode("utf-8")
     analysis_key = hashlib.sha256(csv_bytes + settings).hexdigest()
 
 if "last_saved_analysis" not in st.session_state:
     st.session_state.last_saved_analysis = None
 
-# Community Cloud'da sayfa açılışında ağır model eğitimi süreci düşürebilir.
-# Veri otomatik indirilir; eğitim kullanıcı düğmeye bastığında bir kez çalışır.
-should_analyze = bool(csv_bytes and force_run)
+# Veri hazır olur olmaz analiz otomatik başlar. Aynı veri ve ayarlar, oturum
+# içinde yeniden eğitilmez; böylece 40 saniyelik ekran yenilemeleri ağır modeli
+# gereksiz yere tekrar çalıştırmaz.
+should_analyze = bool(
+    csv_bytes and st.session_state.last_saved_analysis != analysis_key
+)
 
 if should_analyze:
     try:
@@ -1017,28 +919,8 @@ if should_analyze:
                 frame, int(lookback), epochs, int(analysis_candles)
             )
         indicators = latest_indicators(frame)
-        trend_analysis = analyze_10_20_trend(frame)
-        enterprise = enterprise_context(
-            frame,
-            probability,
-            metrics,
-            minimum_confidence_percent / 100,
-        )
-        ai_signal = enterprise["decision"]
-        if (
-            ai_signal in {"YUKARI", "AŞAĞI"}
-            and trend_analysis["trend_signal"] in {"YUKARI", "AŞAĞI"}
-            and ai_signal != trend_analysis["trend_signal"]
-        ):
-            signal = "BEKLE"
-            combined_reason = "AI ve 10/20 trend stratejisi çelişiyor"
-        else:
-            signal = ai_signal
-            combined_reason = (
-                "AI ve trend filtresi uyumlu"
-                if trend_analysis["trend_signal"] == ai_signal
-                else enterprise["reason"]
-            )
+        enterprise = enterprise_context(frame, probability, metrics)
+        signal = enterprise["decision"]
         confidence = enterprise["directional_confidence"]
         best_model_name = max(
             model_details,
@@ -1059,25 +941,13 @@ if should_analyze:
             "En başarılı model": best_model_name,
             "En başarılı model doğruluğu": best_model_accuracy,
             "AI karar nedeni": (
-                combined_reason
-            ),
-            "Ham AI sinyali": ai_signal,
-            "10/20 trend sinyali": trend_analysis["trend_signal"],
-            "İkinci mum durumu": trend_analysis["second_candle"],
-            "Dönüş mum deseni": trend_analysis["alternating_pattern"],
-            "Trend açıklaması": trend_analysis["trend_reason"],
-            "SMA 10": round(float(trend_analysis["sma10"]), 6),
-            "SMA 20": round(float(trend_analysis["sma20"]), 6),
-            "20 mum fiyat bölgesi": trend_analysis["price_zone"],
-            "20 mum konumu (%)": round(
-                float(trend_analysis["range_position"]) * 100, 2
+                enterprise["reason"]
             ),
             "Piyasa rejimi": enterprise["regime"],
             "Veri kalite puanı": round(enterprise["quality_score"], 2),
             "Dinamik güven eşiği": round(
                 enterprise["adaptive_threshold"], 4
             ),
-            "Minimum güven ayarı (%)": minimum_confidence_percent,
             "Denetim kimliği": enterprise["audit_id"],
             "Test doğruluğu": round(metrics["Doğruluk"], 4),
             "Test precision": round(metrics["Precision"], 4),
@@ -1110,20 +980,7 @@ if should_analyze:
             f"%{enterprise['adaptive_threshold'] * 100:.1f}",
         )
         e4.metric("Denetim ID", enterprise["audit_id"])
-        st.info("Birleşik karar açıklaması: " + combined_reason)
-        st.subheader("10/20 mum trend stratejisi")
-        t1, t2, t3, t4, t5, t6 = st.columns(6)
-        t1.metric("Trend sinyali", trend_analysis["trend_signal"])
-        t2.metric("İkinci mum", trend_analysis["second_candle"])
-        t3.metric("SMA 10", f"{trend_analysis['sma10']:.6f}")
-        t4.metric("SMA 20", f"{trend_analysis['sma20']:.6f}")
-        t5.metric(
-            "Fiyat bölgesi",
-            trend_analysis["price_zone"],
-            f"%{trend_analysis['range_position'] * 100:.1f}",
-        )
-        t6.metric("Dönüş deseni", trend_analysis["alternating_pattern"])
-        st.info(trend_analysis["trend_reason"])
+        st.info("Karar açıklaması: " + enterprise["reason"])
         with st.expander("Zeka motoru — model ağırlıkları"):
             st.dataframe(
                 pd.DataFrame(model_details).T.reset_index(
@@ -1149,7 +1006,4 @@ elif csv_bytes and st.session_state.last_saved_analysis == analysis_key:
         st.subheader("Öncelikli işlemler")
         render_clickable_ranking(existing, "priority_existing")
 elif csv_bytes:
-    st.success(
-        "Piyasa verisi hazır. Model eğitimi için "
-        "'Analizi başlat ve Excel'e kaydet' düğmesine basın."
-    )
+    st.info("Piyasa verisi hazır; analiz otomatik olarak başlatılıyor.")
