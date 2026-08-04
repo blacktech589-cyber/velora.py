@@ -606,17 +606,9 @@ def render_auto_top_signal():
     ranked = history.sort_values(
         ["Güven", "Zaman"], ascending=[False, False]
     ).head(20).reset_index(drop=True)
-    if "top_signal_manual_offset" not in st.session_state:
-        st.session_state.top_signal_manual_offset = 0
-    if st.button(
-        "Sonraki yüksek yüzde →",
-        key="next_top_confidence",
-        use_container_width=True,
-    ):
-        st.session_state.top_signal_manual_offset += 1
-    rotation_index = (
-        int(time.time()) // 40 + st.session_state.top_signal_manual_offset
-    ) % len(ranked)
+    # Kullanıcıdan düğmeye basmasını beklemeden, yüksek güvenli sonuçlar
+    # arasında 40 saniyede bir otomatik geçiş yap.
+    rotation_index = (int(time.time()) // 40) % len(ranked)
     top = ranked.iloc[rotation_index]
     confidence_percent = float(top["Güven"]) * 100
     st.subheader("🏆 En yüksek güvenli işlem")
@@ -837,8 +829,6 @@ analysis_candles = st.slider(
         "belleği için zaman geneline yayılmış en fazla 6.000 pencere kullanır."
     ),
 )
-force_run = st.button("Analizi başlat ve Excel'e kaydet", type="primary")
-
 csv_bytes = None
 csv_source = None
 online_data = None
@@ -868,9 +858,12 @@ if csv_bytes:
 if "last_saved_analysis" not in st.session_state:
     st.session_state.last_saved_analysis = None
 
-# Community Cloud'da sayfa açılışında ağır model eğitimi süreci düşürebilir.
-# Veri otomatik indirilir; eğitim kullanıcı düğmeye bastığında bir kez çalışır.
-should_analyze = bool(csv_bytes and force_run)
+# Veri hazır olur olmaz analiz otomatik başlar. Aynı veri ve ayarlar, oturum
+# içinde yeniden eğitilmez; böylece 40 saniyelik ekran yenilemeleri ağır modeli
+# gereksiz yere tekrar çalıştırmaz.
+should_analyze = bool(
+    csv_bytes and st.session_state.last_saved_analysis != analysis_key
+)
 
 if should_analyze:
     try:
@@ -979,7 +972,4 @@ elif csv_bytes and st.session_state.last_saved_analysis == analysis_key:
         st.subheader("Öncelikli işlemler")
         render_clickable_ranking(existing, "priority_existing")
 elif csv_bytes:
-    st.success(
-        "Piyasa verisi hazır. Model eğitimi için "
-        "'Analizi başlat ve Excel'e kaydet' düğmesine basın."
-    )
+    st.info("Piyasa verisi hazır; analiz otomatik olarak başlatılıyor.")
