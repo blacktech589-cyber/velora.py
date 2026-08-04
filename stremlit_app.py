@@ -769,14 +769,14 @@ def enterprise_context(
     disagreement = float(metrics.get("Model anlaşmazlığı", 0))
     adaptive_threshold = min(0.70, 0.55 + disagreement)
     directional_confidence = max(probability, 1 - probability)
+    # Her taramada mutlaka yön üret. Kalite veya güven düşükse yönü gizlemek
+    # yerine açıklamaya düşük güven uyarısı ekle.
+    decision = "YUKARI" if probability >= 0.5 else "AŞAĞI"
     if quality_score < 90:
-        decision = "BEKLE"
-        reason = "Veri kalite puanı yetersiz"
+        reason = "Düşük veri kalitesiyle üretilmiş araştırma yönü"
     elif directional_confidence < adaptive_threshold:
-        decision = "BEKLE"
-        reason = "Dinamik güven eşiği aşılmadı"
+        reason = "Dinamik güven eşiğinin altında araştırma yönü"
     else:
-        decision = "YUKARI" if probability >= 0.5 else "AŞAĞI"
         reason = "Kalite ve model uzlaşması yeterli"
     audit_payload = (
         f"{frame['time'].iloc[-1]}|{probability:.8f}|{decision}|"
