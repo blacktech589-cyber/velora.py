@@ -800,30 +800,43 @@ def render_live_market(asset_name: str, symbol: str, interval: str):
         st.warning(f"Canlı veri geçici olarak yenilenemedi: {exc}")
 
 
+@st.fragment(run_every="40s")
+def auto_advance_market():
+    """Her 40 saniyede sıradaki varlığa geçip tam analizi yeniden çalıştırır."""
+    now = time.time()
+    last_change = st.session_state.get("auto_market_last_change")
+    if last_change is None:
+        st.session_state.auto_market_last_change = now
+        return
+    if now - float(last_change) >= 38:
+        st.session_state.auto_market_index = (
+            int(st.session_state.get("auto_market_index", 0)) + 1
+        ) % len(MARKET_SYMBOLS)
+        st.session_state.auto_market_last_change = now
+        st.rerun()
+
+
 st.set_page_config(page_title="Binomo DL Araştırma", layout="wide")
 st.title("Binomo Derin Öğrenme Araştırması")
 st.caption("Sürüm: ENTERPRISE-AI-2026.07.30.16 — Governed Intelligence")
 st.warning("Araştırma amaçlıdır. Otomatik işlem yapmaz; yatırım tavsiyesi veya kazanç garantisi değildir.")
 render_auto_top_signal()
 render_best_accuracy_panel()
-data_source = st.radio(
-    "Veri kaynağı",
-    ["Çevrim içi veriyi kendisi indir", "CSV kullan"],
-    horizontal=True,
-)
+auto_advance_market()
+data_source = "Çevrim içi veriyi kendisi indir"
 uploaded = None
 interval = "15m"
-if data_source == "CSV kullan":
-    uploaded = st.file_uploader("Mum verisi CSV", type=["csv"])
-else:
-    st.info(
-        "Veriler harici piyasa kaynağından otomatik indirilir. "
-        "Binomo OTC fiyatları halka açık olmadığından OTC seçimlerinde "
-        "normal piyasa karşılığı (vekil sembol) kullanılır."
-    )
+st.info(
+    "Tam otomatik tarama etkin: Her 40 saniyede sıradaki varlık analiz edilir "
+    "ve sonuç Excel'e kaydedilir. Binomo OTC seçimlerinde normal piyasa "
+    "karşılığı (vekil sembol) kullanılır."
+)
 c1, c2, c3 = st.columns(3)
 if data_source == "Çevrim içi veriyi kendisi indir":
-    asset = c1.selectbox("Varlık", list(MARKET_SYMBOLS), index=0)
+    market_names = list(MARKET_SYMBOLS)
+    market_index = int(st.session_state.get("auto_market_index", 0)) % len(market_names)
+    asset = market_names[market_index]
+    c1.metric("Otomatik taranan varlık", asset)
     interval = c2.selectbox("Mum aralığı", list(INTERVAL_PERIODS), index=2)
     horizon = c3.number_input("Tahmin ufku (mum)", 1, 20, 1)
 else:
