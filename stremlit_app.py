@@ -156,6 +156,40 @@ FOREX_PAIRS = [
 for forex_pair in FOREX_PAIRS:
     MARKET_SYMBOLS.setdefault(forex_pair, forex_pair.replace("/", "") + "=X")
 
+# Binomo ekranındaki adlarla otomatik taranacak öncelikli varlıklar.
+# OTC fiyatları halka açık olmadığı için karşılarında normal piyasa vekilleri var.
+BINOMO_ASSET_SYMBOLS = {
+    "Crypto IDX": "BTC-USD",
+    "Bitcoin (OTC)": "BTC-USD",
+    "Ethereum (OTC)": "ETH-USD",
+    "Solana (OTC)": "SOL-USD",
+    "FC Barcelona Token (OTC)": "BAR-USD",
+    "AUD/USD (OTC)": "AUDUSD=X",
+    "Cardano (OTC)": "ADA-USD",
+    "NZD/USD (OTC)": "NZDUSD=X",
+    "GBP/CHF (OTC)": "GBPCHF=X",
+    "Chainlink (OTC)": "LINK-USD",
+    "CHF/JPY (OTC)": "CHFJPY=X",
+    "EUR/CAD (OTC)": "EURCAD=X",
+    "GBP/JPY (OTC)": "GBPJPY=X",
+    "GBP/USD (OTC)": "GBPUSD=X",
+    "EUR/GBP (OTC)": "EURGBP=X",
+    "EUR/USD (OTC)": "EURUSD=X",
+    "AUD/CAD (OTC)": "AUDCAD=X",
+    "USD/JPY (OTC)": "JPY=X",
+    "USD/CAD (OTC)": "CAD=X",
+    "Bitcoin Cash (OTC)": "BCH-USD",
+    "Kusama (OTC)": "KSM-USD",
+    "Aave (OTC)": "AAVE-USD",
+    "Pancake Swap (OTC)": "CAKE-USD",
+    "Uniswap (OTC)": "UNI-USD",
+    "GBP/NZD (OTC)": "GBPNZD=X",
+    "AUD/JPY": "AUDJPY=X",
+    "Gold": "GC=F",
+}
+MARKET_SYMBOLS.update(BINOMO_ASSET_SYMBOLS)
+AUTO_SCAN_ASSETS = list(BINOMO_ASSET_SYMBOLS)
+
 INTERVAL_PERIODS = {
     "1m": "7d",
     "5m": "60d",
@@ -811,7 +845,7 @@ def auto_advance_market():
     if now - float(last_change) >= 38:
         st.session_state.auto_market_index = (
             int(st.session_state.get("auto_market_index", 0)) + 1
-        ) % len(MARKET_SYMBOLS)
+        ) % len(AUTO_SCAN_ASSETS)
         st.session_state.auto_market_last_change = now
         st.rerun()
 
@@ -833,7 +867,7 @@ st.info(
 )
 c1, c2, c3 = st.columns(3)
 if data_source == "Çevrim içi veriyi kendisi indir":
-    market_names = list(MARKET_SYMBOLS)
+    market_names = AUTO_SCAN_ASSETS
     market_index = int(st.session_state.get("auto_market_index", 0)) % len(market_names)
     asset = market_names[market_index]
     c1.metric("Otomatik taranan varlık", asset)
