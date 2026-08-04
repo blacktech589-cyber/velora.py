@@ -591,7 +591,7 @@ def render_clickable_ranking(table: pd.DataFrame, key: str):
 
 @st.fragment(run_every="40s")
 def render_auto_top_signal():
-    """Güven yüzdesine göre sıralı işlemleri 40 saniyede bir gösterir."""
+    """En az 10 farklı varlığı, 40 saniyede bir otomatik yenileyerek gösterir."""
     if not OUTPUT_FILE.exists():
         st.info("Henüz kaydedilmiş bir AI işlemi bulunmuyor.")
         return
@@ -603,27 +603,48 @@ def render_auto_top_signal():
     history = history.dropna(subset=["Güven"])
     if history.empty:
         return
-    ranked = history.sort_values(
-        ["Güven", "Zaman"], ascending=[False, False]
-    ).head(20).reset_index(drop=True)
-    # Kullanıcıdan düğmeye basmasını beklemeden, yüksek güvenli sonuçlar
-    # arasında 40 saniyede bir otomatik geçiş yap.
-    rotation_index = (int(time.time()) // 40) % len(ranked)
-    top = ranked.iloc[rotation_index]
-    confidence_percent = float(top["Güven"]) * 100
-    st.subheader("🏆 En yüksek güvenli işlem")
-    a1, a2, a3, a4 = st.columns(4)
-    a1.metric("Varlık", str(top.get("Varlık", "-")))
-    a2.metric("Sinyal", str(top.get("Sinyal", "-")))
-    a3.metric("Güven yüzdesi", f"%{confidence_percent:.1f}")
-    a4.metric(
-        "Binomo ödeme",
-        f"%{float(top.get('Binomo ödeme oranı (%)', 0)):.1f}",
+    # Her para biriminin yalnızca en güncel sonucunu kullan; aynı varlığın eski
+    # kayıtları listenin on farklı öneriye ulaşmasını engellemesin.
+    history = history.sort_values("Zaman", ascending=False)
+    ranked = (
+        history.drop_duplicates(subset=["Varlık"], keep="first")
+        .sort_values(["Güven", "Zaman"], ascending=[False, False])
+        .reset_index(drop=True)
     )
-    st.progress(min(max(confidence_percent / 100, 0.0), 1.0))
+    page_size = 10
+    page_count = max(1, int(np.ceil(len(ranked) / page_size)))
+    page_index = (int(time.time()) // 40) % page_count
+    start = page_index * page_size
+    visible = ranked.iloc[start:start + page_size].copy()
+    # Son sayfada 10 satırdan az kaldığında listenin başındaki en yüksek
+    # yüzdeli varlıklarla tamamla. Varlık sayısı 10'dan azsa sahte öneri üretme.
+    if len(visible) < page_size and len(ranked) >= page_size:
+        visible = pd.concat([
+            visible,
+            ranked.iloc[:page_size - len(visible)],
+        ], ignore_index=True)
+    visible["Güven yüzdesi"] = visible["Güven"].map(
+        lambda value: f"%{float(value) * 100:.1f}"
+    )
+    visible.insert(0, "Sıra", np.arange(1, len(visible) + 1))
+    columns = [
+        "Sıra", "Varlık", "Sinyal", "Güven yüzdesi",
+        "Binomo ödeme oranı (%)", "Zaman",
+    ]
+    st.subheader("🏆 Otomatik yüksek güvenli 10 para birimi")
+    st.dataframe(
+        visible[[column for column in columns if column in visible.columns]],
+        use_container_width=True,
+        hide_index=True,
+    )
+    if len(ranked) < page_size:
+        st.warning(
+            f"Şu anda {len(ranked)} farklı varlık için kayıt var. "
+            "10 öneriye ulaşmak için farklı para birimlerinin analiz edilmesi gerekir."
+        )
     st.caption(
-        f"40 saniyede bir değişir · Sıra {rotation_index + 1}/{len(ranked)} · "
-        "En yüksek güven yüzdeleri önceliklidir · "
+        f"40 saniyede bir otomatik değişir · Grup {page_index + 1}/{page_count} · "
+        "Tıklama gerekmez · En yüksek güven yüzdeleri önceliklidir · "
         + datetime.now().astimezone().strftime("%H:%M:%S")
     )
 
