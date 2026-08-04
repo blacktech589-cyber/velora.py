@@ -486,6 +486,18 @@ def train_and_predict(frame, lookback, epochs, max_windows=6000):
     return probability, metrics, names, model_details
 
 
+def replace_legacy_wait_signals(frame: pd.DataFrame) -> pd.DataFrame:
+    """Eski BEKLE kayıtlarını model olasılığına göre yön sinyaline çevirir."""
+    result = frame.copy()
+    if "Sinyal" not in result or "Model olasılığı" not in result:
+        return result
+    probability = pd.to_numeric(result["Model olasılığı"], errors="coerce")
+    wait_mask = result["Sinyal"].astype(str).str.upper().eq("BEKLE")
+    result.loc[wait_mask & probability.ge(0.5), "Sinyal"] = "YUKARI"
+    result.loc[wait_mask & probability.lt(0.5), "Sinyal"] = "AŞAĞI"
+    return result
+
+
 def append_excel(record: dict, market_data: pd.DataFrame | None = None) -> bytes:
     new = pd.DataFrame([record])
     if OUTPUT_FILE.exists():
@@ -493,6 +505,8 @@ def append_excel(record: dict, market_data: pd.DataFrame | None = None) -> bytes
         data = pd.concat([old, new], ignore_index=True).tail(5000)
     else:
         data = new
+    # Yeni sonuçla birlikte eski BEKLE satırlarını da Excel'de kalıcı düzelt.
+    data = replace_legacy_wait_signals(data)
     # En yüksek güvenli işlemler her zaman ilk sırada görünür.
     data = data.drop(columns=["Öncelik"], errors="ignore")
     data["Güven"] = pd.to_numeric(data["Güven"], errors="coerce")
@@ -551,6 +565,7 @@ def prioritized_signal_table() -> pd.DataFrame:
     if not OUTPUT_FILE.exists():
         return pd.DataFrame()
     history = pd.read_excel(OUTPUT_FILE, sheet_name="Sinyaller")
+    history = replace_legacy_wait_signals(history)
     history["Güven"] = pd.to_numeric(history["Güven"], errors="coerce")
     payout_source = history.get(
         "Binomo ödeme oranı (%)",
@@ -630,6 +645,7 @@ def render_auto_top_signal():
         st.info("Henüz kaydedilmiş bir AI işlemi bulunmuyor.")
         return
     history = pd.read_excel(OUTPUT_FILE, sheet_name="Sinyaller")
+    history = replace_legacy_wait_signals(history)
     if history.empty or "Güven" not in history:
         st.info("Henüz karşılaştırılabilir işlem bulunmuyor.")
         return
