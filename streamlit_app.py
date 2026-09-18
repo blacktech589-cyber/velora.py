@@ -86,6 +86,8 @@ defaults = {
     "api_secret": "",
     "api_ok": False,
     "account": None,
+    "api_permissions": None,
+    "live_trade_allowed": False,
     "paper_balance": 1000.0,
     "paper_positions": {},
     "trade_log": [],
@@ -201,6 +203,13 @@ class BinanceSpotClient:
         return self.signed(
             "GET",
             "/api/v3/account",
+        )
+
+    def api_restrictions(self):
+        """Read current API-key permission flags from Binance."""
+        return self.signed(
+            "GET",
+            "/sapi/v1/account/apiRestrictions",
         )
 
     def ticker24(self, symbol: str):
@@ -2538,6 +2547,36 @@ def predict_symbol(
             0
         ).numpy()
 
+    probs_safe = np.clip(
+        probs.astype(np.float64),
+        1e-9,
+        1.0,
+    )
+
+    entropy = float(
+        -np.sum(
+            probs_safe
+            *
+            np.log(
+                probs_safe
+            )
+        )
+        /
+        np.log(3.0)
+    )
+
+    confidence = float(
+        max(
+            0.0,
+            min(
+                100.0,
+                (1.0 - entropy)
+                *
+                100.0,
+            ),
+        )
+    )
+
     return {
         "SELL": float(
             probs[0]
@@ -2554,6 +2593,12 @@ def predict_symbol(
             *
             100
         ),
+        "UNCERTAINTY": float(
+            entropy
+            *
+            100
+        ),
+        "MODEL_CONFIDENCE": confidence,
     }, df
 
 # ============================================================
@@ -2739,6 +2784,20 @@ with st.sidebar:
                     test_client.account()
                 )
 
+                try:
+                    permissions = (
+                        test_client.api_restrictions()
+                    )
+                except Exception:
+                    permissions = {}
+
+                live_allowed = bool(
+                    permissions.get(
+                        "enableSpotAndMarginTrading",
+                        False,
+                    )
+                )
+
                 st.session_state[
                     "api_key"
                 ] = api_key
@@ -2752,12 +2811,26 @@ with st.sidebar:
                 ] = account
 
                 st.session_state[
+                    "api_permissions"
+                ] = permissions
+
+                st.session_state[
+                    "live_trade_allowed"
+                ] = live_allowed
+
+                st.session_state[
                     "api_ok"
                 ] = True
 
-                st.success(
-                    "Binance API bağlandı."
-                )
+                if live_allowed:
+                    st.success(
+                        "Binance API bağlandı. Spot işlem izni açık."
+                    )
+                else:
+                    st.warning(
+                        "API bağlandı fakat Spot & Margin Trading izni kapalı. "
+                        "Paper Mode çalışır; Live emirler engellendi."
+                    )
 
             except Exception as exc:
                 st.session_state[
@@ -2789,6 +2862,14 @@ with st.sidebar:
                 "account"
             ] = None
 
+            st.session_state[
+                "api_permissions"
+            ] = None
+
+            st.session_state[
+                "live_trade_allowed"
+            ] = False
+
             st.rerun()
 
     st.divider()
@@ -2813,9 +2894,23 @@ with st.sidebar:
             "Live mod gerçek Spot emir gönderir."
         )
 
+        if not st.session_state.get(
+            "live_trade_allowed",
+            False,
+        ):
+            st.error(
+                "Bu API anahtarında Spot & Margin Trading izni açık değil. "
+                "Binance API Management bölümünde güvenilir IPv4 tanımlayıp "
+                "Enable Spot & Margin Trading seçeneğini etkinleştir."
+            )
+
         live_confirm = (
             st.checkbox(
-                "Gerçek emirleri etkinleştir"
+                "Gerçek emirleri etkinleştir",
+                disabled=not st.session_state.get(
+                    "live_trade_allowed",
+                    False,
+                ),
             )
         )
 
@@ -3036,6 +3131,74 @@ if (
                 "Gösterilecek bakiye yok."
             )
 
+
+# ============================================================
+# API PERMISSION DIAGNOSTICS
+# ============================================================
+
+if st.session_state.get("api_ok"):
+    with st.expander(
+        "🔎 API İzin Teşhisi",
+        expanded=True,
+    ):
+        permissions = (
+            st.session_state.get(
+                "api_permissions"
+            )
+            or {}
+        )
+
+        p1, p2, p3 = st.columns(3)
+
+        p1.metric(
+            "Reading",
+            "Açık"
+            if permissions.get(
+                "enableReading",
+                True,
+            )
+            else "Kapalı",
+        )
+
+        p2.metric(
+            "Spot Trading",
+            "Açık"
+            if permissions.get(
+                "enableSpotAndMarginTrading",
+                False,
+            )
+            else "Kapalı",
+        )
+
+        p3.metric(
+            "IP Restriction",
+            "Açık"
+            if permissions.get(
+                "ipRestrict",
+                False,
+            )
+            else "Kapalı",
+        )
+
+        if not permissions.get(
+            "enableSpotAndMarginTrading",
+            False,
+        ):
+            st.warning(
+                "Live trading izni kapalı. Binance tarafında "
+                "Enable Spot & Margin Trading etkin değil."
+            )
+
+        if not permissions.get(
+            "ipRestrict",
+            False,
+        ):
+            st.info(
+                "Binance, sistem üretimli API anahtarlarında işlem izni için "
+                "güvenilir IPv4 kısıtı isteyebilir. Live botu sabit IP'li "
+                "bir VPS/PC üzerinde çalıştırmak en sorunsuz yöntemdir."
+            )
+
 # ============================================================
 # TABS
 # ============================================================
@@ -3123,12 +3286,19 @@ with tab_scan:
                     "WAIT"
                 ]
 
+                ai_confidence = probs.get(
+                    "MODEL_CONFIDENCE",
+                    0.0,
+                )
+
                 if (
                     buy
                     >=
                     buy_threshold
                     and
                     buy > sell
+                    and
+                    ai_confidence >= 25.0
                 ):
                     signal = "BUY"
 
@@ -3138,6 +3308,8 @@ with tab_scan:
                     sell_threshold
                     and
                     sell > buy
+                    and
+                    ai_confidence >= 25.0
                 ):
                     signal = "SELL"
 
@@ -3173,6 +3345,22 @@ with tab_scan:
                         "SELL %":
                         round(
                             sell,
+                            2,
+                        ),
+                        "AI Güven %":
+                        round(
+                            probs.get(
+                                "MODEL_CONFIDENCE",
+                                0.0,
+                            ),
+                            2,
+                        ),
+                        "Belirsizlik %":
+                        round(
+                            probs.get(
+                                "UNCERTAINTY",
+                                100.0,
+                            ),
                             2,
                         ),
                         "Signal":
@@ -3319,6 +3507,16 @@ with tab_order:
                     f"%{probs['SELL']:.2f}",
                 )
 
+                d, e = st.columns(2)
+                d.metric(
+                    "AI Güven",
+                    f"%{probs.get('MODEL_CONFIDENCE', 0.0):.2f}",
+                )
+                e.metric(
+                    "Belirsizlik",
+                    f"%{probs.get('UNCERTAINTY', 100.0):.2f}",
+                )
+
             except Exception as exc:
                 st.warning(
                     str(exc)
@@ -3372,6 +3570,14 @@ with tab_order:
                         ]:
                             raise RuntimeError(
                                 "API bağlantısı yok."
+                            )
+
+                        if not st.session_state.get(
+                            "live_trade_allowed",
+                            False,
+                        ):
+                            raise RuntimeError(
+                                "API anahtarında Spot & Margin Trading izni yok."
                             )
 
                         if not live_confirm:
@@ -3728,10 +3934,12 @@ SELL / WAIT / BUY
     )
 
     st.info(
-        "Modelin daha büyük olması tek başına "
-        "daha doğru tahmin anlamına gelmez. "
-        "Asıl kalite eğitim verisi, rejim çeşitliliği, "
-        "komisyon/slippage ve walk-forward testten gelir."
+        "Bu sürüm yalnızca BUY/SELL olasılığına bakmaz; "
+        "tahmin dağılımının entropy değerinden belirsizlik ölçer ve "
+        "düşük güvenli sinyalleri WAIT'e düşürür. Modelin daha büyük "
+        "olması tek başına daha doğru tahmin anlamına gelmez; "
+        "kalite eğitim verisi, piyasa rejimleri, komisyon/slippage "
+        "ve walk-forward testten gelir."
     )
 
 # ============================================================
