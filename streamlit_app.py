@@ -59,13 +59,23 @@ import streamlit as st
 # On ephemeral cloud instances the install may need to repeat after a restart.
 
 def _install_torch_inside_streamlit():
+    """
+    Streamlit Cloud fallback:
+    - installs CPU-only PyTorch (no CUDA/NVIDIA packages)
+    - installs into /tmp, which is writable on Community Cloud
+    - avoids writing into the managed /home/adminuser/venv site-packages
+    """
+    target_dir = "/tmp/torch_cpu_runtime"
+
     st.warning(
-        "PyTorch bulunamadı. Streamlit ortamına otomatik olarak kuruluyor..."
+        "PyTorch bulunamadı. CPU-only PyTorch yazılabilir geçici klasöre kuruluyor..."
     )
 
     progress = st.progress(10)
     status = st.empty()
-    status.info("pip install torch başlatılıyor...")
+    status.info("CPU-only torch kurulumu başlatılıyor...")
+
+    Path(target_dir).mkdir(parents=True, exist_ok=True)
 
     command = [
         sys.executable,
@@ -74,7 +84,11 @@ def _install_torch_inside_streamlit():
         "install",
         "--disable-pip-version-check",
         "--no-cache-dir",
-        "torch",
+        "--target",
+        target_dir,
+        "--extra-index-url",
+        "https://download.pytorch.org/whl/cpu",
+        "torch==2.14.0+cpu",
     ]
 
     process = subprocess.run(
@@ -87,25 +101,28 @@ def _install_torch_inside_streamlit():
     progress.progress(90)
 
     if process.returncode != 0:
-        st.error(
-            "PyTorch otomatik kurulamadı. pip çıktısı aşağıda:"
-        )
-        st.code(
-            process.stdout[-8000:],
-            language="text",
-        )
+        st.error("CPU-only PyTorch otomatik kurulamadı.")
+        st.code(process.stdout[-10000:], language="text")
         st.info(
-            "Streamlit Cloud için repo kökünde requirements.txt kullanmak "
-            "daha güvenilirdir."
+            "En sağlam çözüm: requirements.txt içine "
+            "`--extra-index-url https://download.pytorch.org/whl/cpu` "
+            "ve `torch==2.14.0+cpu` ekleyip app'i redeploy etmektir."
         )
         st.stop()
 
+    # Make the freshly-installed target importable in the current process.
+    if target_dir not in sys.path:
+        sys.path.insert(0, target_dir)
+
     importlib.invalidate_caches()
     progress.progress(100)
-    status.success("PyTorch kuruldu. Uygulama yeniden başlatılıyor...")
-    time.sleep(1.0)
-    st.rerun()
+    status.success("CPU-only PyTorch kuruldu. AI modülü yükleniyor...")
 
+
+# If a previous runtime installation exists after a rerun, use it first.
+_TORCH_RUNTIME_DIR = "/tmp/torch_cpu_runtime"
+if Path(_TORCH_RUNTIME_DIR).exists() and _TORCH_RUNTIME_DIR not in sys.path:
+    sys.path.insert(0, _TORCH_RUNTIME_DIR)
 
 try:
     import torch
@@ -115,8 +132,8 @@ except ModuleNotFoundError as exc:
     if exc.name == "torch":
         _install_torch_inside_streamlit()
 
-        # st.rerun normally stops execution. This fallback covers unusual hosts.
         importlib.invalidate_caches()
+
         import torch
         import torch.nn as nn
         from torch.utils.data import Dataset, DataLoader
