@@ -34,6 +34,8 @@ from __future__ import annotations
 import os
 import sys
 import time
+import subprocess
+import importlib
 import json
 import math
 import hmac
@@ -47,6 +49,63 @@ from urllib.parse import urlencode
 import numpy as np
 import pandas as pd
 import requests
+import streamlit as st
+
+# ============================================================
+# STREAMLIT CLOUD AUTO PYTORCH BOOTSTRAP
+# ============================================================
+# requirements.txt is still the preferred deployment method.
+# If torch is missing, this block tries to install it at runtime.
+# On ephemeral cloud instances the install may need to repeat after a restart.
+
+def _install_torch_inside_streamlit():
+    st.warning(
+        "PyTorch bulunamadı. Streamlit ortamına otomatik olarak kuruluyor..."
+    )
+
+    progress = st.progress(10)
+    status = st.empty()
+    status.info("pip install torch başlatılıyor...")
+
+    command = [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--no-cache-dir",
+        "torch",
+    ]
+
+    process = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    progress.progress(90)
+
+    if process.returncode != 0:
+        st.error(
+            "PyTorch otomatik kurulamadı. pip çıktısı aşağıda:"
+        )
+        st.code(
+            process.stdout[-8000:],
+            language="text",
+        )
+        st.info(
+            "Streamlit Cloud için repo kökünde requirements.txt kullanmak "
+            "daha güvenilirdir."
+        )
+        st.stop()
+
+    importlib.invalidate_caches()
+    progress.progress(100)
+    status.success("PyTorch kuruldu. Uygulama yeniden başlatılıyor...")
+    time.sleep(1.0)
+    st.rerun()
+
 
 try:
     import torch
@@ -54,21 +113,15 @@ try:
     from torch.utils.data import Dataset, DataLoader
 except ModuleNotFoundError as exc:
     if exc.name == "torch":
-        try:
-            import streamlit as st
-            st.error(
-                "PyTorch (torch) kurulu değil. Repo köküne requirements.txt ekle ve içine torch yaz."
-            )
-            st.code(
-                "streamlit>=1.38\npandas>=2.1\nnumpy>=1.26\nrequests>=2.31\ntorch\n",
-                language="text"
-            )
-            st.stop()
-        except ModuleNotFoundError:
-            raise RuntimeError(
-                "PyTorch kurulmamış. `pip install torch` çalıştırın."
-            ) from exc
-    raise
+        _install_torch_inside_streamlit()
+
+        # st.rerun normally stops execution. This fallback covers unusual hosts.
+        importlib.invalidate_caches()
+        import torch
+        import torch.nn as nn
+        from torch.utils.data import Dataset, DataLoader
+    else:
+        raise
 
 
 # ============================================================
