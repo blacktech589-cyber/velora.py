@@ -652,6 +652,15 @@ class BinanceTRClient:
         path,
         params=None,
     ):
+        """
+        Binance TR SIGNED request.
+
+        Important:
+        - X-MBX-APIKEY header is case-sensitive.
+        - HMAC-SHA256 is calculated over the EXACT query/body string.
+        - GET sends the exact signed string in the URL query.
+        - POST sends the exact signed string as application/x-www-form-urlencoded.
+        """
         if (
             not self.api_key
             or
@@ -665,18 +674,29 @@ class BinanceTRClient:
             params or {}
         )
 
-        payload["timestamp"] = (
+        # Use Binance TR server time to avoid local-clock drift.
+        server_timestamp = int(
             self.server_time()
         )
 
-        payload.setdefault(
-            "recvWindow",
-            5000,
+        # Keep explicit deterministic order for easier debugging.
+        payload["recvWindow"] = int(
+            payload.get(
+                "recvWindow",
+                5000,
+            )
         )
 
+        payload["timestamp"] = (
+            server_timestamp
+        )
+
+        # Build ONE canonical string and use exactly this string for both
+        # signature generation and the actual HTTP request.
         unsigned_query = urlencode(
             payload,
             doseq=True,
+            safe="",
         )
 
         signature = hmac.new(
@@ -689,17 +709,21 @@ class BinanceTRClient:
             hashlib.sha256,
         ).hexdigest()
 
-        signed_payload = dict(
-            payload
+        signed_query = (
+            unsigned_query
+            +
+            "&signature="
+            +
+            signature
         )
-
-        signed_payload[
-            "signature"
-        ] = signature
 
         headers = {
             "X-MBX-APIKEY":
             self.api_key,
+            "Accept":
+            "application/json",
+            "User-Agent":
+            "BinanceTR-DeepAI-Scalper/1.0",
         }
 
         url = (
@@ -710,20 +734,166 @@ class BinanceTRClient:
 
         method = method.upper()
 
-        if method == "GET":
-            raw = request_json(
-                "GET",
-                url,
-                params=signed_payload,
-                headers=headers,
+        try:
+            if method == "GET":
+                # Do NOT pass params=dict here. We send the exact query string
+                # that was signed so requests cannot re-encode/reorder it.
+                response = requests.get(
+                    url
+                    +
+                    "?"
+                    +
+                    signed_query,
+                    headers=headers,
+                    timeout=20,
+                )
+            else:
+                post_headers = dict(
+                    headers
+                )
+
+                post_headers[
+                    "Content-Type"
+                ] = (
+                    "application/"
+                    "x-www-form-urlencoded"
+                )
+
+                # Send exact signed body string.
+                response = requests.request(
+                    method,
+                    url,
+                    data=signed_query,
+                    headers=post_headers,
+                    timeout=20,
+                )
+
+        except requests.RequestException as exc:
+            raise BinanceTRAPIError(
+                f"Binance TR signed bağlantı hatası: {exc}"
+            ) from exc
+
+        # Keep HTTP and Binance JSON error information.
+        if response.status_code == 451:
+            raise BinanceTRAPIError(
+                "Binance TR signed HTTP 451: "
+                "sunucu/ağ erişimi reddetti."
             )
-        else:
-            raw = request_json(
-                method,
-                url,
-                data=signed_payload,
-                headers=headers,
+
+        try:
+            raw = response.json()
+        except Exception:
+            raw = None
+
+        if not response.ok:
+            detail = (
+                raw
+                if raw is not None
+                else response.text[:1200]
             )
+
+            raise BinanceTRAPIError(
+                f"Binance TR signed HTTP "
+                f"{response.status_code}: {detail}"
+            )
+
+        if raw is None:
+            raise BinanceTRAPIError(
+                "Binance TR signed endpoint JSON döndürmedi: "
+                f"{response.text[:1200]}"
+            )
+
+        # Binance TR may return HTTP 200 with code != 0.
+        if isinstance(
+            raw,
+            dict,
+        ):
+            code_value = raw.get(
+                "code",
+                0,
+            )
+
+            if code_value not in (
+                0,
+                "0",
+                None,
+            ):
+                message = (
+                    raw.get(
+                        "msg"
+                    )
+                    or
+                    raw.get(
+                        "message"
+                    )
+                    or
+                    str(
+                        raw
+                    )
+                )
+
+                hint = ""
+
+                message_lower = str(
+                    message
+                ).lower()
+
+                if (
+                    "api-key"
+                    in message_lower
+                    or
+                    "api key"
+                    in message_lower
+                    or
+                    "apikey"
+                    in message_lower
+                ):
+                    hint = (
+                        " | İpucu: Bu anahtarın Binance TR hesabındaki "
+                        "API Management bölümünden oluşturulduğunu kontrol et. "
+                        "Binance.com anahtarını Binance TR endpointinde kullanma."
+                    )
+
+                elif (
+                    "signature"
+                    in message_lower
+                ):
+                    hint = (
+                        " | İpucu: Secret Key yanlış olabilir. "
+                        "API Key ve Secret Key case-sensitive'dir; "
+                        "başında/sonunda boşluk olmamalı."
+                    )
+
+                elif (
+                    "timestamp"
+                    in message_lower
+                    or
+                    "recvwindow"
+                    in message_lower
+                ):
+                    hint = (
+                        " | İpucu: Timestamp/recvWindow reddedildi. "
+                        "Kod Binance TR server time kullanıyor; "
+                        "yeniden API testi yap."
+                    )
+
+                elif (
+                    "permission"
+                    in message_lower
+                    or
+                    "trade"
+                    in message_lower
+                ):
+                    hint = (
+                        " | İpucu: API anahtarında gerekli hesap/Spot "
+                        "yetkilerini kontrol et."
+                    )
+
+                raise BinanceTRAPIError(
+                    f"Binance TR API code "
+                    f"{code_value}: {message}"
+                    f"{hint}"
+                )
 
         return unwrap_binance_tr(
             raw
@@ -4956,14 +5126,34 @@ def run_api_diagnostics(
         )
 
     except Exception as exc:
+        error_text = str(
+            exc
+        )
+
         diagnostics[
             "4_signed_account"
         ] = {
             "ok":
             False,
             "error":
-            str(
-                exc
+            error_text,
+            "endpoint":
+            (
+                TR_API_BASE
+                +
+                "/open/v1/account/spot"
+            ),
+            "uses_server_time":
+            True,
+            "signature":
+            "HMAC-SHA256 exact query string",
+            "header":
+            "X-MBX-APIKEY",
+            "hint":
+            (
+                "API anahtarının Binance TR API Management üzerinden "
+                "oluşturulduğunu, Secret Key'in doğru olduğunu ve "
+                "API erişim/yetki ayarlarını kontrol et."
             ),
         }
 
@@ -9808,193 +9998,3 @@ st.caption(
 # INTERNAL REFERENCE 0359.04 — training-validation reference; reserved for maintenance, audit notes, and future production extensions.
 # INTERNAL REFERENCE 0359.05 — scalping execution reference; reserved for maintenance, audit notes, and future production extensions.
 # INTERNAL REFERENCE 0359.06 — risk and exchange-filter reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0359.07 — Binance TR symbol-format reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0359.08 — multi-timeframe ensemble reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0359.09 — MC-dropout uncertainty reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0359.10 — paper/live execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0360.01 — API diagnostic reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0360.02 — feature-engine reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0360.03 — model architecture reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0360.04 — training-validation reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0360.05 — scalping execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0360.06 — risk and exchange-filter reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0360.07 — Binance TR symbol-format reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0360.08 — multi-timeframe ensemble reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0360.09 — MC-dropout uncertainty reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0360.10 — paper/live execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0361.01 — API diagnostic reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0361.02 — feature-engine reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0361.03 — model architecture reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0361.04 — training-validation reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0361.05 — scalping execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0361.06 — risk and exchange-filter reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0361.07 — Binance TR symbol-format reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0361.08 — multi-timeframe ensemble reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0361.09 — MC-dropout uncertainty reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0361.10 — paper/live execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0362.01 — API diagnostic reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0362.02 — feature-engine reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0362.03 — model architecture reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0362.04 — training-validation reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0362.05 — scalping execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0362.06 — risk and exchange-filter reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0362.07 — Binance TR symbol-format reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0362.08 — multi-timeframe ensemble reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0362.09 — MC-dropout uncertainty reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0362.10 — paper/live execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0363.01 — API diagnostic reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0363.02 — feature-engine reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0363.03 — model architecture reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0363.04 — training-validation reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0363.05 — scalping execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0363.06 — risk and exchange-filter reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0363.07 — Binance TR symbol-format reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0363.08 — multi-timeframe ensemble reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0363.09 — MC-dropout uncertainty reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0363.10 — paper/live execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0364.01 — API diagnostic reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0364.02 — feature-engine reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0364.03 — model architecture reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0364.04 — training-validation reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0364.05 — scalping execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0364.06 — risk and exchange-filter reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0364.07 — Binance TR symbol-format reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0364.08 — multi-timeframe ensemble reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0364.09 — MC-dropout uncertainty reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0364.10 — paper/live execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0365.01 — API diagnostic reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0365.02 — feature-engine reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0365.03 — model architecture reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0365.04 — training-validation reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0365.05 — scalping execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0365.06 — risk and exchange-filter reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0365.07 — Binance TR symbol-format reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0365.08 — multi-timeframe ensemble reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0365.09 — MC-dropout uncertainty reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0365.10 — paper/live execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0366.01 — API diagnostic reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0366.02 — feature-engine reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0366.03 — model architecture reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0366.04 — training-validation reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0366.05 — scalping execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0366.06 — risk and exchange-filter reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0366.07 — Binance TR symbol-format reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0366.08 — multi-timeframe ensemble reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0366.09 — MC-dropout uncertainty reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0366.10 — paper/live execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0367.01 — API diagnostic reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0367.02 — feature-engine reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0367.03 — model architecture reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0367.04 — training-validation reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0367.05 — scalping execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0367.06 — risk and exchange-filter reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0367.07 — Binance TR symbol-format reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0367.08 — multi-timeframe ensemble reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0367.09 — MC-dropout uncertainty reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0367.10 — paper/live execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0368.01 — API diagnostic reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0368.02 — feature-engine reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0368.03 — model architecture reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0368.04 — training-validation reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0368.05 — scalping execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0368.06 — risk and exchange-filter reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0368.07 — Binance TR symbol-format reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0368.08 — multi-timeframe ensemble reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0368.09 — MC-dropout uncertainty reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0368.10 — paper/live execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0369.01 — API diagnostic reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0369.02 — feature-engine reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0369.03 — model architecture reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0369.04 — training-validation reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0369.05 — scalping execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0369.06 — risk and exchange-filter reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0369.07 — Binance TR symbol-format reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0369.08 — multi-timeframe ensemble reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0369.09 — MC-dropout uncertainty reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0369.10 — paper/live execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0370.01 — API diagnostic reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0370.02 — feature-engine reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0370.03 — model architecture reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0370.04 — training-validation reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0370.05 — scalping execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0370.06 — risk and exchange-filter reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0370.07 — Binance TR symbol-format reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0370.08 — multi-timeframe ensemble reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0370.09 — MC-dropout uncertainty reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0370.10 — paper/live execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0371.01 — API diagnostic reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0371.02 — feature-engine reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0371.03 — model architecture reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0371.04 — training-validation reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0371.05 — scalping execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0371.06 — risk and exchange-filter reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0371.07 — Binance TR symbol-format reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0371.08 — multi-timeframe ensemble reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0371.09 — MC-dropout uncertainty reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0371.10 — paper/live execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0372.01 — API diagnostic reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0372.02 — feature-engine reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0372.03 — model architecture reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0372.04 — training-validation reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0372.05 — scalping execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0372.06 — risk and exchange-filter reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0372.07 — Binance TR symbol-format reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0372.08 — multi-timeframe ensemble reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0372.09 — MC-dropout uncertainty reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0372.10 — paper/live execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0373.01 — API diagnostic reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0373.02 — feature-engine reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0373.03 — model architecture reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0373.04 — training-validation reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0373.05 — scalping execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0373.06 — risk and exchange-filter reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0373.07 — Binance TR symbol-format reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0373.08 — multi-timeframe ensemble reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0373.09 — MC-dropout uncertainty reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0373.10 — paper/live execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0374.01 — API diagnostic reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0374.02 — feature-engine reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0374.03 — model architecture reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0374.04 — training-validation reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0374.05 — scalping execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0374.06 — risk and exchange-filter reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0374.07 — Binance TR symbol-format reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0374.08 — multi-timeframe ensemble reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0374.09 — MC-dropout uncertainty reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0374.10 — paper/live execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0375.01 — API diagnostic reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0375.02 — feature-engine reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0375.03 — model architecture reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0375.04 — training-validation reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0375.05 — scalping execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0375.06 — risk and exchange-filter reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0375.07 — Binance TR symbol-format reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0375.08 — multi-timeframe ensemble reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0375.09 — MC-dropout uncertainty reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0375.10 — paper/live execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0376.01 — API diagnostic reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0376.02 — feature-engine reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0376.03 — model architecture reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0376.04 — training-validation reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0376.05 — scalping execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0376.06 — risk and exchange-filter reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0376.07 — Binance TR symbol-format reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0376.08 — multi-timeframe ensemble reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0376.09 — MC-dropout uncertainty reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0376.10 — paper/live execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0377.01 — API diagnostic reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0377.02 — feature-engine reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0377.03 — model architecture reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0377.04 — training-validation reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0377.05 — scalping execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0377.06 — risk and exchange-filter reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0377.07 — Binance TR symbol-format reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0377.08 — multi-timeframe ensemble reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0377.09 — MC-dropout uncertainty reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0377.10 — paper/live execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0378.01 — API diagnostic reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0378.02 — feature-engine reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0378.03 — model architecture reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0378.04 — training-validation reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0378.05 — scalping execution reference; reserved for maintenance, audit notes, and future production extensions.
-# INTERNAL REFERENCE 0378.06 — risk and exchange-filter reference; reserved for maintenance, audit notes, and future production extensions.
