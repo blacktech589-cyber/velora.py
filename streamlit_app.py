@@ -1,42 +1,36 @@
 from __future__ import annotations
 
 # ============================================================
-# BINANCE SPOT DEEP AI 200 - SINGLE FILE STREAMLIT APP
+# BINANCE AUTO MARKET DEEP-AI SCALPER — SINGLE FILE
 # ============================================================
-# Kurulum:
-#   pip install streamlit pandas numpy requests torch
+# Spot + USDⓈ-M Futures
+# 200 features
+# Multi-branch deep model:
+#   TCN + BiLSTM/BiGRU + Transformer + self-attention + learned gating
+# MC-dropout uncertainty
+# Automatic Spot/Futures routing
+# Percent-profit scalping take-profit
 #
-# Çalıştırma:
-#   streamlit run streamlit_app.py
-#
-# Streamlit Cloud kullanıyorsanız repo kökünde requirements.txt:
-#   streamlit
-#   pandas
-#   numpy
-#   requests
+# Streamlit Cloud requirements.txt:
+#   streamlit>=1.38
+#   pandas>=2.1
+#   numpy>=1.26
+#   requests>=2.31
 #   torch
 #
-# Özellikler:
-# - Binance API Key / Secret Key paneli
-# - Spot market data
-# - 200 causal feature
-# - Residual CNN + BiLSTM + BiGRU + Transformer + Attention
-# - Model eğitimi
-# - BUY / WAIT / SELL olasılıkları
-# - Paper trading
-# - Live Spot MARKET BUY / SELL
-# - Bakiye, pozisyon ve işlem logları
+# Run:
+#   streamlit run streamlit_app.py
 #
-# Not:
-# - Withdrawal yetkisi vermeyin.
-# - Önce Paper Mode kullanın.
-# - AI kâr garantisi vermez.
+# IMPORTANT:
+# - 451 = legal/regional HTTP restriction; this app does not bypass it.
+# - Live trading is OFF by default.
+# - Futures can liquidate leveraged positions.
+# - AI does not guarantee profit.
 # ============================================================
 
-import os
 import json
-import time
 import math
+import time
 import hmac
 import hashlib
 from pathlib import Path
@@ -48,10 +42,9 @@ import pandas as pd
 import requests
 import streamlit as st
 
-# ----------------------- TORCH SAFE IMPORT -----------------------
+# -------------------------- TORCH --------------------------
 TORCH_OK = True
 TORCH_ERROR = ""
-
 try:
     import torch
     import torch.nn as nn
@@ -60,17 +53,25 @@ except Exception as exc:
     TORCH_OK = False
     TORCH_ERROR = str(exc)
 
-# ----------------------- APP CONFIG -----------------------
+# -------------------------- CONFIG --------------------------
 st.set_page_config(
-    page_title="Binance Spot Deep AI 200",
+    page_title="Binance Auto-Market Deep AI Scalper",
     page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-BINANCE_BASE = "https://api.binance.com"
 FEATURE_COUNT = 200
-DEFAULT_MODEL_DIR = "model_artifacts"
+
+SPOT_BASES = [
+    "https://api.binance.com",
+    "https://api-gcp.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://api4.binance.com",
+]
+FUTURES_BASE = "https://fapi.binance.com"
 
 RET_H = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89]
 WIN = [5, 8, 13, 21, 34, 55, 89, 144]
@@ -80,241 +81,206 @@ STO_P = [5, 7, 9, 14, 21, 28, 35, 50]
 BB_P = [10, 14, 20, 28, 35, 50, 75, 100]
 VOL_P = [5, 8, 13, 21, 34, 55, 89, 144]
 
-# ----------------------- SESSION -----------------------
-defaults = {
+# -------------------------- STATE --------------------------
+DEFAULTS = {
     "api_key": "",
     "api_secret": "",
     "api_ok": False,
+    "spot_allowed": False,
+    "futures_allowed": False,
+    "api_permissions": {},
     "account": None,
-    "api_permissions": None,
-    "live_trade_allowed": False,
     "paper_balance": 1000.0,
-    "paper_positions": {},
+    "positions": {},
     "trade_log": [],
-    "last_scan": [],
+    "scan_rows": [],
     "training_log": [],
-    "bot_enabled": False,
+    "last_network_diag": {},
 }
-for key, value in defaults.items():
-    if key not in st.session_state:
-        st.session_state[key] = value
+for k, v in DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-# ----------------------- STYLE -----------------------
+# -------------------------- STYLE --------------------------
 st.markdown(
     """
     <style>
-    .block-container { padding-top: 1.0rem; padding-bottom: 2rem; }
-    [data-testid="stSidebar"] { background: #0b111c; }
-
-    .hero {
-        background: linear-gradient(135deg, #0f172a 0%, #172554 100%);
-        border: 1px solid #334155;
-        border-radius: 22px;
-        padding: 22px;
-        margin-bottom: 14px;
+    .block-container{padding-top:1rem;padding-bottom:2rem}
+    [data-testid="stSidebar"]{background:#0b111c}
+    .hero{
+      padding:22px;border-radius:22px;
+      background:linear-gradient(135deg,#0f172a,#172554);
+      border:1px solid #334155;margin-bottom:14px
     }
-    .hero h1 { margin: 0; font-size: 32px; }
-    .hero p { margin: 6px 0 0 0; opacity: .75; }
-    .good {
-        display: inline-block;
-        padding: 5px 10px;
-        border-radius: 999px;
-        background: #123b2d;
-        color: #65e6ad;
-        font-weight: 700;
-    }
-    .bad {
-        display: inline-block;
-        padding: 5px 10px;
-        border-radius: 999px;
-        background: #42202b;
-        color: #ff90a2;
-        font-weight: 700;
-    }
+    .hero h1{margin:0;font-size:31px}
+    .hero p{margin:.35rem 0 0;opacity:.76}
+    .ok{color:#66e6ae;font-weight:800}
+    .no{color:#ff8fa3;font-weight:800}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 # ============================================================
-# BINANCE CLIENT
+# HTTP / 451 HANDLING
 # ============================================================
 
-class BinanceSpotClient:
-    def __init__(self, api_key: str = "", api_secret: str = ""):
+class Binance451Error(RuntimeError):
+    pass
+
+
+def _json_or_text(resp):
+    try:
+        return resp.json()
+    except Exception:
+        return resp.text
+
+
+def _raise_for_binance(resp, label="Binance"):
+    if resp.status_code == 451:
+        raise Binance451Error(
+            f"{label} HTTP 451: servis bu ağ/bölge için yasal nedenle erişimi reddetti. "
+            "Bu bir API-key hatası değildir ve kod içinde bypass edilmez."
+        )
+    if not resp.ok:
+        raise RuntimeError(
+            f"{label} HTTP {resp.status_code}: {_json_or_text(resp)}"
+        )
+
+
+def spot_public_request(path: str, params=None, timeout=15):
+    """
+    Official Spot endpoint failover for connection/5xx issues.
+    451 is treated as a legal restriction and is NOT bypassed.
+    """
+    last_error = None
+    for base in SPOT_BASES:
+        try:
+            r = requests.get(base + path, params=params or {}, timeout=timeout)
+            if r.status_code == 451:
+                raise Binance451Error(
+                    f"Spot HTTP 451 on {base}: legal/regional access restriction."
+                )
+            if r.status_code >= 500:
+                last_error = RuntimeError(
+                    f"{base} HTTP {r.status_code}"
+                )
+                continue
+            _raise_for_binance(r, "Spot")
+            return r.json(), base
+        except Binance451Error:
+            raise
+        except (requests.RequestException, RuntimeError) as exc:
+            last_error = exc
+            continue
+    raise RuntimeError(
+        f"Tüm resmi Spot uç noktaları başarısız: {last_error}"
+    )
+
+
+def futures_public_request(path: str, params=None, timeout=15):
+    try:
+        r = requests.get(
+            FUTURES_BASE + path,
+            params=params or {},
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Futures bağlantı hatası: {exc}") from exc
+    _raise_for_binance(r, "Futures")
+    return r.json()
+
+# ============================================================
+# SIGNING / CLIENTS
+# ============================================================
+
+def sign_query(secret: str, payload: dict) -> str:
+    query = urlencode(payload, doseq=True, safe="")
+    signature = hmac.new(
+        secret.encode("utf-8"),
+        query.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return query, signature
+
+
+class SpotClient:
+    def __init__(self, api_key="", api_secret=""):
         self.api_key = (api_key or "").strip()
         self.api_secret = (api_secret or "").strip()
+        self.base = None
 
-    def public_get(self, path: str, params=None):
-        response = requests.get(
-            BINANCE_BASE + path,
-            params=params or {},
-            timeout=20,
-        )
-        response.raise_for_status()
-        return response.json()
-
-    def server_time(self) -> int:
-        data = self.public_get("/api/v3/time")
+    def server_time(self):
+        data, base = spot_public_request("/api/v3/time")
+        self.base = base
         return int(data["serverTime"])
 
-    def signed(self, method: str, path: str, params=None):
+    def public(self, path, params=None):
+        data, base = spot_public_request(path, params=params)
+        self.base = base
+        return data
+
+    def signed(self, method, path, params=None):
         if not self.api_key or not self.api_secret:
             raise RuntimeError("API Key / Secret Key eksik.")
 
+        ts = self.server_time()
         payload = dict(params or {})
-        payload["timestamp"] = self.server_time()
+        payload["timestamp"] = ts
         payload["recvWindow"] = 5000
 
-        query = urlencode(payload, doseq=True, safe="")
+        query, signature = sign_query(self.api_secret, payload)
+        url = f"{self.base}{path}?{query}&signature={signature}"
 
-        signature = hmac.new(
-            self.api_secret.encode("utf-8"),
-            query.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-
-        url = f"{BINANCE_BASE}{path}?{query}&signature={signature}"
-
-        headers = {
-            "X-MBX-APIKEY": self.api_key,
-        }
-
-        response = requests.request(
+        r = requests.request(
             method,
             url,
-            headers=headers,
-            timeout=25,
+            headers={"X-MBX-APIKEY": self.api_key},
+            timeout=20,
         )
-
-        if not response.ok:
-            try:
-                detail = response.json()
-            except Exception:
-                detail = response.text
-
-            raise RuntimeError(
-                f"Binance HTTP {response.status_code}: {detail}"
-            )
-
-        return response.json()
+        _raise_for_binance(r, "Spot signed API")
+        return r.json()
 
     def account(self):
-        return self.signed(
-            "GET",
-            "/api/v3/account",
-        )
+        return self.signed("GET", "/api/v3/account")
 
-    def api_restrictions(self):
-        """Read current API-key permission flags from Binance."""
-        return self.signed(
-            "GET",
-            "/sapi/v1/account/apiRestrictions",
-        )
+    def restrictions(self):
+        return self.signed("GET", "/sapi/v1/account/apiRestrictions")
 
-    def ticker24(self, symbol: str):
-        return self.public_get(
-            "/api/v3/ticker/24hr",
-            {"symbol": symbol.upper()},
-        )
-
-    def exchange_info(self, symbol: str | None = None):
-        params = {}
-        if symbol:
-            params["symbol"] = symbol.upper()
-
-        return self.public_get(
-            "/api/v3/exchangeInfo",
-            params,
-        )
-
-    def klines(
-        self,
-        symbol: str,
-        interval: str = "5m",
-        limit: int = 1000,
-        start_time=None,
-        end_time=None,
-    ):
-        params = {
-            "symbol": symbol.upper(),
-            "interval": interval,
-            "limit": int(limit),
-        }
-
-        if start_time is not None:
-            params["startTime"] = int(start_time)
-
+    def klines(self, symbol, interval="1m", limit=1000, end_time=None):
+        p = {"symbol": symbol.upper(), "interval": interval, "limit": int(limit)}
         if end_time is not None:
-            params["endTime"] = int(end_time)
+            p["endTime"] = int(end_time)
+        return self.public("/api/v3/klines", p)
 
-        return self.public_get(
-            "/api/v3/klines",
-            params,
-        )
+    def ticker24(self, symbol):
+        return self.public("/api/v3/ticker/24hr", {"symbol": symbol.upper()})
 
-    def symbol_filters(self, symbol: str):
+    def book_ticker(self, symbol):
+        return self.public("/api/v3/ticker/bookTicker", {"symbol": symbol.upper()})
+
+    def exchange_info(self, symbol):
+        return self.public("/api/v3/exchangeInfo", {"symbol": symbol.upper()})
+
+    def _symbol_filters(self, symbol):
         info = self.exchange_info(symbol)
-
-        if not info.get("symbols"):
-            raise RuntimeError(
-                f"Symbol bulunamadı: {symbol}"
-            )
-
-        symbol_data = info["symbols"][0]
-
-        filters = {
-            f["filterType"]: f
-            for f in symbol_data.get("filters", [])
-        }
-
-        return filters, symbol_data
+        s = info["symbols"][0]
+        return {f["filterType"]: f for f in s["filters"]}
 
     @staticmethod
-    def floor_step(value: float, step: float) -> float:
-        if step <= 0:
-            return float(value)
+    def _floor_step(v, step):
+        return math.floor(v / step) * step if step > 0 else v
 
-        return math.floor(
-            value / step
-        ) * step
+    def normalize_qty(self, symbol, qty):
+        lot = self._symbol_filters(symbol).get("LOT_SIZE", {})
+        step = float(lot.get("stepSize", "0.00000001"))
+        min_qty = float(lot.get("minQty", "0"))
+        q = self._floor_step(float(qty), step)
+        if q < min_qty:
+            raise RuntimeError(f"Spot qty minQty altında: {q} < {min_qty}")
+        return q
 
-    def normalize_quantity(self, symbol: str, qty: float) -> float:
-        filters, _ = self.symbol_filters(symbol)
-
-        lot = filters.get(
-            "LOT_SIZE",
-            {},
-        )
-
-        step = float(
-            lot.get(
-                "stepSize",
-                "0.00000001",
-            )
-        )
-
-        min_qty = float(
-            lot.get(
-                "minQty",
-                "0",
-            )
-        )
-
-        normalized = self.floor_step(
-            qty,
-            step,
-        )
-
-        if normalized < min_qty:
-            raise RuntimeError(
-                f"SELL miktarı minQty altında: "
-                f"{normalized} < {min_qty}"
-            )
-
-        return normalized
-
-    def market_buy_quote(self, symbol: str, quote_amount: float):
+    def market_buy_quote(self, symbol, usdt):
         return self.signed(
             "POST",
             "/api/v3/order",
@@ -322,16 +288,12 @@ class BinanceSpotClient:
                 "symbol": symbol.upper(),
                 "side": "BUY",
                 "type": "MARKET",
-                "quoteOrderQty": f"{float(quote_amount):.8f}",
+                "quoteOrderQty": f"{float(usdt):.8f}",
             },
         )
 
-    def market_sell_qty(self, symbol: str, qty: float):
-        normalized = self.normalize_quantity(
-            symbol,
-            qty,
-        )
-
+    def market_sell_qty(self, symbol, qty):
+        q = self.normalize_qty(symbol, qty)
         return self.signed(
             "POST",
             "/api/v3/order",
@@ -339,2658 +301,1226 @@ class BinanceSpotClient:
                 "symbol": symbol.upper(),
                 "side": "SELL",
                 "type": "MARKET",
-                "quantity": f"{normalized:.12f}",
+                "quantity": f"{q:.12f}",
+            },
+        )
+
+
+class FuturesClient:
+    def __init__(self, api_key="", api_secret=""):
+        self.api_key = (api_key or "").strip()
+        self.api_secret = (api_secret or "").strip()
+
+    def server_time(self):
+        return int(futures_public_request("/fapi/v1/time")["serverTime"])
+
+    def public(self, path, params=None):
+        return futures_public_request(path, params=params)
+
+    def signed(self, method, path, params=None):
+        if not self.api_key or not self.api_secret:
+            raise RuntimeError("API Key / Secret Key eksik.")
+
+        payload = dict(params or {})
+        payload["timestamp"] = self.server_time()
+        payload["recvWindow"] = 5000
+
+        query, signature = sign_query(self.api_secret, payload)
+        url = f"{FUTURES_BASE}{path}?{query}&signature={signature}"
+
+        r = requests.request(
+            method,
+            url,
+            headers={"X-MBX-APIKEY": self.api_key},
+            timeout=20,
+        )
+        _raise_for_binance(r, "USDⓈ-M Futures")
+        return r.json()
+
+    def klines(self, symbol, interval="1m", limit=1000, end_time=None):
+        p = {"symbol": symbol.upper(), "interval": interval, "limit": int(limit)}
+        if end_time is not None:
+            p["endTime"] = int(end_time)
+        return self.public("/fapi/v1/klines", p)
+
+    def ticker24(self, symbol):
+        return self.public("/fapi/v1/ticker/24hr", {"symbol": symbol.upper()})
+
+    def book_ticker(self, symbol):
+        return self.public("/fapi/v1/ticker/bookTicker", {"symbol": symbol.upper()})
+
+    def premium_index(self, symbol):
+        return self.public("/fapi/v1/premiumIndex", {"symbol": symbol.upper()})
+
+    def exchange_info(self):
+        return self.public("/fapi/v1/exchangeInfo")
+
+    def _symbol_filters(self, symbol):
+        info = self.exchange_info()
+        found = [s for s in info["symbols"] if s["symbol"] == symbol.upper()]
+        if not found:
+            raise RuntimeError(f"Futures symbol bulunamadı: {symbol}")
+        s = found[0]
+        return {f["filterType"]: f for f in s["filters"]}
+
+    @staticmethod
+    def _floor_step(v, step):
+        return math.floor(v / step) * step if step > 0 else v
+
+    def normalize_qty(self, symbol, qty):
+        filters = self._symbol_filters(symbol)
+        lot = filters.get("MARKET_LOT_SIZE") or filters.get("LOT_SIZE") or {}
+        step = float(lot.get("stepSize", "0.001"))
+        min_qty = float(lot.get("minQty", "0"))
+        q = self._floor_step(float(qty), step)
+        if q < min_qty:
+            raise RuntimeError(f"Futures qty minQty altında: {q} < {min_qty}")
+        return q
+
+    def set_leverage(self, symbol, leverage):
+        return self.signed(
+            "POST",
+            "/fapi/v1/leverage",
+            {
+                "symbol": symbol.upper(),
+                "leverage": int(leverage),
+            },
+        )
+
+    def market_open(self, symbol, direction, qty):
+        side = "BUY" if direction == "LONG" else "SELL"
+        q = self.normalize_qty(symbol, qty)
+        return self.signed(
+            "POST",
+            "/fapi/v1/order",
+            {
+                "symbol": symbol.upper(),
+                "side": side,
+                "type": "MARKET",
+                "quantity": f"{q:.12f}",
+            },
+        )
+
+    def market_close(self, symbol, direction, qty):
+        side = "SELL" if direction == "LONG" else "BUY"
+        q = self.normalize_qty(symbol, qty)
+        return self.signed(
+            "POST",
+            "/fapi/v1/order",
+            {
+                "symbol": symbol.upper(),
+                "side": side,
+                "type": "MARKET",
+                "quantity": f"{q:.12f}",
+                "reduceOnly": "true",
             },
         )
 
 # ============================================================
-# DATA HELPERS
+# DATA
 # ============================================================
 
-def klines_to_df(rows) -> pd.DataFrame:
-    columns = [
-        "open_time",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "close_time",
-        "quote_volume",
-        "trades",
-        "taker_base",
-        "taker_quote",
-        "ignore",
+def klines_to_df(rows):
+    cols = [
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "trades", "taker_base",
+        "taker_quote", "ignore",
     ]
-
-    df = pd.DataFrame(
-        rows,
-        columns=columns,
-    )
-
-    numeric = [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "quote_volume",
-        "trades",
-        "taker_base",
-        "taker_quote",
-    ]
-
-    for col in numeric:
-        df[col] = pd.to_numeric(
-            df[col],
-            errors="coerce",
-        )
-
-    df["open_time"] = pd.to_datetime(
-        df["open_time"],
-        unit="ms",
-        utc=True,
-    )
-
-    return df.set_index(
-        "open_time"
-    )
+    df = pd.DataFrame(rows, columns=cols)
+    for c in [
+        "open", "high", "low", "close", "volume",
+        "quote_volume", "trades", "taker_base", "taker_quote",
+    ]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    return df.set_index("open_time")
 
 
-def fetch_klines_history(
-    symbol: str,
-    interval: str,
-    total: int,
-) -> pd.DataFrame:
-    client = BinanceSpotClient()
-
+def fetch_history(market, symbol, interval, total):
+    client = SpotClient() if market == "SPOT" else FuturesClient()
     rows = []
     end_time = None
 
     while len(rows) < total:
-        limit = min(
-            1000,
-            total - len(rows),
-        )
-
-        batch = client.klines(
-            symbol=symbol,
-            interval=interval,
-            limit=limit,
-            end_time=end_time,
-        )
-
+        lim = min(1000, total - len(rows))
+        batch = client.klines(symbol, interval, lim, end_time=end_time)
         if not batch:
             break
-
         rows = batch + rows
-
-        earliest = int(
-            batch[0][0]
-        )
-
-        end_time = earliest - 1
-
+        end_time = int(batch[0][0]) - 1
         time.sleep(0.05)
 
     rows = rows[-total:]
-
     if not rows:
-        raise RuntimeError(
-            "Binance geçmiş veri alınamadı."
-        )
-
-    return klines_to_df(
-        rows
-    )
+        raise RuntimeError("Geçmiş veri alınamadı.")
+    return klines_to_df(rows)
 
 # ============================================================
-# 200 FEATURE ENGINE
+# 200 FEATURES
 # ============================================================
 
 def safe_div(a, b):
-    if isinstance(
-        b,
-        pd.Series,
-    ):
-        b = b.replace(
-            0,
-            np.nan,
-        )
-
+    if isinstance(b, pd.Series):
+        b = b.replace(0, np.nan)
     return a / b
 
 
-def ema(
-    series: pd.Series,
-    period: int,
-) -> pd.Series:
-    return series.ewm(
-        span=period,
-        adjust=False,
-    ).mean()
+def ema(s, p):
+    return s.ewm(span=p, adjust=False).mean()
 
 
-def rsi(
-    series: pd.Series,
-    period: int,
-) -> pd.Series:
-    delta = series.diff()
-
-    up = delta.clip(
-        lower=0
-    ).ewm(
-        alpha=1 / period,
-        adjust=False,
-    ).mean()
-
-    down = (
-        -delta.clip(
-            upper=0
-        )
-    ).ewm(
-        alpha=1 / period,
-        adjust=False,
-    ).mean()
-
-    rs = safe_div(
-        up,
-        down,
-    )
-
-    return 100 - (
-        100 / (1 + rs)
-    )
+def rsi(s, p):
+    d = s.diff()
+    up = d.clip(lower=0).ewm(alpha=1/p, adjust=False).mean()
+    dn = (-d.clip(upper=0)).ewm(alpha=1/p, adjust=False).mean()
+    rs = safe_div(up, dn)
+    return 100 - 100 / (1 + rs)
 
 
-def atr(
-    df: pd.DataFrame,
-    period: int,
-) -> pd.Series:
-    previous_close = (
-        df["close"].shift(1)
-    )
-
+def atr(df, p):
+    pc = df["close"].shift(1)
     tr = pd.concat(
         [
             df["high"] - df["low"],
-            (
-                df["high"]
-                - previous_close
-            ).abs(),
-            (
-                df["low"]
-                - previous_close
-            ).abs(),
+            (df["high"] - pc).abs(),
+            (df["low"] - pc).abs(),
         ],
         axis=1,
-    ).max(
-        axis=1
-    )
-
-    return tr.ewm(
-        alpha=1 / period,
-        adjust=False,
-    ).mean()
+    ).max(axis=1)
+    return tr.ewm(alpha=1/p, adjust=False).mean()
 
 
-def zscore(
-    series: pd.Series,
-    period: int,
-) -> pd.Series:
-    mean = (
-        series
-        .rolling(period)
-        .mean()
-    )
-
-    std = (
-        series
-        .rolling(period)
-        .std()
-    )
-
-    return safe_div(
-        series - mean,
-        std,
-    )
+def zscore(s, p):
+    m = s.rolling(p).mean()
+    sd = s.rolling(p).std()
+    return safe_div(s - m, sd)
 
 
-def build_features(
-    df: pd.DataFrame,
-) -> pd.DataFrame:
-    required = {
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-    }
-
-    missing = (
-        required
-        -
-        set(df.columns)
-    )
-
+def build_features(df):
+    req = {"open", "high", "low", "close", "volume"}
+    missing = req - set(df.columns)
     if missing:
-        raise ValueError(
-            f"Eksik kolonlar: "
-            f"{sorted(missing)}"
-        )
+        raise ValueError(f"Eksik kolonlar: {sorted(missing)}")
 
     x = df.copy().sort_index()
+    out = pd.DataFrame(index=x.index)
 
-    out = pd.DataFrame(
-        index=x.index
-    )
+    o, h, l, c, v = x["open"], x["high"], x["low"], x["close"], x["volume"]
+    qv = x["quote_volume"] if "quote_volume" in x.columns else c * v
+    trades = x["trades"] if "trades" in x.columns else pd.Series(0.0, index=x.index)
+    taker = x["taker_base"] if "taker_base" in x.columns else pd.Series(0.0, index=x.index)
 
-    o = x["open"]
-    h = x["high"]
-    l = x["low"]
-    c = x["close"]
-    v = x["volume"]
-
-    qv = (
-        x["quote_volume"]
-        if "quote_volume" in x.columns
-        else c * v
-    )
-
-    trades = (
-        x["trades"]
-        if "trades" in x.columns
-        else pd.Series(
-            0.0,
-            index=x.index,
-        )
-    )
-
-    taker_base = (
-        x["taker_base"]
-        if "taker_base" in x.columns
-        else pd.Series(
-            0.0,
-            index=x.index,
-        )
-    )
-
-    # 1-20: returns / log returns
+    # 20 return features
     for n in RET_H:
-        out[
-            f"ret_{n}"
-        ] = c.pct_change(n)
-
-    log_close = np.log(
-        c.replace(
-            0,
-            np.nan,
-        )
-    )
-
+        out[f"ret_{n}"] = c.pct_change(n)
+    logc = np.log(c.replace(0, np.nan))
     for n in RET_H:
-        out[
-            f"logret_{n}"
-        ] = log_close.diff(n)
+        out[f"logret_{n}"] = logc.diff(n)
 
-    # 21-36: SMA / EMA deviations
+    # 16 trend
     for w in WIN:
-        sma = c.rolling(
-            w
-        ).mean()
-
-        out[
-            f"sma_dev_{w}"
-        ] = safe_div(
-            c,
-            sma,
-        ) - 1
-
+        out[f"sma_dev_{w}"] = safe_div(c, c.rolling(w).mean()) - 1
     for w in WIN:
-        em = ema(
-            c,
-            w,
-        )
+        out[f"ema_dev_{w}"] = safe_div(c, ema(c, w)) - 1
 
-        out[
-            f"ema_dev_{w}"
-        ] = safe_div(
-            c,
-            em,
-        ) - 1
-
-    # 37-52: volatility + zscore
-    ret1 = c.pct_change()
-
+    # 16 volatility / z
+    r1 = c.pct_change()
     for w in WIN:
-        out[
-            f"ret_std_{w}"
-        ] = (
-            ret1
-            .rolling(w)
-            .std()
-        )
-
+        out[f"ret_std_{w}"] = r1.rolling(w).std()
     for w in WIN:
-        out[
-            f"close_z_{w}"
-        ] = zscore(
-            c,
-            w,
-        )
+        out[f"close_z_{w}"] = zscore(c, w)
 
-    # 53-68: channel
+    # 16 channel
     for w in WIN:
-        rolling_min = (
-            l.rolling(w).min()
-        )
+        lo = l.rolling(w).min()
+        hi = h.rolling(w).max()
+        width = (hi - lo).replace(0, np.nan)
+        out[f"range_pos_{w}"] = (c - lo) / width
+        out[f"range_width_{w}"] = width / c.replace(0, np.nan)
 
-        rolling_max = (
-            h.rolling(w).max()
-        )
-
-        width = (
-            rolling_max
-            -
-            rolling_min
-        ).replace(
-            0,
-            np.nan,
-        )
-
-        out[
-            f"range_pos_{w}"
-        ] = (
-            c - rolling_min
-        ) / width
-
-        out[
-            f"range_width_{w}"
-        ] = (
-            width
-            /
-            c.replace(
-                0,
-                np.nan,
-            )
-        )
-
-    # 69-76: RSI
+    # 8 RSI
     for p in RSI_P:
-        out[
-            f"rsi_{p}"
-        ] = (
-            rsi(
-                c,
-                p,
-            )
-            /
-            100.0
-        )
+        out[f"rsi_{p}"] = rsi(c, p) / 100
 
-    # 77-84: ATR
+    # 8 ATR
     for p in ATR_P:
-        out[
-            f"atr_pct_{p}"
-        ] = (
-            atr(
-                x,
-                p,
-            )
-            /
-            c.replace(
-                0,
-                np.nan,
-            )
-        )
+        out[f"atr_pct_{p}"] = atr(x, p) / c.replace(0, np.nan)
 
-    # 85-100: stochastic
+    # 16 stochastic
     for p in STO_P:
-        low_roll = (
-            l.rolling(p).min()
-        )
+        lo = l.rolling(p).min()
+        hi = h.rolling(p).max()
+        k = (c - lo) / (hi - lo).replace(0, np.nan)
+        out[f"stoch_k_{p}"] = k
+        out[f"stoch_d_{p}"] = k.rolling(3).mean()
 
-        high_roll = (
-            h.rolling(p).max()
-        )
-
-        k = (
-            c - low_roll
-        ) / (
-            high_roll
-            -
-            low_roll
-        ).replace(
-            0,
-            np.nan,
-        )
-
-        out[
-            f"stoch_k_{p}"
-        ] = k
-
-        out[
-            f"stoch_d_{p}"
-        ] = (
-            k
-            .rolling(3)
-            .mean()
-        )
-
-    # 101-116: Bollinger
+    # 16 Bollinger
     for p in BB_P:
-        mean = (
-            c.rolling(p).mean()
-        )
+        m = c.rolling(p).mean()
+        sd = c.rolling(p).std()
+        up = m + 2*sd
+        dn = m - 2*sd
+        out[f"bb_pos_{p}"] = (c-dn)/(up-dn).replace(0, np.nan)
+        out[f"bb_width_{p}"] = (up-dn)/m.replace(0, np.nan)
 
-        std = (
-            c.rolling(p).std()
-        )
-
-        upper = (
-            mean + 2 * std
-        )
-
-        lower = (
-            mean - 2 * std
-        )
-
-        out[
-            f"bb_pos_{p}"
-        ] = (
-            c - lower
-        ) / (
-            upper - lower
-        ).replace(
-            0,
-            np.nan,
-        )
-
-        out[
-            f"bb_width_{p}"
-        ] = (
-            upper - lower
-        ) / mean.replace(
-            0,
-            np.nan,
-        )
-
-    # 117-140: volume
+    # 24 volume
     for p in VOL_P:
-        out[
-            f"vol_z_{p}"
-        ] = zscore(
-            v,
-            p,
-        )
+        out[f"vol_z_{p}"] = zscore(v, p)
+        out[f"vol_ratio_{p}"] = safe_div(v, v.rolling(p).mean())
+        out[f"qvol_ratio_{p}"] = safe_div(qv, qv.rolling(p).mean())
 
-        out[
-            f"vol_ratio_{p}"
-        ] = safe_div(
-            v,
-            v.rolling(p).mean(),
-        )
-
-        out[
-            f"qvol_ratio_{p}"
-        ] = safe_div(
-            qv,
-            qv.rolling(p).mean(),
-        )
-
-    # 141-150: ROC
+    # 10 ROC
     for n in RET_H:
-        out[
-            f"roc_{n}"
-        ] = (
-            c
-            /
-            c.shift(
-                n
-            ).replace(
-                0,
-                np.nan,
-            )
-            -
-            1
-        )
+        out[f"roc_{n}"] = c/c.shift(n).replace(0, np.nan)-1
 
-    # 151-160: candle geometry
-    candle_range = (
-        h - l
-    ).replace(
-        0,
-        np.nan,
-    )
+    # 10 candle geometry
+    rng = (h-l).replace(0, np.nan)
+    body = c-o
+    max_oc = pd.concat([o, c], axis=1).max(axis=1)
+    min_oc = pd.concat([o, c], axis=1).min(axis=1)
+    out["body_pct"] = body/o.replace(0, np.nan)
+    out["body_to_range"] = body/rng
+    out["abs_body_to_range"] = body.abs()/rng
+    out["upper_wick_ratio"] = (h-max_oc)/rng
+    out["lower_wick_ratio"] = (min_oc-l)/rng
+    out["close_location"] = (c-l)/rng
+    out["open_location"] = (o-l)/rng
+    out["gap_pct"] = o/c.shift(1).replace(0, np.nan)-1
+    out["hl_pct"] = (h-l)/c.replace(0, np.nan)
+    out["oc_abs_pct"] = body.abs()/o.replace(0, np.nan)
 
-    body = (
-        c - o
-    )
+    # 12 microstructure proxies
+    signed = np.sign(c.diff()).fillna(0)
+    obv = (signed*v).cumsum()
+    for w in [5, 13, 21, 34]:
+        out[f"obv_z_{w}"] = zscore(obv, w)
+    for w in [5, 13, 21, 34]:
+        out[f"trade_z_{w}"] = zscore(trades, w)
+    taker_ratio = safe_div(taker, v)
+    for w in [5, 13, 21, 34]:
+        out[f"taker_ratio_ma_{w}"] = taker_ratio.rolling(w).mean()
 
-    max_oc = pd.concat(
-        [o, c],
-        axis=1,
-    ).max(
-        axis=1
-    )
+    # 12 MACD
+    for fast, slow in [(5,13),(8,21),(12,26),(13,34),(21,55),(34,89)]:
+        macd = ema(c, fast) - ema(c, slow)
+        sig = ema(macd, 9)
+        out[f"macd_norm_{fast}_{slow}"] = macd/c.replace(0, np.nan)
+        out[f"macd_hist_{fast}_{slow}"] = (macd-sig)/c.replace(0, np.nan)
 
-    min_oc = pd.concat(
-        [o, c],
-        axis=1,
-    ).min(
-        axis=1
-    )
+    # 8 acceleration
+    for n in [1,2,3,5,8,13,21,34]:
+        rr = c.pct_change(n)
+        out[f"accel_{n}"] = rr - rr.shift(n)
 
-    out[
-        "body_pct"
-    ] = (
-        body
-        /
-        o.replace(
-            0,
-            np.nan,
-        )
-    )
-
-    out[
-        "body_to_range"
-    ] = (
-        body
-        /
-        candle_range
-    )
-
-    out[
-        "abs_body_to_range"
-    ] = (
-        body.abs()
-        /
-        candle_range
-    )
-
-    out[
-        "upper_wick_ratio"
-    ] = (
-        h - max_oc
-    ) / candle_range
-
-    out[
-        "lower_wick_ratio"
-    ] = (
-        min_oc - l
-    ) / candle_range
-
-    out[
-        "close_location"
-    ] = (
-        c - l
-    ) / candle_range
-
-    out[
-        "open_location"
-    ] = (
-        o - l
-    ) / candle_range
-
-    out[
-        "gap_pct"
-    ] = (
-        o
-        /
-        c.shift(1).replace(
-            0,
-            np.nan,
-        )
-        -
-        1
-    )
-
-    out[
-        "hl_pct"
-    ] = (
-        h - l
-    ) / c.replace(
-        0,
-        np.nan,
-    )
-
-    out[
-        "oc_abs_pct"
-    ] = (
-        c - o
-    ).abs() / o.replace(
-        0,
-        np.nan,
-    )
-
-    # 161-172: microstructure proxies
-    signed = np.sign(
-        c.diff()
-    ).fillna(0)
-
-    obv = (
-        signed * v
-    ).cumsum()
-
-    for w in [
-        5,
-        13,
-        21,
-        34,
-    ]:
-        out[
-            f"obv_z_{w}"
-        ] = zscore(
-            obv,
-            w,
-        )
-
-    for w in [
-        5,
-        13,
-        21,
-        34,
-    ]:
-        out[
-            f"trade_z_{w}"
-        ] = zscore(
-            trades,
-            w,
-        )
-
-    taker_ratio = safe_div(
-        taker_base,
-        v,
-    )
-
-    for w in [
-        5,
-        13,
-        21,
-        34,
-    ]:
-        out[
-            f"taker_ratio_ma_{w}"
-        ] = (
-            taker_ratio
-            .rolling(w)
-            .mean()
-        )
-
-    # 173-184: MACD family
-    macd_pairs = [
-        (5, 13),
-        (8, 21),
-        (12, 26),
-        (13, 34),
-        (21, 55),
-        (34, 89),
-    ]
-
-    for fast, slow in macd_pairs:
-        macd = (
-            ema(
-                c,
-                fast,
-            )
-            -
-            ema(
-                c,
-                slow,
-            )
-        )
-
-        signal = ema(
-            macd,
-            9,
-        )
-
-        out[
-            f"macd_norm_{fast}_{slow}"
-        ] = (
-            macd
-            /
-            c.replace(
-                0,
-                np.nan,
-            )
-        )
-
-        out[
-            f"macd_hist_{fast}_{slow}"
-        ] = (
-            macd - signal
-        ) / c.replace(
-            0,
-            np.nan,
-        )
-
-    # 185-192: acceleration
-    for n in [
-        1,
-        2,
-        3,
-        5,
-        8,
-        13,
-        21,
-        34,
-    ]:
-        r = c.pct_change(
-            n
-        )
-
-        out[
-            f"accel_{n}"
-        ] = (
-            r
-            -
-            r.shift(n)
-        )
-
-    # 193-198: time
-    if isinstance(
-        out.index,
-        pd.DatetimeIndex,
-    ):
-        minute = (
-            out.index.minute
-            +
-            out.index.hour * 60
-        )
-
-        dow = (
-            out.index.dayofweek
-        )
-
-        out[
-            "tod_sin"
-        ] = np.sin(
-            2 * np.pi
-            *
-            minute / 1440
-        )
-
-        out[
-            "tod_cos"
-        ] = np.cos(
-            2 * np.pi
-            *
-            minute / 1440
-        )
-
-        out[
-            "dow_sin"
-        ] = np.sin(
-            2 * np.pi
-            *
-            dow / 7
-        )
-
-        out[
-            "dow_cos"
-        ] = np.cos(
-            2 * np.pi
-            *
-            dow / 7
-        )
-
-        out[
-            "hour_sin"
-        ] = np.sin(
-            2 * np.pi
-            *
-            out.index.hour / 24
-        )
-
-        out[
-            "hour_cos"
-        ] = np.cos(
-            2 * np.pi
-            *
-            out.index.hour / 24
-        )
+    # 6 time
+    if isinstance(out.index, pd.DatetimeIndex):
+        minute = out.index.minute + out.index.hour*60
+        dow = out.index.dayofweek
+        out["tod_sin"] = np.sin(2*np.pi*minute/1440)
+        out["tod_cos"] = np.cos(2*np.pi*minute/1440)
+        out["dow_sin"] = np.sin(2*np.pi*dow/7)
+        out["dow_cos"] = np.cos(2*np.pi*dow/7)
+        out["hour_sin"] = np.sin(2*np.pi*out.index.hour/24)
+        out["hour_cos"] = np.cos(2*np.pi*out.index.hour/24)
     else:
-        for name in [
-            "tod_sin",
-            "tod_cos",
-            "dow_sin",
-            "dow_cos",
-            "hour_sin",
-            "hour_cos",
-        ]:
+        for name in ["tod_sin","tod_cos","dow_sin","dow_cos","hour_sin","hour_cos"]:
             out[name] = 0.0
 
-    # 199-200: cross features
-    out[
-        "trend_volume_interaction"
-    ] = (
-        out[
-            "ema_dev_21"
-        ]
-        *
-        out[
-            "vol_ratio_21"
-        ]
-    )
+    # two explicit interaction features
+    out["trend_volume_interaction"] = out["ema_dev_21"] * out["vol_ratio_21"]
+    out["momentum_vol_interaction"] = out["ret_5"] * out["atr_pct_14"]
 
-    out[
-        "momentum_volatility_interaction"
-    ] = (
-        out[
-            "ret_5"
-        ]
-        *
-        out[
-            "atr_pct_14"
-        ]
-    )
-
-    # Tam olarak 200 feature
-    base_cols = list(
-        out.columns
-    )
-
+    # exact 200 safety
+    base_cols = list(out.columns)
     i = 0
-
-    while (
-        out.shape[1]
-        <
-        FEATURE_COUNT
-    ):
-        a = base_cols[
-            i % len(base_cols)
-        ]
-
-        b = base_cols[
-            (
-                i * 7 + 11
-            )
-            %
-            len(base_cols)
-        ]
-
-        out[
-            f"cross_{i:03d}"
-        ] = (
-            out[a]
-            *
-            out[b]
-        )
-
+    while out.shape[1] < FEATURE_COUNT:
+        a = base_cols[i % len(base_cols)]
+        b = base_cols[(i*7+11) % len(base_cols)]
+        out[f"cross_{i:03d}"] = out[a] * out[b]
         i += 1
 
-    out = out.iloc[
-        :,
-        :FEATURE_COUNT,
-    ]
+    out = out.iloc[:, :FEATURE_COUNT]
+    out = out.replace([np.inf, -np.inf], np.nan)
+    out = out.ffill().fillna(0).clip(-1000, 1000).astype("float32")
 
-    out = out.replace(
-        [
-            np.inf,
-            -np.inf,
-        ],
-        np.nan,
-    )
-
-    out = (
-        out
-        .ffill()
-        .fillna(0.0)
-        .clip(
-            -1000,
-            1000,
-        )
-        .astype(
-            "float32"
-        )
-    )
-
-    if (
-        out.shape[1]
-        != FEATURE_COUNT
-    ):
-        raise RuntimeError(
-            f"Feature count mismatch: "
-            f"{out.shape[1]}"
-        )
-
+    if out.shape[1] != FEATURE_COUNT:
+        raise RuntimeError(f"Feature count mismatch: {out.shape[1]}")
     return out
 
 # ============================================================
-# DEEP LEARNING MODEL
+# SMART MULTI-BRANCH MODEL
 # ============================================================
 
 if TORCH_OK:
 
-    class ResidualTemporalBlock(
-        nn.Module
-    ):
-        def __init__(
-            self,
-            channels: int,
-            kernel_size: int,
-            dilation: int,
-            dropout: float,
-        ):
+    class TemporalResidual(nn.Module):
+        def __init__(self, channels, kernel, dilation, dropout):
             super().__init__()
-
-            padding = (
-                (
-                    kernel_size - 1
-                )
-                *
-                dilation
-            ) // 2
-
+            pad = ((kernel-1)*dilation)//2
             self.net = nn.Sequential(
-                nn.Conv1d(
-                    channels,
-                    channels,
-                    kernel_size=kernel_size,
-                    padding=padding,
-                    dilation=dilation,
-                ),
-                nn.BatchNorm1d(
-                    channels
-                ),
+                nn.Conv1d(channels, channels, kernel, padding=pad, dilation=dilation),
+                nn.BatchNorm1d(channels),
                 nn.GELU(),
-                nn.Dropout(
-                    dropout
-                ),
-                nn.Conv1d(
-                    channels,
-                    channels,
-                    kernel_size=kernel_size,
-                    padding=padding,
-                    dilation=dilation,
-                ),
-                nn.BatchNorm1d(
-                    channels
-                ),
+                nn.Dropout(dropout),
+                nn.Conv1d(channels, channels, kernel, padding=pad, dilation=dilation),
+                nn.BatchNorm1d(channels),
                 nn.GELU(),
             )
+            self.drop = nn.Dropout(dropout)
 
-            self.dropout = (
-                nn.Dropout(
-                    dropout
-                )
-            )
-
-        def forward(
-            self,
-            x,
-        ):
-            return self.dropout(
-                self.net(x)
-                +
-                x
-            )
+        def forward(self, x):
+            return self.drop(self.net(x) + x)
 
 
-    class DeepSpotAI(
-        nn.Module
-    ):
+    class SmartMarketAI(nn.Module):
+        """
+        Multi-branch temporal fusion:
+        - CNN branch learns local/scalping patterns
+        - BiLSTM/BiGRU branch learns sequence state
+        - Transformer branch learns long-range relations
+        - learned branch gate chooses which branch matters
+        - final self-attention + pooled classifier
+        """
         def __init__(
             self,
-            n_features: int = FEATURE_COUNT,
-            d_model: int = 160,
-            lstm_hidden: int = 112,
-            gru_hidden: int = 112,
-            heads: int = 8,
-            dropout: float = 0.18,
-            classes: int = 3,
+            n_features=FEATURE_COUNT,
+            d_model=160,
+            heads=8,
+            dropout=0.20,
+            classes=3,
         ):
             super().__init__()
 
-            self.input_norm = (
-                nn.LayerNorm(
-                    n_features
-                )
+            self.norm = nn.LayerNorm(n_features)
+            self.project = nn.Sequential(
+                nn.Linear(n_features, 256),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(256, d_model),
+                nn.GELU(),
             )
 
-            self.project = (
-                nn.Sequential(
-                    nn.Linear(
-                        n_features,
-                        256,
-                    ),
-                    nn.GELU(),
-                    nn.Dropout(
-                        dropout
-                    ),
-                    nn.Linear(
-                        256,
-                        d_model,
-                    ),
-                    nn.GELU(),
-                )
-            )
-
-            self.temporal = (
-                nn.Sequential(
-                    ResidualTemporalBlock(
-                        d_model,
-                        3,
-                        1,
-                        dropout,
-                    ),
-                    ResidualTemporalBlock(
-                        d_model,
-                        5,
-                        2,
-                        dropout,
-                    ),
-                    ResidualTemporalBlock(
-                        d_model,
-                        7,
-                        4,
-                        dropout,
-                    ),
-                )
+            self.cnn = nn.Sequential(
+                TemporalResidual(d_model, 3, 1, dropout),
+                TemporalResidual(d_model, 5, 2, dropout),
+                TemporalResidual(d_model, 7, 4, dropout),
             )
 
             self.lstm = nn.LSTM(
-                input_size=d_model,
-                hidden_size=lstm_hidden,
-                num_layers=2,
-                batch_first=True,
-                dropout=dropout,
-                bidirectional=True,
+                d_model, 112, num_layers=2, batch_first=True,
+                dropout=dropout, bidirectional=True,
             )
-
-            self.lstm_proj = (
-                nn.Sequential(
-                    nn.Linear(
-                        lstm_hidden * 2,
-                        d_model,
-                    ),
-                    nn.GELU(),
-                    nn.LayerNorm(
-                        d_model
-                    ),
-                )
-            )
+            self.lstm_proj = nn.Linear(224, d_model)
 
             self.gru = nn.GRU(
-                input_size=d_model,
-                hidden_size=gru_hidden,
-                num_layers=2,
-                batch_first=True,
+                d_model, 112, num_layers=2, batch_first=True,
+                dropout=dropout, bidirectional=True,
+            )
+            self.gru_proj = nn.Linear(224, d_model)
+
+            enc_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=heads,
+                dim_feedforward=d_model*4,
                 dropout=dropout,
-                bidirectional=True,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.transformer = nn.TransformerEncoder(enc_layer, num_layers=3)
+
+            self.branch_gate = nn.Sequential(
+                nn.Linear(d_model*3, 192),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(192, 3),
+                nn.Softmax(dim=-1),
             )
 
-            self.gru_proj = (
-                nn.Sequential(
-                    nn.Linear(
-                        gru_hidden * 2,
-                        d_model,
-                    ),
-                    nn.GELU(),
-                    nn.LayerNorm(
-                        d_model
-                    ),
-                )
+            self.attn = nn.MultiheadAttention(
+                d_model, heads, dropout=dropout, batch_first=True
+            )
+            self.attn_norm = nn.LayerNorm(d_model)
+
+            self.pool_gate = nn.Sequential(
+                nn.Linear(d_model*3, 128),
+                nn.GELU(),
+                nn.Linear(128, 3),
+                nn.Softmax(dim=-1),
             )
 
-            encoder_layer = (
-                nn.TransformerEncoderLayer(
-                    d_model=d_model,
-                    nhead=heads,
-                    dim_feedforward=d_model * 4,
-                    dropout=dropout,
-                    activation="gelu",
-                    batch_first=True,
-                    norm_first=True,
-                )
+            self.head = nn.Sequential(
+                nn.Linear(d_model*3, 384),
+                nn.GELU(),
+                nn.LayerNorm(384),
+                nn.Dropout(dropout),
+                nn.Linear(384, 192),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(192, 64),
+                nn.GELU(),
+                nn.Linear(64, classes),
             )
 
-            self.transformer = (
-                nn.TransformerEncoder(
-                    encoder_layer,
-                    num_layers=2,
-                )
+        def forward(self, x):
+            x = self.project(self.norm(x))
+
+            # branch 1: TCN
+            cnn = self.cnn(x.transpose(1,2)).transpose(1,2)
+
+            # branch 2: recurrent
+            lstm, _ = self.lstm(x)
+            rnn = self.lstm_proj(lstm)
+            gru, _ = self.gru(rnn)
+            rnn = rnn + self.gru_proj(gru)
+
+            # branch 3: transformer
+            tr = self.transformer(x)
+
+            branch_summary = torch.cat(
+                [cnn.mean(1), rnn.mean(1), tr.mean(1)], dim=-1
+            )
+            w = self.branch_gate(branch_summary)
+
+            fused_seq = (
+                cnn * w[:,0:1,None]
+                + rnn * w[:,1:2,None]
+                + tr * w[:,2:3,None]
             )
 
-            self.attention = (
-                nn.MultiheadAttention(
-                    embed_dim=d_model,
-                    num_heads=heads,
-                    dropout=dropout,
-                    batch_first=True,
-                )
-            )
+            a, _ = self.attn(fused_seq, fused_seq, fused_seq, need_weights=False)
+            fused_seq = self.attn_norm(fused_seq + a)
 
-            self.attn_norm = (
-                nn.LayerNorm(
-                    d_model
-                )
-            )
+            last = fused_seq[:,-1,:]
+            mean = fused_seq.mean(1)
+            mx = fused_seq.max(1).values
 
-            self.gate = (
-                nn.Sequential(
-                    nn.Linear(
-                        d_model * 3,
-                        d_model,
-                    ),
-                    nn.GELU(),
-                    nn.Linear(
-                        d_model,
-                        3,
-                    ),
-                    nn.Softmax(
-                        dim=-1
-                    ),
-                )
-            )
-
-            self.classifier = (
-                nn.Sequential(
-                    nn.Linear(
-                        d_model * 3,
-                        320,
-                    ),
-                    nn.GELU(),
-                    nn.LayerNorm(
-                        320
-                    ),
-                    nn.Dropout(
-                        dropout
-                    ),
-                    nn.Linear(
-                        320,
-                        160,
-                    ),
-                    nn.GELU(),
-                    nn.Dropout(
-                        dropout
-                    ),
-                    nn.Linear(
-                        160,
-                        64,
-                    ),
-                    nn.GELU(),
-                    nn.Linear(
-                        64,
-                        classes,
-                    ),
-                )
-            )
-
-        def forward(
-            self,
-            x,
-        ):
-            x = self.input_norm(
-                x
-            )
-
-            x = self.project(
-                x
-            )
-
-            temporal = (
-                self.temporal(
-                    x.transpose(
-                        1,
-                        2,
-                    )
-                )
-                .transpose(
-                    1,
-                    2,
-                )
-            )
-
-            x = x + temporal
-
-            lstm_out, _ = (
-                self.lstm(x)
-            )
-
-            lstm_out = (
-                self.lstm_proj(
-                    lstm_out
-                )
-            )
-
-            x = x + lstm_out
-
-            gru_out, _ = (
-                self.gru(x)
-            )
-
-            gru_out = (
-                self.gru_proj(
-                    gru_out
-                )
-            )
-
-            x = x + gru_out
-
-            x = self.transformer(
-                x
-            )
-
-            attn_out, _ = (
-                self.attention(
-                    x,
-                    x,
-                    x,
-                    need_weights=False,
-                )
-            )
-
-            x = self.attn_norm(
-                x + attn_out
-            )
-
-            last_pool = (
-                x[:, -1, :]
-            )
-
-            mean_pool = (
-                x.mean(
-                    dim=1
-                )
-            )
-
-            max_pool = (
-                x.max(
-                    dim=1
-                ).values
-            )
-
-            gate_input = torch.cat(
+            pg = self.pool_gate(torch.cat([last, mean, mx], dim=-1))
+            pooled = torch.cat(
                 [
-                    last_pool,
-                    mean_pool,
-                    max_pool,
+                    last * pg[:,0:1],
+                    mean * pg[:,1:2],
+                    mx * pg[:,2:3],
                 ],
                 dim=-1,
             )
-
-            weights = self.gate(
-                gate_input
-            )
-
-            weighted_last = (
-                last_pool
-                *
-                weights[:, 0:1]
-            )
-
-            weighted_mean = (
-                mean_pool
-                *
-                weights[:, 1:2]
-            )
-
-            weighted_max = (
-                max_pool
-                *
-                weights[:, 2:3]
-            )
-
-            fused = torch.cat(
-                [
-                    weighted_last,
-                    weighted_mean,
-                    weighted_max,
-                ],
-                dim=-1,
-            )
-
-            return self.classifier(
-                fused
-            )
+            return self.head(pooled)
 
 
-    class SequenceDataset(
-        Dataset
-    ):
-        def __init__(
-            self,
-            X,
-            y,
-            sequence_length: int,
-        ):
-            self.X = X
-            self.y = y
-            self.sequence_length = (
-                sequence_length
-            )
+    class SeqDS(Dataset):
+        def __init__(self, X, y, seq):
+            self.X, self.y, self.seq = X, y, seq
 
-        def __len__(
-            self,
-        ):
-            return max(
-                0,
-                len(self.y)
-                -
-                self.sequence_length
-                +
-                1,
-            )
+        def __len__(self):
+            return max(0, len(self.y)-self.seq+1)
 
-        def __getitem__(
-            self,
-            index,
-        ):
-            end = (
-                index
-                +
-                self.sequence_length
-                -
-                1
-            )
-
-            seq = self.X[
-                index:
-                index
-                +
-                self.sequence_length
-            ]
-
-            target = self.y[
-                end
-            ]
-
+        def __getitem__(self, i):
+            j = i+self.seq-1
             return (
-                torch.tensor(
-                    seq,
-                    dtype=torch.float32,
-                ),
-                torch.tensor(
-                    target,
-                    dtype=torch.long,
-                ),
+                torch.tensor(self.X[i:i+self.seq], dtype=torch.float32),
+                torch.tensor(self.y[j], dtype=torch.long),
             )
 
 # ============================================================
-# LABELS / TRAINING
+# TRAIN / LOAD / MC-DROPOUT INFERENCE
 # ============================================================
 
-def build_labels(
-    close: pd.Series,
-    horizon: int,
-    threshold: float,
-):
-    future_return = (
-        close.shift(
-            -horizon
-        )
-        /
-        close
-        -
-        1
-    )
-
-    labels = np.ones(
-        len(close),
-        dtype=np.int64,
-    )
-
-    labels[
-        future_return
-        <
-        -threshold
-    ] = 0
-
-    labels[
-        future_return
-        >
-        threshold
-    ] = 2
-
-    return labels
+def labels_from_close(close, horizon, threshold):
+    future = close.shift(-horizon)/close - 1
+    y = np.ones(len(close), dtype=np.int64)
+    y[future < -threshold] = 0
+    y[future > threshold] = 2
+    return y
 
 
-def compute_class_weights(
-    y: np.ndarray,
-):
-    counts = np.bincount(
-        y,
-        minlength=3,
-    ).astype(
-        np.float64
-    )
+def class_weights(y):
+    counts = np.bincount(y, minlength=3).astype(float)
+    counts[counts == 0] = 1
+    return torch.tensor(counts.sum()/(3*counts), dtype=torch.float32)
 
-    counts[
-        counts == 0
-    ] = 1
 
-    weights = (
-        counts.sum()
-        /
-        (
-            3
-            *
-            counts
-        )
-    )
-
-    return torch.tensor(
-        weights,
-        dtype=torch.float32,
-    )
+def model_dir_for(base_dir, market):
+    return Path(base_dir) / market.lower()
 
 
 def train_model(
-    symbol: str,
-    interval: str,
-    bars: int,
-    sequence_length: int,
-    horizon: int,
-    threshold: float,
-    epochs: int,
-    batch_size: int,
-    out_dir: str,
-    learning_rate: float,
+    market,
+    symbol,
+    interval,
+    bars,
+    seq,
+    horizon,
+    threshold,
+    epochs,
+    batch,
+    lr,
+    base_dir,
 ):
     if not TORCH_OK:
-        raise RuntimeError(
-            "PyTorch kurulu değil."
-        )
+        raise RuntimeError("PyTorch kurulu değil.")
 
-    out = Path(
-        out_dir
-    )
-
-    out.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
+    out = model_dir_for(base_dir, market)
+    out.mkdir(parents=True, exist_ok=True)
     st.session_state.training_log = []
 
-    def log(
-        text: str,
-    ):
-        st.session_state.training_log.append(
-            text
-        )
+    def log(msg):
+        st.session_state.training_log.append(str(msg))
 
-    log(
-        "Binance geçmiş verisi indiriliyor..."
+    log(f"{market} {symbol}: geçmiş veri indiriliyor...")
+    df = fetch_history(market, symbol, interval, bars)
+    feats = build_features(df)
+    y = labels_from_close(df["close"], horizon, threshold)
+
+    usable = len(df)-horizon
+    feats = feats.iloc[:usable]
+    y = y[:usable]
+
+    train_end = int(len(feats)*0.70)
+    val_end = int(len(feats)*0.85)
+
+    mean = feats.iloc[:train_end].mean().to_numpy(np.float32)
+    std = feats.iloc[:train_end].std().replace(0,1).to_numpy(np.float32)
+
+    X = ((feats.to_numpy(np.float32)-mean)/std).clip(-8,8)
+
+    tr = DataLoader(
+        SeqDS(X[:train_end], y[:train_end], seq),
+        batch_size=batch, shuffle=True, drop_last=True
+    )
+    va = DataLoader(
+        SeqDS(
+            X[train_end-seq:val_end],
+            y[train_end-seq:val_end],
+            seq
+        ),
+        batch_size=batch, shuffle=False
+    )
+    te = DataLoader(
+        SeqDS(X[val_end-seq:], y[val_end-seq:], seq),
+        batch_size=batch, shuffle=False
     )
 
-    df = fetch_klines_history(
-        symbol,
-        interval,
-        bars,
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    log(f"Device: {device}")
+
+    model = SmartMarketAI().to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt, mode="min", factor=.5, patience=1, min_lr=1e-6
+    )
+    loss_fn = nn.CrossEntropyLoss(
+        weight=class_weights(y[:train_end]).to(device),
+        label_smoothing=.03,
     )
 
-    log(
-        f"{len(df)} mum indirildi."
-    )
-
-    features = build_features(
-        df
-    )
-
-    log(
-        f"{features.shape[1]} özellik üretildi."
-    )
-
-    labels = build_labels(
-        df["close"],
-        horizon,
-        threshold,
-    )
-
-    usable = (
-        len(df)
-        -
-        horizon
-    )
-
-    features = (
-        features.iloc[
-            :usable
-        ]
-    )
-
-    labels = labels[
-        :usable
-    ]
-
-    train_end = int(
-        len(features)
-        *
-        0.70
-    )
-
-    val_end = int(
-        len(features)
-        *
-        0.85
-    )
-
-    train_features = (
-        features.iloc[
-            :train_end
-        ]
-    )
-
-    mean = (
-        train_features
-        .mean()
-        .to_numpy(
-            np.float32
-        )
-    )
-
-    std = (
-        train_features
-        .std()
-        .replace(
-            0,
-            1
-        )
-        .to_numpy(
-            np.float32
-        )
-    )
-
-    X = (
-        (
-            features.to_numpy(
-                np.float32
-            )
-            -
-            mean
-        )
-        /
-        std
-    ).clip(
-        -8,
-        8,
-    )
-
-    X_train = X[
-        :train_end
-    ]
-
-    y_train = labels[
-        :train_end
-    ]
-
-    X_val = X[
-        train_end
-        -
-        sequence_length:
-        val_end
-    ]
-
-    y_val = labels[
-        train_end
-        -
-        sequence_length:
-        val_end
-    ]
-
-    X_test = X[
-        val_end
-        -
-        sequence_length:
-    ]
-
-    y_test = labels[
-        val_end
-        -
-        sequence_length:
-    ]
-
-    train_ds = SequenceDataset(
-        X_train,
-        y_train,
-        sequence_length,
-    )
-
-    val_ds = SequenceDataset(
-        X_val,
-        y_val,
-        sequence_length,
-    )
-
-    test_ds = SequenceDataset(
-        X_test,
-        y_test,
-        sequence_length,
-    )
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        drop_last=True,
-    )
-
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-    )
-
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=batch_size,
-        shuffle=False,
-    )
-
-    device = (
-        "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
-
-    log(
-        f"Device: {device}"
-    )
-
-    model = DeepSpotAI(
-        n_features=FEATURE_COUNT
-    ).to(
-        device
-    )
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=learning_rate,
-        weight_decay=1e-4,
-    )
-
-    scheduler = (
-        torch.optim.lr_scheduler
-        .ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=0.5,
-            patience=1,
-            min_lr=1e-6,
-        )
-    )
-
-    class_weights = (
-        compute_class_weights(
-            y_train
-        )
-        .to(
-            device
-        )
-    )
-
-    loss_fn = (
-        nn.CrossEntropyLoss(
-            weight=class_weights,
-            label_smoothing=0.03,
-        )
-    )
-
-    best_val_loss = (
-        float("inf")
-    )
-
+    best = float("inf")
     patience = 0
-    max_patience = 4
 
-    for epoch in range(
-        1,
-        epochs + 1,
-    ):
+    for epoch in range(1, epochs+1):
         model.train()
+        tl, tc, tn = 0.0, 0, 0
 
-        train_loss_total = 0.0
-        train_correct = 0
-        train_total = 0
-
-        for xb, yb in train_loader:
-            xb = xb.to(
-                device
-            )
-
-            yb = yb.to(
-                device
-            )
-
-            optimizer.zero_grad(
-                set_to_none=True
-            )
-
-            logits = model(
-                xb
-            )
-
-            loss = loss_fn(
-                logits,
-                yb,
-            )
-
+        for xb, yb in tr:
+            xb, yb = xb.to(device), yb.to(device)
+            opt.zero_grad(set_to_none=True)
+            logits = model(xb)
+            loss = loss_fn(logits, yb)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
 
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                1.0,
-            )
-
-            optimizer.step()
-
-            train_loss_total += (
-                loss.item()
-            )
-
-            preds = logits.argmax(
-                dim=1
-            )
-
-            train_correct += (
-                preds == yb
-            ).sum().item()
-
-            train_total += (
-                yb.numel()
-            )
+            tl += loss.item()
+            tc += (logits.argmax(1) == yb).sum().item()
+            tn += yb.numel()
 
         model.eval()
-
-        val_loss_total = 0.0
-        val_correct = 0
-        val_total = 0
-
+        vl, vc, vn = 0.0, 0, 0
         with torch.no_grad():
-            for xb, yb in val_loader:
-                xb = xb.to(
-                    device
-                )
+            for xb, yb in va:
+                xb, yb = xb.to(device), yb.to(device)
+                logits = model(xb)
+                loss = loss_fn(logits, yb)
+                vl += loss.item()
+                vc += (logits.argmax(1) == yb).sum().item()
+                vn += yb.numel()
 
-                yb = yb.to(
-                    device
-                )
-
-                logits = model(
-                    xb
-                )
-
-                loss = loss_fn(
-                    logits,
-                    yb,
-                )
-
-                val_loss_total += (
-                    loss.item()
-                )
-
-                preds = logits.argmax(
-                    dim=1
-                )
-
-                val_correct += (
-                    preds == yb
-                ).sum().item()
-
-                val_total += (
-                    yb.numel()
-                )
-
-        train_loss = (
-            train_loss_total
-            /
-            max(
-                1,
-                len(train_loader),
-            )
-        )
-
-        val_loss = (
-            val_loss_total
-            /
-            max(
-                1,
-                len(val_loader),
-            )
-        )
-
-        train_acc = (
-            train_correct
-            /
-            max(
-                1,
-                train_total,
-            )
-        )
-
-        val_acc = (
-            val_correct
-            /
-            max(
-                1,
-                val_total,
-            )
-        )
-
-        scheduler.step(
-            val_loss
-        )
-
-        current_lr = (
-            optimizer
-            .param_groups[0]["lr"]
-        )
+        tl /= max(1, len(tr))
+        vl /= max(1, len(va))
+        ta = tc/max(1,tn)
+        vaa = vc/max(1,vn)
+        sched.step(vl)
 
         log(
-            f"Epoch {epoch:02d} | "
-            f"train_loss={train_loss:.4f} | "
-            f"train_acc={train_acc:.4f} | "
-            f"val_loss={val_loss:.4f} | "
-            f"val_acc={val_acc:.4f} | "
-            f"lr={current_lr:.7f}"
+            f"Epoch {epoch:02d} | train={tl:.4f}/{ta:.3f} "
+            f"| val={vl:.4f}/{vaa:.3f} | lr={opt.param_groups[0]['lr']:.7f}"
         )
 
-        if (
-            val_loss
-            <
-            best_val_loss
-        ):
-            best_val_loss = (
-                val_loss
-            )
-
+        if vl < best:
+            best = vl
             patience = 0
-
-            torch.save(
-                model.state_dict(),
-                out / "model.pt",
-            )
-
-            np.savez(
-                out / "scaler.npz",
-                mean=mean,
-                std=std,
-            )
-
-            metadata = {
-                "symbol": symbol,
-                "interval": interval,
-                "sequence_length": sequence_length,
-                "horizon": horizon,
-                "threshold": threshold,
-                "feature_count": FEATURE_COUNT,
-                "features": list(
-                    features.columns
-                ),
-                "classes": [
-                    "SELL",
-                    "WAIT",
-                    "BUY",
-                ],
-                "architecture": (
-                    "ResidualCNN+BiLSTM+BiGRU+"
-                    "Transformer+MultiHeadAttention"
-                ),
-            }
-
-            (
-                out / "meta.json"
-            ).write_text(
+            torch.save(model.state_dict(), out/"model.pt")
+            np.savez(out/"scaler.npz", mean=mean, std=std)
+            (out/"meta.json").write_text(
                 json.dumps(
-                    metadata,
+                    {
+                        "market": market,
+                        "symbol": symbol,
+                        "interval": interval,
+                        "seq": seq,
+                        "horizon": horizon,
+                        "threshold": threshold,
+                        "feature_count": FEATURE_COUNT,
+                        "features": list(feats.columns),
+                        "classes": ["SELL","WAIT","BUY"],
+                        "architecture": "TCN+BiLSTM+BiGRU+Transformer+Attention+Gating",
+                    },
                     indent=2,
                 ),
                 encoding="utf-8",
             )
-
-            log(
-                "En iyi model kaydedildi."
-            )
-
+            log("Yeni en iyi model kaydedildi.")
         else:
             patience += 1
-
-            if (
-                patience
-                >=
-                max_patience
-            ):
-                log(
-                    "Early stopping."
-                )
+            if patience >= 4:
+                log("Early stopping.")
                 break
 
-    model.load_state_dict(
-        torch.load(
-            out / "model.pt",
-            map_location=device,
-        )
-    )
-
+    model.load_state_dict(torch.load(out/"model.pt", map_location=device))
     model.eval()
 
-    test_correct = 0
-    test_total = 0
-
-    confusion = np.zeros(
-        (
-            3,
-            3,
-        ),
-        dtype=int,
-    )
-
+    correct = total = 0
     with torch.no_grad():
-        for xb, yb in test_loader:
-            xb = xb.to(
-                device
-            )
+        for xb, yb in te:
+            xb, yb = xb.to(device), yb.to(device)
+            pred = model(xb).argmax(1)
+            correct += (pred == yb).sum().item()
+            total += yb.numel()
 
-            yb = yb.to(
-                device
-            )
+    acc = correct/max(1,total)
+    log(f"Out-of-sample test accuracy: {acc:.4f}")
+    return {"market":market, "test_accuracy":acc, "model_dir":str(out)}
 
-            logits = model(
-                xb
-            )
-
-            preds = logits.argmax(
-                dim=1
-            )
-
-            test_correct += (
-                preds == yb
-            ).sum().item()
-
-            test_total += (
-                yb.numel()
-            )
-
-            for true, pred in zip(
-                yb.cpu().numpy(),
-                preds.cpu().numpy(),
-            ):
-                confusion[
-                    int(true),
-                    int(pred),
-                ] += 1
-
-    test_acc = (
-        test_correct
-        /
-        max(
-            1,
-            test_total,
-        )
-    )
-
-    log(
-        f"Test accuracy: "
-        f"{test_acc:.4f}"
-    )
-
-    log(
-        "Eğitim tamamlandı."
-    )
-
-    return {
-        "test_accuracy": test_acc,
-        "confusion": confusion.tolist(),
-        "model_dir": str(
-            out.resolve()
-        ),
-    }
-
-# ============================================================
-# MODEL LOAD / INFERENCE
-# ============================================================
 
 _MODEL_CACHE = {}
 
 
-def clear_model_cache():
-    _MODEL_CACHE.clear()
-
-
-def load_model_artifacts(
-    model_dir: str,
-):
+def load_model(base_dir, market):
     if not TORCH_OK:
-        raise RuntimeError(
-            "PyTorch kurulu değil."
-        )
+        raise RuntimeError("PyTorch kurulu değil.")
 
-    key = str(
-        Path(
-            model_dir
-        ).resolve()
-    )
-
+    p = model_dir_for(base_dir, market)
+    key = str(p.resolve())
     if key in _MODEL_CACHE:
-        return _MODEL_CACHE[
-            key
-        ]
+        return _MODEL_CACHE[key]
 
-    path = Path(
-        model_dir
-    )
+    for name in ["model.pt","meta.json","scaler.npz"]:
+        if not (p/name).exists():
+            raise RuntimeError(f"{market} model dosyası yok: {p/name}")
 
-    meta_path = (
-        path
-        /
-        "meta.json"
-    )
+    meta = json.loads((p/"meta.json").read_text(encoding="utf-8"))
+    sc = np.load(p/"scaler.npz")
 
-    model_path = (
-        path
-        /
-        "model.pt"
-    )
-
-    scaler_path = (
-        path
-        /
-        "scaler.npz"
-    )
-
-    if not (
-        meta_path.exists()
-        and
-        model_path.exists()
-        and
-        scaler_path.exists()
-    ):
-        raise RuntimeError(
-            "Model dosyaları bulunamadı."
-        )
-
-    metadata = json.loads(
-        meta_path.read_text(
-            encoding="utf-8"
-        )
-    )
-
-    scaler = np.load(
-        scaler_path
-    )
-
-    mean = scaler[
-        "mean"
-    ]
-
-    std = scaler[
-        "std"
-    ]
-
-    model = DeepSpotAI(
-        n_features=int(
-            metadata[
-                "feature_count"
-            ]
-        )
-    )
-
-    state = torch.load(
-        model_path,
-        map_location="cpu",
-    )
-
-    model.load_state_dict(
-        state
-    )
-
+    model = SmartMarketAI(n_features=int(meta["feature_count"]))
+    model.load_state_dict(torch.load(p/"model.pt", map_location="cpu"))
     model.eval()
 
-    result = (
-        model,
-        metadata,
-        mean,
-        std,
-    )
-
-    _MODEL_CACHE[
-        key
-    ] = result
-
-    return result
+    obj = (model, meta, sc["mean"], sc["std"])
+    _MODEL_CACHE[key] = obj
+    return obj
 
 
-def predict_symbol(
-    client: BinanceSpotClient,
-    symbol: str,
-    interval: str,
-    model_dir: str,
-):
-    (
-        model,
-        metadata,
-        mean,
-        std,
-    ) = load_model_artifacts(
-        model_dir
-    )
+def enable_mc_dropout(model):
+    """
+    Keep BatchNorm in eval, enable Dropout for MC sampling.
+    """
+    model.eval()
+    for m in model.modules():
+        if isinstance(m, nn.Dropout):
+            m.train()
 
-    rows = client.klines(
-        symbol,
-        interval,
-        limit=1000,
-    )
 
-    df = klines_to_df(
-        rows
-    )
+def predict_market(client, market, symbol, interval, base_dir, mc_samples=8):
+    model, meta, mean, std = load_model(base_dir, market)
 
-    features = build_features(
-        df
-    )
+    df = klines_to_df(client.klines(symbol, interval, limit=1000))
+    feats = build_features(df).reindex(columns=meta["features"], fill_value=0.0)
 
-    features = features.reindex(
-        columns=metadata[
-            "features"
-        ],
-        fill_value=0.0,
-    )
+    X = ((feats.to_numpy(np.float32)-mean)/std).clip(-8,8)
+    seq = int(meta["seq"])
+    if len(X) < seq:
+        raise RuntimeError("Yetersiz sequence.")
 
-    values = (
-        features
-        .to_numpy(
-            np.float32
-        )
-    )
+    t = torch.tensor(X[-seq:], dtype=torch.float32).unsqueeze(0)
 
-    normalized = (
-        (
-            values
-            -
-            mean
-        )
-        /
-        std
-    ).clip(
-        -8,
-        8,
-    )
-
-    seq_len = int(
-        metadata[
-            "sequence_length"
-        ]
-    )
-
-    if (
-        len(normalized)
-        <
-        seq_len
-    ):
-        raise RuntimeError(
-            "Yetersiz mum."
-        )
-
-    sequence = normalized[
-        -seq_len:
-    ]
-
-    tensor = torch.tensor(
-        sequence,
-        dtype=torch.float32,
-    ).unsqueeze(
-        0
-    )
-
+    # MC-dropout uncertainty
+    enable_mc_dropout(model)
+    draws = []
     with torch.no_grad():
-        logits = model(
-            tensor
-        )
+        for _ in range(max(2, int(mc_samples))):
+            draws.append(torch.softmax(model(t), dim=1).squeeze(0).numpy())
+    model.eval()
 
-        probs = torch.softmax(
-            logits,
-            dim=1,
-        ).squeeze(
-            0
-        ).numpy()
+    arr = np.stack(draws)
+    mean_prob = arr.mean(axis=0)
+    variance = float(arr.var(axis=0).mean())
 
-    probs_safe = np.clip(
-        probs.astype(np.float64),
-        1e-9,
-        1.0,
-    )
-
-    entropy = float(
-        -np.sum(
-            probs_safe
-            *
-            np.log(
-                probs_safe
-            )
-        )
-        /
-        np.log(3.0)
-    )
-
-    confidence = float(
-        max(
-            0.0,
-            min(
-                100.0,
-                (1.0 - entropy)
-                *
-                100.0,
-            ),
-        )
-    )
+    safe = np.clip(mean_prob.astype(float), 1e-9, 1.0)
+    entropy = float(-np.sum(safe*np.log(safe))/np.log(3.0))
+    uncertainty = min(100.0, 100.0*(0.70*entropy + 0.30*min(1.0, variance*100)))
+    confidence = max(0.0, 100.0-uncertainty)
 
     return {
-        "SELL": float(
-            probs[0]
-            *
-            100
-        ),
-        "WAIT": float(
-            probs[1]
-            *
-            100
-        ),
-        "BUY": float(
-            probs[2]
-            *
-            100
-        ),
-        "UNCERTAINTY": float(
-            entropy
-            *
-            100
-        ),
-        "MODEL_CONFIDENCE": confidence,
+        "SELL": float(mean_prob[0]*100),
+        "WAIT": float(mean_prob[1]*100),
+        "BUY": float(mean_prob[2]*100),
+        "CONFIDENCE": confidence,
+        "UNCERTAINTY": uncertainty,
     }, df
 
 # ============================================================
-# PAPER TRADING
+# ROUTER: SPOT OR FUTURES
 # ============================================================
 
-def paper_buy(
-    symbol: str,
-    usdt: float,
-    price: float,
+def spread_bps(book):
+    bid = float(book["bidPrice"])
+    ask = float(book["askPrice"])
+    mid = (bid+ask)/2
+    return ((ask-bid)/mid)*10000 if mid > 0 else 9999
+
+
+def realized_vol_score(df):
+    r = df["close"].pct_change().tail(40).std()
+    # scalping likes some movement, but not extreme chaos
+    pct = float(r*100)
+    if pct <= 0:
+        return 0.0
+    if pct < 0.05:
+        return pct/0.05*35
+    if pct <= 0.8:
+        return 35 + min(35, (pct-0.05)/0.75*35)
+    return max(10, 70-(pct-0.8)*25)
+
+
+def candidate_score(
+    market,
+    probs,
+    spread,
+    vol_score,
+    funding_rate=0.0,
 ):
-    if (
-        st.session_state
-        .paper_balance
-        <
-        usdt
-    ):
-        raise RuntimeError(
-            "Paper bakiye yetersiz."
-        )
+    direction_prob = max(probs["BUY"], probs["SELL"])
+    wait_penalty = probs["WAIT"] * 0.20
+    uncertainty_penalty = probs["UNCERTAINTY"] * 0.25
+    spread_penalty = min(35.0, spread * 2.0)
+    funding_penalty = min(15.0, abs(funding_rate)*10000*2.0)
 
-    qty = (
-        usdt
-        /
-        price
+    score = (
+        direction_prob*0.62
+        + probs["CONFIDENCE"]*0.23
+        + vol_score*0.15
+        - wait_penalty
+        - uncertainty_penalty
+        - spread_penalty
+        - funding_penalty
     )
 
-    old = (
-        st.session_state
-        .paper_positions
-        .get(
-            symbol,
-            {
-                "qty": 0.0,
-                "avg": 0.0,
-            },
-        )
-    )
+    if market == "SPOT" and probs["SELL"] > probs["BUY"]:
+        score -= 30  # Spot has no native short in this bot
 
-    new_qty = (
-        old["qty"]
-        +
-        qty
-    )
+    return float(score)
 
-    new_avg = (
-        (
-            old["qty"]
-            *
-            old["avg"]
-        )
-        +
-        (
-            qty
-            *
-            price
-        )
-    ) / new_qty
 
-    st.session_state[
-        "paper_positions"
-    ][symbol] = {
-        "qty": new_qty,
-        "avg": new_avg,
+def scan_one_symbol(
+    symbol,
+    interval,
+    base_dir,
+    spot_client,
+    futures_client,
+    allow_spot,
+    allow_futures,
+    mc_samples,
+):
+    rows = []
+
+    # SPOT
+    if allow_spot and (model_dir_for(base_dir, "SPOT")/"model.pt").exists():
+        try:
+            probs, df = predict_market(
+                spot_client, "SPOT", symbol, interval, base_dir, mc_samples
+            )
+            book = spot_client.book_ticker(symbol)
+            sp = spread_bps(book)
+            vs = realized_vol_score(df)
+            direction = "LONG" if probs["BUY"] >= probs["SELL"] else "NONE"
+            score = candidate_score("SPOT", probs, sp, vs, 0)
+            rows.append(
+                {
+                    "Symbol":symbol,
+                    "Market":"SPOT",
+                    "Direction":direction,
+                    "BUY %":probs["BUY"],
+                    "WAIT %":probs["WAIT"],
+                    "SELL %":probs["SELL"],
+                    "AI Güven %":probs["CONFIDENCE"],
+                    "Belirsizlik %":probs["UNCERTAINTY"],
+                    "Spread bps":sp,
+                    "Funding %":0.0,
+                    "Vol Score":vs,
+                    "Router Score":score,
+                }
+            )
+        except Exception as exc:
+            rows.append({"Symbol":symbol,"Market":"SPOT","Error":str(exc)})
+
+    # FUTURES
+    if allow_futures and (model_dir_for(base_dir, "FUTURES")/"model.pt").exists():
+        try:
+            probs, df = predict_market(
+                futures_client, "FUTURES", symbol, interval, base_dir, mc_samples
+            )
+            book = futures_client.book_ticker(symbol)
+            sp = spread_bps(book)
+            premium = futures_client.premium_index(symbol)
+            funding = float(premium.get("lastFundingRate", 0.0))
+            vs = realized_vol_score(df)
+            direction = "LONG" if probs["BUY"] >= probs["SELL"] else "SHORT"
+            score = candidate_score("FUTURES", probs, sp, vs, funding)
+            rows.append(
+                {
+                    "Symbol":symbol,
+                    "Market":"FUTURES",
+                    "Direction":direction,
+                    "BUY %":probs["BUY"],
+                    "WAIT %":probs["WAIT"],
+                    "SELL %":probs["SELL"],
+                    "AI Güven %":probs["CONFIDENCE"],
+                    "Belirsizlik %":probs["UNCERTAINTY"],
+                    "Spread bps":sp,
+                    "Funding %":funding*100,
+                    "Vol Score":vs,
+                    "Router Score":score,
+                }
+            )
+        except Exception as exc:
+            rows.append({"Symbol":symbol,"Market":"FUTURES","Error":str(exc)})
+
+    return rows
+
+# ============================================================
+# POSITION / SCALPING
+# ============================================================
+
+def position_key(market, symbol):
+    return f"{market}:{symbol}"
+
+
+def market_price(market, symbol, spot, futures):
+    client = spot if market == "SPOT" else futures
+    return float(client.ticker24(symbol)["lastPrice"])
+
+
+def pnl_percent(pos, current_price):
+    sign = 1.0 if pos["direction"] == "LONG" else -1.0
+    price_move = sign * (current_price-pos["entry"])/pos["entry"]*100
+    return price_move * float(pos.get("leverage", 1))
+
+
+def estimated_pnl_usdt(pos, current_price):
+    roe = pnl_percent(pos, current_price)/100
+    return float(pos["margin_usdt"]) * roe
+
+
+def add_paper_position(
+    market,
+    symbol,
+    direction,
+    margin_usdt,
+    entry,
+    leverage,
+    tp_pct,
+):
+    key = position_key(market, symbol)
+    if key in st.session_state.positions:
+        raise RuntimeError("Bu market/symbol için zaten açık takip pozisyonu var.")
+
+    notional = margin_usdt * leverage
+    qty = notional / entry
+
+    st.session_state.positions[key] = {
+        "market":market,
+        "symbol":symbol,
+        "direction":direction,
+        "margin_usdt":float(margin_usdt),
+        "entry":float(entry),
+        "qty":float(qty),
+        "leverage":int(leverage),
+        "tp_pct":float(tp_pct),
+        "mode":"PAPER",
+        "opened_at":str(datetime.now()),
     }
 
-    st.session_state[
-        "paper_balance"
-    ] -= usdt
 
-    st.session_state[
-        "trade_log"
-    ].append(
-        {
-            "time": str(
-                datetime.now()
-            ),
-            "mode": "PAPER",
-            "side": "BUY",
-            "symbol": symbol,
-            "price": price,
-            "quote": usdt,
-        }
-    )
-
-
-def paper_sell_all(
-    symbol: str,
-    price: float,
+def open_live_position(
+    market,
+    symbol,
+    direction,
+    margin_usdt,
+    price,
+    leverage,
+    tp_pct,
+    spot,
+    futures,
 ):
-    pos = (
-        st.session_state
-        .paper_positions
-        .get(
-            symbol
-        )
-    )
+    key = position_key(market, symbol)
+    if key in st.session_state.positions:
+        raise RuntimeError("Bu market/symbol zaten takip ediliyor.")
 
-    if not pos:
-        raise RuntimeError(
-            "Paper pozisyon yok."
-        )
+    if market == "SPOT":
+        if direction != "LONG":
+            raise RuntimeError("Spot modunda SHORT açılmaz.")
 
-    quote = (
-        pos["qty"]
-        *
-        price
-    )
+        result = spot.market_buy_quote(symbol, margin_usdt)
+        executed_qty = float(result.get("executedQty", 0) or 0)
+        quote_qty = float(result.get("cummulativeQuoteQty", 0) or 0)
+        entry = quote_qty/executed_qty if executed_qty > 0 and quote_qty > 0 else price
 
-    pnl = (
-        price
-        -
-        pos["avg"]
-    ) * pos["qty"]
+        st.session_state.positions[key] = {
+            "market":"SPOT",
+            "symbol":symbol,
+            "direction":"LONG",
+            "margin_usdt":float(margin_usdt),
+            "entry":float(entry),
+            "qty":float(executed_qty),
+            "leverage":1,
+            "tp_pct":float(tp_pct),
+            "mode":"LIVE",
+            "opened_at":str(datetime.now()),
+        }
+        return result
 
-    st.session_state[
-        "paper_balance"
-    ] += quote
+    futures.set_leverage(symbol, leverage)
+    qty = (margin_usdt*leverage)/price
+    q = futures.normalize_qty(symbol, qty)
+    result = futures.market_open(symbol, direction, q)
 
-    st.session_state[
-        "trade_log"
-    ].append(
+    st.session_state.positions[key] = {
+        "market":"FUTURES",
+        "symbol":symbol,
+        "direction":direction,
+        "margin_usdt":float(margin_usdt),
+        "entry":float(price),
+        "qty":float(q),
+        "leverage":int(leverage),
+        "tp_pct":float(tp_pct),
+        "mode":"LIVE",
+        "opened_at":str(datetime.now()),
+    }
+    return result
+
+
+def close_position(key, current, spot, futures):
+    pos = st.session_state.positions[key]
+
+    if pos["mode"] == "LIVE":
+        if pos["market"] == "SPOT":
+            result = spot.market_sell_qty(pos["symbol"], pos["qty"])
+        else:
+            result = futures.market_close(
+                pos["symbol"], pos["direction"], pos["qty"]
+            )
+    else:
+        result = {"paper": True}
+
+    pnl_pct_value = pnl_percent(pos, current)
+    pnl_usdt_value = estimated_pnl_usdt(pos, current)
+
+    if pos["mode"] == "PAPER":
+        st.session_state.paper_balance += pnl_usdt_value
+
+    st.session_state.trade_log.append(
         {
-            "time": str(
-                datetime.now()
-            ),
-            "mode": "PAPER",
-            "side": "SELL",
-            "symbol": symbol,
-            "price": price,
-            "quote": quote,
-            "pnl": pnl,
+            "time":str(datetime.now()),
+            "action":"CLOSE_TP",
+            "market":pos["market"],
+            "symbol":pos["symbol"],
+            "direction":pos["direction"],
+            "entry":pos["entry"],
+            "exit":current,
+            "pnl_pct":pnl_pct_value,
+            "pnl_usdt_est":pnl_usdt_value,
+            "mode":pos["mode"],
+            "result":str(result),
         }
     )
 
-    del st.session_state[
-        "paper_positions"
-    ][symbol]
+    del st.session_state.positions[key]
+    return result
+
+
+def monitor_take_profit(spot, futures):
+    events = []
+    for key in list(st.session_state.positions.keys()):
+        pos = st.session_state.positions.get(key)
+        if not pos:
+            continue
+        try:
+            current = market_price(pos["market"], pos["symbol"], spot, futures)
+            roe = pnl_percent(pos, current)
+            if roe >= float(pos["tp_pct"]):
+                result = close_position(key, current, spot, futures)
+                events.append(
+                    f"{pos['market']} {pos['symbol']} {pos['direction']} "
+                    f"TP kapandı: %{roe:.3f}"
+                )
+        except Exception as exc:
+            events.append(f"{key} monitor error: {exc}")
+    return events
 
 # ============================================================
 # SIDEBAR
 # ============================================================
 
 with st.sidebar:
-    st.header(
-        "🔐 Binance API"
-    )
+    st.header("🔐 Binance API")
 
     api_key = st.text_input(
         "API Key",
-        value=st.session_state[
-            "api_key"
-        ],
+        value=st.session_state.api_key,
         type="password",
     )
-
     api_secret = st.text_input(
         "Secret Key",
-        value=st.session_state[
-            "api_secret"
-        ],
+        value=st.session_state.api_secret,
         type="password",
     )
 
-    c1, c2 = st.columns(
-        2
-    )
+    if st.button("🔌 API Bağlantısını Test Et", use_container_width=True):
+        diag = {}
+        try:
+            spot_test = SpotClient(api_key, api_secret)
+            account = spot_test.account()
+            perms = spot_test.restrictions()
 
-    with c1:
-        if st.button(
-            "Bağlan",
-            use_container_width=True,
-        ):
+            st.session_state.api_key = api_key
+            st.session_state.api_secret = api_secret
+            st.session_state.account = account
+            st.session_state.api_permissions = perms
+            st.session_state.spot_allowed = bool(
+                perms.get("enableSpotAndMarginTrading", False)
+            )
+            st.session_state.futures_allowed = bool(
+                perms.get("enableFutures", False)
+            )
+            st.session_state.api_ok = True
+
+            diag["spot_endpoint"] = spot_test.base
+            diag["spot_signed"] = "OK"
+            diag["spot_trade_permission"] = st.session_state.spot_allowed
+            diag["futures_permission"] = st.session_state.futures_allowed
+
             try:
-                test_client = (
-                    BinanceSpotClient(
-                        api_key,
-                        api_secret,
-                    )
-                )
-
-                account = (
-                    test_client.account()
-                )
-
-                try:
-                    permissions = (
-                        test_client.api_restrictions()
-                    )
-                except Exception:
-                    permissions = {}
-
-                live_allowed = bool(
-                    permissions.get(
-                        "enableSpotAndMarginTrading",
-                        False,
-                    )
-                )
-
-                st.session_state[
-                    "api_key"
-                ] = api_key
-
-                st.session_state[
-                    "api_secret"
-                ] = api_secret
-
-                st.session_state[
-                    "account"
-                ] = account
-
-                st.session_state[
-                    "api_permissions"
-                ] = permissions
-
-                st.session_state[
-                    "live_trade_allowed"
-                ] = live_allowed
-
-                st.session_state[
-                    "api_ok"
-                ] = True
-
-                if live_allowed:
-                    st.success(
-                        "Binance API bağlandı. Spot işlem izni açık."
-                    )
-                else:
-                    st.warning(
-                        "API bağlandı fakat Spot & Margin Trading izni kapalı. "
-                        "Paper Mode çalışır; Live emirler engellendi."
-                    )
-
+                FuturesClient(api_key, api_secret).server_time()
+                diag["futures_public"] = "OK"
             except Exception as exc:
-                st.session_state[
-                    "api_ok"
-                ] = False
+                diag["futures_public"] = str(exc)
 
-                st.error(
-                    str(exc)
-                )
+            st.session_state.last_network_diag = diag
+            st.success("API imzalı bağlantı başarılı.")
 
-    with c2:
-        if st.button(
-            "Temizle",
-            use_container_width=True,
-        ):
-            st.session_state[
-                "api_key"
-            ] = ""
+        except Binance451Error as exc:
+            st.session_state.api_ok = False
+            st.session_state.last_network_diag = {"451": str(exc)}
+            st.error(str(exc))
+        except Exception as exc:
+            st.session_state.api_ok = False
+            st.session_state.last_network_diag = {"error": str(exc)}
+            st.error(str(exc))
 
-            st.session_state[
-                "api_secret"
-            ] = ""
-
-            st.session_state[
-                "api_ok"
-            ] = False
-
-            st.session_state[
-                "account"
-            ] = None
-
-            st.session_state[
-                "api_permissions"
-            ] = None
-
-            st.session_state[
-                "live_trade_allowed"
-            ] = False
-
-            st.rerun()
+    if st.button("Anahtarları Temizle", use_container_width=True):
+        for k in [
+            "api_key","api_secret","account","api_permissions"
+        ]:
+            st.session_state[k] = "" if k in ["api_key","api_secret"] else None
+        st.session_state.api_ok = False
+        st.session_state.spot_allowed = False
+        st.session_state.futures_allowed = False
+        st.rerun()
 
     st.divider()
+    st.header("⚡ Scalping")
 
-    st.header(
-        "⚙️ Trading"
-    )
-
-    mode = st.radio(
-        "İşlem modu",
-        [
-            "Paper",
-            "Live",
-        ],
+    execution_mode = st.radio(
+        "Emir modu",
+        ["Paper", "Live"],
         index=0,
     )
 
     live_confirm = False
-
-    if mode == "Live":
-        st.warning(
-            "Live mod gerçek Spot emir gönderir."
+    if execution_mode == "Live":
+        live_confirm = st.checkbox(
+            "Gerçek Spot/Futures emirlerini aç",
+            value=False,
         )
 
-        if not st.session_state.get(
-            "live_trade_allowed",
-            False,
-        ):
-            st.error(
-                "Bu API anahtarında Spot & Margin Trading izni açık değil. "
-                "Binance API Management bölümünde güvenilir IPv4 tanımlayıp "
-                "Enable Spot & Margin Trading seçeneğini etkinleştir."
-            )
-
-        live_confirm = (
-            st.checkbox(
-                "Gerçek emirleri etkinleştir",
-                disabled=not st.session_state.get(
-                    "live_trade_allowed",
-                    False,
-                ),
-            )
-        )
-
-    symbols_text = (
-        st.text_area(
-            "USDT pariteleri",
-            "BTCUSDT\nETHUSDT\nBNBUSDT\nSOLUSDT\nXRPUSDT",
-            height=120,
-        )
+    symbols_text = st.text_area(
+        "Pariteler",
+        "BTCUSDT\nETHUSDT\nBNBUSDT\nSOLUSDT\nXRPUSDT",
+        height=115,
     )
-
-    symbols = [
-        item.strip().upper()
-        for item
-        in symbols_text.splitlines()
-        if item.strip()
-    ]
+    symbols = [x.strip().upper() for x in symbols_text.splitlines() if x.strip()]
 
     interval = st.selectbox(
-        "Timeframe",
-        [
-            "1m",
-            "3m",
-            "5m",
-            "15m",
-            "30m",
-            "1h",
-        ],
-        index=2,
+        "Scalping timeframe",
+        ["1m","3m","5m","15m"],
+        index=0,
     )
 
-    model_dir = st.text_input(
-        "Model klasörü",
-        DEFAULT_MODEL_DIR,
+    margin_usdt = st.number_input(
+        "İşlem başına USDT",
+        min_value=5.0,
+        value=20.0,
+        step=5.0,
     )
 
-    order_usdt = (
-        st.number_input(
-            "İşlem başına USDT",
-            min_value=5.0,
-            value=20.0,
-            step=5.0,
-        )
+    tp_pct = st.number_input(
+        "Kârda kapat (%)",
+        min_value=0.05,
+        max_value=20.0,
+        value=0.50,
+        step=0.05,
+        format="%.2f",
+        help="Futures'ta bu değer yaklaşık ROE hedefidir (fiyat hareketi × kaldıraç).",
     )
 
-    buy_threshold = (
-        st.slider(
-            "BUY güven eşiği %",
-            50,
-            99,
-            75,
-        )
+    leverage = st.slider(
+        "Futures kaldıraç",
+        min_value=1,
+        max_value=10,
+        value=2,
     )
 
-    sell_threshold = (
-        st.slider(
-            "SELL güven eşiği %",
-            50,
-            99,
-            75,
-        )
+    min_router_score = st.slider(
+        "Minimum Auto-Market skor",
+        0.0,
+        100.0,
+        35.0,
+        1.0,
     )
 
-    max_positions = (
-        st.slider(
-            "Maks. açık Paper pozisyon",
-            1,
-            20,
-            5,
-        )
+    mc_samples = st.slider(
+        "AI belirsizlik örneklemesi",
+        2,
+        16,
+        8,
     )
 
-client = BinanceSpotClient(
-    st.session_state[
-        "api_key"
-    ],
-    st.session_state[
-        "api_secret"
-    ],
-)
+    base_model_dir = st.text_input(
+        "Model ana klasörü",
+        "models",
+    )
+
+spot = SpotClient(st.session_state.api_key, st.session_state.api_secret)
+futures = FuturesClient(st.session_state.api_key, st.session_state.api_secret)
 
 # ============================================================
 # HEADER
@@ -2999,11 +1529,11 @@ client = BinanceSpotClient(
 st.markdown(
     """
     <div class="hero">
-        <h1>Binance Spot Deep AI 200</h1>
-        <p>
-        200 feature • Residual CNN • BiLSTM • BiGRU •
-        Transformer • Multi-Head Attention • Paper / Live
-        </p>
+      <h1>Binance Auto-Market Deep AI Scalper</h1>
+      <p>
+      Spot + USDⓈ-M Futures • 200 özellik • TCN + BiLSTM + BiGRU +
+      Transformer + Attention + uncertainty • yüzde kârda otomatik kapanış
+      </p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -3011,1075 +1541,390 @@ st.markdown(
 
 if not TORCH_OK:
     st.error(
-        "PyTorch (torch) kurulu değil. "
-        "Streamlit Cloud kullanıyorsan repo köküne "
-        "`requirements.txt` ekleyip içine `torch` yaz."
+        f"PyTorch kurulamadı: {TORCH_ERROR}. Repo kökünde requirements.txt içine `torch` ekle."
     )
 
-    st.code(
-        "streamlit\n"
-        "pandas\n"
-        "numpy\n"
-        "requests\n"
-        "torch\n",
-        language="text",
-    )
-
-m1, m2, m3, m4 = st.columns(
-    4
-)
-
-m1.metric(
-    "API",
-    (
-        "Bağlı"
-        if st.session_state[
-            "api_ok"
-        ]
-        else "Bağlı değil"
-    ),
-)
-
-m2.metric(
-    "AI Feature",
-    FEATURE_COUNT,
-)
-
-m3.metric(
-    "Paper bakiye",
-    f"{st.session_state['paper_balance']:.2f} USDT",
-)
-
-m4.metric(
-    "Açık Paper pozisyon",
-    len(
-        st.session_state[
-            "paper_positions"
-        ]
-    ),
-)
-
 # ============================================================
-# ACCOUNT
+# KPI / PERMISSIONS
 # ============================================================
 
-if (
-    st.session_state[
-        "api_ok"
-    ]
-    and
-    st.session_state[
-        "account"
-    ]
-):
-    with st.expander(
-        "💳 Binance Hesabı"
-    ):
-        balances = []
-
-        for balance in (
-            st.session_state[
-                "account"
-            ]
-            .get(
-                "balances",
-                [],
-            )
-        ):
-            free = float(
-                balance[
-                    "free"
-                ]
-            )
-
-            locked = float(
-                balance[
-                    "locked"
-                ]
-            )
-
-            if (
-                free > 0
-                or
-                locked > 0
-            ):
-                balances.append(
-                    {
-                        "Asset":
-                        balance[
-                            "asset"
-                        ],
-                        "Free":
-                        free,
-                        "Locked":
-                        locked,
-                        "Total":
-                        free + locked,
-                    }
-                )
-
-        if balances:
-            st.dataframe(
-                pd.DataFrame(
-                    balances
-                ),
-                use_container_width=True,
-                hide_index=True,
-            )
-        else:
-            st.info(
-                "Gösterilecek bakiye yok."
-            )
-
-
-# ============================================================
-# API PERMISSION DIAGNOSTICS
-# ============================================================
-
-if st.session_state.get("api_ok"):
-    with st.expander(
-        "🔎 API İzin Teşhisi",
-        expanded=True,
-    ):
-        permissions = (
-            st.session_state.get(
-                "api_permissions"
-            )
-            or {}
-        )
-
-        p1, p2, p3 = st.columns(3)
-
-        p1.metric(
-            "Reading",
-            "Açık"
-            if permissions.get(
-                "enableReading",
-                True,
-            )
-            else "Kapalı",
-        )
-
-        p2.metric(
-            "Spot Trading",
-            "Açık"
-            if permissions.get(
-                "enableSpotAndMarginTrading",
-                False,
-            )
-            else "Kapalı",
-        )
-
-        p3.metric(
-            "IP Restriction",
-            "Açık"
-            if permissions.get(
-                "ipRestrict",
-                False,
-            )
-            else "Kapalı",
-        )
-
-        if not permissions.get(
-            "enableSpotAndMarginTrading",
-            False,
-        ):
-            st.warning(
-                "Live trading izni kapalı. Binance tarafında "
-                "Enable Spot & Margin Trading etkin değil."
-            )
-
-        if not permissions.get(
-            "ipRestrict",
-            False,
-        ):
-            st.info(
-                "Binance, sistem üretimli API anahtarlarında işlem izni için "
-                "güvenilir IPv4 kısıtı isteyebilir. Live botu sabit IP'li "
-                "bir VPS/PC üzerinde çalıştırmak en sorunsuz yöntemdir."
-            )
+k1,k2,k3,k4,k5 = st.columns(5)
+k1.metric("API", "Bağlı" if st.session_state.api_ok else "Bağlı değil")
+k2.metric("Spot izin", "Açık" if st.session_state.spot_allowed else "Kapalı")
+k3.metric("Futures izin", "Açık" if st.session_state.futures_allowed else "Kapalı")
+k4.metric("Paper bakiye", f"{st.session_state.paper_balance:.2f} USDT")
+k5.metric("Takip pozisyon", len(st.session_state.positions))
 
 # ============================================================
 # TABS
 # ============================================================
 
-(
-    tab_scan,
-    tab_order,
-    tab_train,
-    tab_model,
-    tab_positions,
-    tab_logs,
-    tab_security,
-) = st.tabs(
+tab_auto, tab_scalp, tab_train, tab_positions, tab_model, tab_diag = st.tabs(
     [
-        "📊 AI Tarayıcı",
-        "💸 Emir",
+        "🤖 Otomatik Spot/Futures",
+        "⚡ Scalper",
         "🏋 Eğitim",
-        "🧠 Model",
         "💼 Pozisyonlar",
-        "🧾 Loglar",
-        "🔐 Güvenlik",
+        "🧠 Model",
+        "🔎 API/451",
     ]
 )
 
 # ============================================================
-# SCANNER
+# AUTO ROUTER
 # ============================================================
 
-with tab_scan:
-    st.subheader(
-        "Deep Learning Coin Tarayıcı"
-    )
+with tab_auto:
+    st.subheader("AI hangi piyasayı kullanacağına kendisi karar versin")
 
-    if not TORCH_OK:
-        st.warning(
-            "Tarayıcı için torch kurulmalı."
+    paper_router_spot = True if execution_mode == "Paper" else st.session_state.spot_allowed
+    paper_router_fut = True if execution_mode == "Paper" else st.session_state.futures_allowed
+
+    if st.button("🧠 Spot + Futures Tara", type="primary", disabled=not TORCH_OK):
+        all_rows = []
+        for symbol in symbols[:15]:
+            try:
+                all_rows.extend(
+                    scan_one_symbol(
+                        symbol=symbol,
+                        interval=interval,
+                        base_dir=base_model_dir,
+                        spot_client=spot,
+                        futures_client=futures,
+                        allow_spot=paper_router_spot,
+                        allow_futures=paper_router_fut,
+                        mc_samples=mc_samples,
+                    )
+                )
+            except Binance451Error as exc:
+                st.error(str(exc))
+                break
+            except Exception as exc:
+                all_rows.append({"Symbol":symbol, "Market":"?", "Error":str(exc)})
+
+        st.session_state.scan_rows = all_rows
+
+    valid = [
+        r for r in st.session_state.scan_rows
+        if "Router Score" in r and r.get("Direction") not in [None, "NONE"]
+    ]
+
+    if st.session_state.scan_rows:
+        df_scan = pd.DataFrame(st.session_state.scan_rows)
+        if "Router Score" in df_scan.columns:
+            df_scan = df_scan.sort_values("Router Score", ascending=False)
+        st.dataframe(df_scan, use_container_width=True, hide_index=True)
+
+    if valid:
+        best = sorted(valid, key=lambda x: x["Router Score"], reverse=True)[0]
+
+        st.success(
+            f"En yüksek router skoru: {best['Market']} / {best['Symbol']} / "
+            f"{best['Direction']} — skor {best['Router Score']:.2f}"
         )
 
-    elif not Path(
-        model_dir,
-        "model.pt",
-    ).exists():
-        st.warning(
-            "Model henüz eğitilmedi. "
-            "Önce Eğitim sekmesine git."
-        )
+        b1,b2,b3,b4 = st.columns(4)
+        b1.metric("Market", best["Market"])
+        b2.metric("Direction", best["Direction"])
+        b3.metric("AI Güven", f"%{best['AI Güven %']:.1f}")
+        b4.metric("Spread", f"{best['Spread bps']:.2f} bps")
 
-    if st.button(
-        "🧠 AI Taramayı Başlat",
-        type="primary",
-        disabled=(
-            not TORCH_OK
-        ),
-    ):
-        scan_rows = []
+        can_open = best["Router Score"] >= min_router_score
 
-        for symbol in (
-            symbols[:20]
+        if not can_open:
+            st.warning(
+                f"Skor {min_router_score:.1f} eşiğinin altında; bot işlem açmıyor."
+            )
+
+        if st.button(
+            "🚀 AI Seçimini Aç",
+            disabled=not can_open,
+            type="primary",
         ):
             try:
-                probs, _ = (
-                    predict_symbol(
-                        client,
-                        symbol,
-                        interval,
-                        model_dir,
+                if execution_mode == "Live":
+                    if not st.session_state.api_ok or not live_confirm:
+                        raise RuntimeError("Live API bağlantısı ve onayı gerekli.")
+                    if best["Market"] == "SPOT" and not st.session_state.spot_allowed:
+                        raise RuntimeError("API anahtarında Spot işlem izni yok.")
+                    if best["Market"] == "FUTURES" and not st.session_state.futures_allowed:
+                        raise RuntimeError("API anahtarında Futures izni yok.")
+
+                price = market_price(best["Market"], best["Symbol"], spot, futures)
+                lev = 1 if best["Market"] == "SPOT" else leverage
+
+                if execution_mode == "Paper":
+                    add_paper_position(
+                        best["Market"], best["Symbol"], best["Direction"],
+                        margin_usdt, price, lev, tp_pct
                     )
-                )
-
-                ticker = (
-                    client.ticker24(
-                        symbol
-                    )
-                )
-
-                buy = probs[
-                    "BUY"
-                ]
-
-                sell = probs[
-                    "SELL"
-                ]
-
-                wait = probs[
-                    "WAIT"
-                ]
-
-                ai_confidence = probs.get(
-                    "MODEL_CONFIDENCE",
-                    0.0,
-                )
-
-                if (
-                    buy
-                    >=
-                    buy_threshold
-                    and
-                    buy > sell
-                    and
-                    ai_confidence >= 25.0
-                ):
-                    signal = "BUY"
-
-                elif (
-                    sell
-                    >=
-                    sell_threshold
-                    and
-                    sell > buy
-                    and
-                    ai_confidence >= 25.0
-                ):
-                    signal = "SELL"
-
+                    st.session_state.paper_balance -= margin_usdt
+                    result = {"paper":True}
                 else:
-                    signal = "WAIT"
+                    result = open_live_position(
+                        best["Market"], best["Symbol"], best["Direction"],
+                        margin_usdt, price, lev, tp_pct, spot, futures
+                    )
 
-                scan_rows.append(
+                st.session_state.trade_log.append(
                     {
-                        "Symbol":
-                        symbol,
-                        "Price":
-                        float(
-                            ticker[
-                                "lastPrice"
-                            ]
-                        ),
-                        "24h %":
-                        float(
-                            ticker[
-                                "priceChangePercent"
-                            ]
-                        ),
-                        "BUY %":
-                        round(
-                            buy,
-                            2,
-                        ),
-                        "WAIT %":
-                        round(
-                            wait,
-                            2,
-                        ),
-                        "SELL %":
-                        round(
-                            sell,
-                            2,
-                        ),
-                        "AI Güven %":
-                        round(
-                            probs.get(
-                                "MODEL_CONFIDENCE",
-                                0.0,
-                            ),
-                            2,
-                        ),
-                        "Belirsizlik %":
-                        round(
-                            probs.get(
-                                "UNCERTAINTY",
-                                100.0,
-                            ),
-                            2,
-                        ),
-                        "Signal":
-                        signal,
+                        "time":str(datetime.now()),
+                        "action":"OPEN",
+                        "market":best["Market"],
+                        "symbol":best["Symbol"],
+                        "direction":best["Direction"],
+                        "entry":price,
+                        "margin_usdt":margin_usdt,
+                        "leverage":lev,
+                        "tp_pct":tp_pct,
+                        "router_score":best["Router Score"],
+                        "mode":execution_mode.upper(),
+                        "result":str(result),
                     }
                 )
-
+                st.success("Pozisyon açıldı ve yüzde-kâr TP monitörüne eklendi.")
             except Exception as exc:
-                st.warning(
-                    f"{symbol}: "
-                    f"{exc}"
-                )
-
-        st.session_state[
-            "last_scan"
-        ] = scan_rows
-
-    if st.session_state[
-        "last_scan"
-    ]:
-        scan_df = (
-            pd.DataFrame(
-                st.session_state[
-                    "last_scan"
-                ]
-            )
-            .sort_values(
-                "BUY %",
-                ascending=False,
-            )
-        )
-
-        st.dataframe(
-            scan_df,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        st.bar_chart(
-            scan_df
-            .set_index(
-                "Symbol"
-            )[
-                [
-                    "BUY %",
-                    "WAIT %",
-                    "SELL %",
-                ]
-            ]
-        )
+                st.error(str(exc))
 
 # ============================================================
-# ORDER PANEL
+# SCALPER MONITOR
 # ============================================================
 
-with tab_order:
-    st.subheader(
-        "Manuel + AI Destekli Emir"
+with tab_scalp:
+    st.subheader("Yüzde kâra geldiğinde kapat")
+
+    st.write(
+        f"Aktif hedef: **%{tp_pct:.2f}**. "
+        "Paper pozisyonlar ve bu panel üzerinden açılan Live pozisyonlar takip edilir."
     )
 
-    if not symbols:
-        st.info(
-            "Parite gir."
-        )
-    else:
-        selected_symbol = (
-            st.selectbox(
-                "Parite",
-                symbols,
-                key="trade_symbol",
-            )
-        )
+    if st.button("🔄 TP'leri Şimdi Kontrol Et", use_container_width=True):
+        events = monitor_take_profit(spot, futures)
+        if events:
+            for event in events:
+                st.info(event)
+        else:
+            st.success("Kontrol edildi; kapanan pozisyon yok.")
 
-        amount = (
-            st.number_input(
-                "USDT miktarı",
-                min_value=5.0,
-                value=float(
-                    order_usdt
-                ),
-                step=5.0,
-            )
-        )
+    live_auto_tp = st.checkbox(
+        "Panel açıkken her 3 saniyede otomatik TP kontrolü",
+        value=False,
+        help="Bu bir arka plan servisi değildir; Streamlit oturumu aktifken çalışır.",
+    )
 
-        try:
-            ticker = (
-                client.ticker24(
-                    selected_symbol
-                )
-            )
-
-            price = float(
-                ticker[
-                    "lastPrice"
-                ]
-            )
-
-            st.metric(
-                "Anlık fiyat",
-                f"{price:.8f}",
-            )
-
-        except Exception as exc:
-            price = None
-
-            st.error(
-                str(exc)
-            )
-
-        if (
-            TORCH_OK
-            and
-            Path(
-                model_dir,
-                "model.pt",
-            ).exists()
-        ):
-            try:
-                probs, _ = (
-                    predict_symbol(
-                        client,
-                        selected_symbol,
-                        interval,
-                        model_dir,
-                    )
-                )
-
-                a, b, c = st.columns(
-                    3
-                )
-
-                a.metric(
-                    "BUY",
-                    f"%{probs['BUY']:.2f}",
-                )
-
-                b.metric(
-                    "WAIT",
-                    f"%{probs['WAIT']:.2f}",
-                )
-
-                c.metric(
-                    "SELL",
-                    f"%{probs['SELL']:.2f}",
-                )
-
-                d, e = st.columns(2)
-                d.metric(
-                    "AI Güven",
-                    f"%{probs.get('MODEL_CONFIDENCE', 0.0):.2f}",
-                )
-                e.metric(
-                    "Belirsizlik",
-                    f"%{probs.get('UNCERTAINTY', 100.0):.2f}",
-                )
-
-            except Exception as exc:
-                st.warning(
-                    str(exc)
-                )
-
-        left, right = st.columns(
-            2
-        )
-
-        with left:
-            if st.button(
-                "🟢 BUY",
-                use_container_width=True,
-            ):
-                try:
-                    if price is None:
-                        raise RuntimeError(
-                            "Fiyat alınamadı."
-                        )
-
-                    if mode == "Paper":
-                        if (
-                            len(
-                                st.session_state[
-                                    "paper_positions"
-                                ]
-                            )
-                            >=
-                            max_positions
-                            and
-                            selected_symbol
-                            not in
-                            st.session_state[
-                                "paper_positions"
-                            ]
-                        ):
-                            raise RuntimeError(
-                                "Maksimum açık "
-                                "Paper pozisyon sayısına ulaşıldı."
-                            )
-
-                        paper_buy(
-                            selected_symbol,
-                            amount,
-                            price,
-                        )
-
-                    else:
-                        if not st.session_state[
-                            "api_ok"
-                        ]:
-                            raise RuntimeError(
-                                "API bağlantısı yok."
-                            )
-
-                        if not st.session_state.get(
-                            "live_trade_allowed",
-                            False,
-                        ):
-                            raise RuntimeError(
-                                "API anahtarında Spot & Margin Trading izni yok."
-                            )
-
-                        if not live_confirm:
-                            raise RuntimeError(
-                                "Live işlem onayı yok."
-                            )
-
-                        result = (
-                            client
-                            .market_buy_quote(
-                                selected_symbol,
-                                amount,
-                            )
-                        )
-
-                        st.session_state[
-                            "trade_log"
-                        ].append(
-                            {
-                                "time":
-                                str(
-                                    datetime.now()
-                                ),
-                                "mode":
-                                "LIVE",
-                                "side":
-                                "BUY",
-                                "symbol":
-                                selected_symbol,
-                                "result":
-                                str(
-                                    result
-                                ),
-                            }
-                        )
-
-                    st.success(
-                        "BUY işlendi."
-                    )
-
-                except Exception as exc:
-                    st.error(
-                        str(exc)
-                    )
-
-        with right:
-            sell_qty = (
-                st.number_input(
-                    "Live SELL coin miktarı",
-                    min_value=0.0,
-                    value=0.0,
-                    format="%.8f",
-                )
-            )
-
-            if st.button(
-                "🔴 SELL",
-                use_container_width=True,
-            ):
-                try:
-                    if price is None:
-                        raise RuntimeError(
-                            "Fiyat alınamadı."
-                        )
-
-                    if mode == "Paper":
-                        paper_sell_all(
-                            selected_symbol,
-                            price,
-                        )
-
-                    else:
-                        if not st.session_state[
-                            "api_ok"
-                        ]:
-                            raise RuntimeError(
-                                "API bağlantısı yok."
-                            )
-
-                        if not live_confirm:
-                            raise RuntimeError(
-                                "Live işlem onayı yok."
-                            )
-
-                        if (
-                            sell_qty
-                            <=
-                            0
-                        ):
-                            raise RuntimeError(
-                                "SELL miktarı "
-                                "0'dan büyük olmalı."
-                            )
-
-                        result = (
-                            client
-                            .market_sell_qty(
-                                selected_symbol,
-                                sell_qty,
-                            )
-                        )
-
-                        st.session_state[
-                            "trade_log"
-                        ].append(
-                            {
-                                "time":
-                                str(
-                                    datetime.now()
-                                ),
-                                "mode":
-                                "LIVE",
-                                "side":
-                                "SELL",
-                                "symbol":
-                                selected_symbol,
-                                "result":
-                                str(
-                                    result
-                                ),
-                            }
-                        )
-
-                    st.success(
-                        "SELL işlendi."
-                    )
-
-                except Exception as exc:
-                    st.error(
-                        str(exc)
-                    )
+    if live_auto_tp and hasattr(st, "fragment"):
+        @st.fragment(run_every="3s")
+        def auto_tp_fragment():
+            events = monitor_take_profit(spot, futures)
+            if events:
+                for event in events:
+                    st.write(event)
+            st.caption(f"Son TP kontrolü: {datetime.now().strftime('%H:%M:%S')}")
+        auto_tp_fragment()
 
 # ============================================================
-# TRAINING TAB
+# TRAINING
 # ============================================================
 
 with tab_train:
-    st.subheader(
-        "Model Eğitimi"
+    st.subheader("Spot ve Futures modellerini ayrı eğit")
+
+    market_train = st.radio(
+        "Eğitilecek piyasa",
+        ["SPOT","FUTURES"],
+        horizontal=True,
     )
+    train_symbol = st.text_input("Eğitim symbol", "BTCUSDT")
+    t1,t2,t3 = st.columns(3)
 
-    if not TORCH_OK:
-        st.error(
-            "PyTorch kurulmadan eğitim yapılamaz."
-        )
-
-    train_symbol = (
-        st.text_input(
-            "Eğitim paritesi",
-            "BTCUSDT",
-        )
-    )
-
-    tc1, tc2, tc3 = (
-        st.columns(
-            3
-        )
-    )
-
-    with tc1:
-        train_interval = (
-            st.selectbox(
-                "Eğitim timeframe",
-                [
-                    "1m",
-                    "3m",
-                    "5m",
-                    "15m",
-                    "30m",
-                    "1h",
-                ],
-                index=2,
-                key="train_interval",
-            )
-        )
-
-        train_bars = (
-            st.number_input(
-                "Geçmiş mum sayısı",
-                min_value=3000,
-                max_value=100000,
-                value=10000,
-                step=1000,
-            )
-        )
-
-    with tc2:
-        seq_len = (
-            st.number_input(
-                "Sequence uzunluğu",
-                min_value=32,
-                max_value=256,
-                value=96,
-                step=16,
-            )
-        )
-
-        horizon = (
-            st.number_input(
-                "Tahmin horizon",
-                min_value=1,
-                max_value=24,
-                value=3,
-            )
-        )
-
-    with tc3:
-        threshold = (
-            st.number_input(
-                "Label threshold",
-                min_value=0.0005,
-                max_value=0.05,
-                value=0.0025,
-                step=0.0005,
-                format="%.4f",
-            )
-        )
-
-        epochs = (
-            st.number_input(
-                "Epoch",
-                min_value=1,
-                max_value=50,
-                value=8,
-            )
-        )
-
-    batch_size = (
-        st.selectbox(
-            "Batch size",
-            [
-                32,
-                64,
-                128,
-                256,
-            ],
+    with t1:
+        train_interval = st.selectbox(
+            "Eğitim timeframe",
+            ["1m","3m","5m","15m"],
             index=2,
+            key="train_tf",
         )
+        bars = st.number_input(
+            "Mum sayısı",
+            3000, 100000, 15000, 1000
+        )
+
+    with t2:
+        seq = st.number_input("Sequence", 32, 256, 96, 16)
+        horizon = st.number_input("Horizon (mum)", 1, 24, 3)
+
+    with t3:
+        threshold = st.number_input(
+            "Label threshold",
+            0.0005, 0.05, 0.0025, 0.0005,
+            format="%.4f"
+        )
+        epochs = st.number_input("Epoch", 1, 40, 8)
+
+    batch = st.selectbox("Batch", [32,64,128,256], index=2)
+    lr = st.number_input(
+        "Learning rate",
+        0.00001, 0.005, 0.0002, 0.00001,
+        format="%.5f",
     )
 
-    lr = (
-        st.number_input(
-            "Learning rate",
-            min_value=0.00001,
-            max_value=0.005,
-            value=0.0002,
-            step=0.00001,
-            format="%.5f",
-        )
-    )
-
-    if st.button(
-        "🏋 Modeli Eğit",
-        type="primary",
-        disabled=(
-            not TORCH_OK
-        ),
-    ):
+    if st.button("🏋 Modeli Eğit", disabled=not TORCH_OK, type="primary"):
         try:
-            with st.spinner(
-                "Model eğitiliyor..."
-            ):
+            with st.spinner("Model eğitiliyor..."):
                 result = train_model(
-                    symbol=train_symbol.upper(),
-                    interval=train_interval,
-                    bars=int(
-                        train_bars
-                    ),
-                    sequence_length=int(
-                        seq_len
-                    ),
-                    horizon=int(
-                        horizon
-                    ),
-                    threshold=float(
-                        threshold
-                    ),
-                    epochs=int(
-                        epochs
-                    ),
-                    batch_size=int(
-                        batch_size
-                    ),
-                    out_dir=model_dir,
-                    learning_rate=float(
-                        lr
-                    ),
+                    market_train,
+                    train_symbol.upper(),
+                    train_interval,
+                    int(bars),
+                    int(seq),
+                    int(horizon),
+                    float(threshold),
+                    int(epochs),
+                    int(batch),
+                    float(lr),
+                    base_model_dir,
                 )
-
-                clear_model_cache()
-
-            st.success(
-                "Model eğitildi."
-            )
-
-            st.json(
-                result
-            )
-
+                _MODEL_CACHE.clear()
+            st.success("Eğitim tamamlandı.")
+            st.json(result)
         except Exception as exc:
-            st.error(
-                str(exc)
-            )
+            st.error(str(exc))
 
-    if st.session_state[
-        "training_log"
-    ]:
+    if st.session_state.training_log:
         st.text_area(
             "Eğitim logu",
-            "\n".join(
-                st.session_state[
-                    "training_log"
-                ]
-            ),
+            "\n".join(st.session_state.training_log),
             height=300,
         )
-
-# ============================================================
-# MODEL TAB
-# ============================================================
-
-with tab_model:
-    st.subheader(
-        "Deep Learning Mimarisi"
-    )
-
-    st.code(
-        """
-200 Causal Market Features
-        ↓
-LayerNorm
-        ↓
-Dense 200 → 256 → 160
-        ↓
-Residual Temporal CNN
-kernel 3 / 5 / 7
-dilation 1 / 2 / 4
-        ↓
-2-Layer Bidirectional LSTM
-        ↓
-2-Layer Bidirectional GRU
-        ↓
-2-Layer Transformer Encoder
-        ↓
-8-Head Self Attention
-        ↓
-Gated Last / Mean / Max Pooling
-        ↓
-Dense 480 → 320 → 160 → 64
-        ↓
-SELL / WAIT / BUY
-        """,
-        language="text",
-    )
-
-    st.info(
-        "Bu sürüm yalnızca BUY/SELL olasılığına bakmaz; "
-        "tahmin dağılımının entropy değerinden belirsizlik ölçer ve "
-        "düşük güvenli sinyalleri WAIT'e düşürür. Modelin daha büyük "
-        "olması tek başına daha doğru tahmin anlamına gelmez; "
-        "kalite eğitim verisi, piyasa rejimleri, komisyon/slippage "
-        "ve walk-forward testten gelir."
-    )
 
 # ============================================================
 # POSITIONS
 # ============================================================
 
 with tab_positions:
-    st.subheader(
-        "Paper Pozisyonları"
-    )
+    st.subheader("Takip edilen pozisyonlar")
 
     rows = []
-
-    for (
-        symbol,
-        pos,
-    ) in (
-        st.session_state[
-            "paper_positions"
-        ].items()
-    ):
+    for key, pos in st.session_state.positions.items():
         try:
-            current = float(
-                client
-                .ticker24(
-                    symbol
-                )[
-                    "lastPrice"
-                ]
-            )
+            cur = market_price(pos["market"], pos["symbol"], spot, futures)
+            roe = pnl_percent(pos, cur)
+            est = estimated_pnl_usdt(pos, cur)
         except Exception:
-            current = None
-
-        pnl = (
-            (
-                current
-                -
-                pos["avg"]
-            )
-            *
-            pos["qty"]
-            if current is not None
-            else None
-        )
+            cur, roe, est = None, None, None
 
         rows.append(
             {
-                "Symbol":
-                symbol,
-                "Qty":
-                pos["qty"],
-                "Avg":
-                pos["avg"],
-                "Current":
-                current,
-                "PnL":
-                pnl,
+                "Key":key,
+                "Market":pos["market"],
+                "Symbol":pos["symbol"],
+                "Direction":pos["direction"],
+                "Mode":pos["mode"],
+                "Entry":pos["entry"],
+                "Current":cur,
+                "Leverage":pos["leverage"],
+                "TP %":pos["tp_pct"],
+                "PnL %":roe,
+                "PnL USDT est":est,
             }
         )
 
     if rows:
-        st.dataframe(
-            pd.DataFrame(
-                rows
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     else:
-        st.info(
-            "Açık Paper pozisyon yok."
-        )
+        st.info("Açık takip pozisyonu yok.")
 
-# ============================================================
-# LOGS
-# ============================================================
-
-with tab_logs:
-    st.subheader(
-        "İşlem Geçmişi"
-    )
-
-    if st.session_state[
-        "trade_log"
-    ]:
-        log_df = (
-            pd.DataFrame(
-                st.session_state[
-                    "trade_log"
-                ]
-            )
-        )
-
+    st.subheader("İşlem logu")
+    if st.session_state.trade_log:
         st.dataframe(
-            log_df.iloc[
-                ::-1
-            ],
+            pd.DataFrame(st.session_state.trade_log).iloc[::-1],
             use_container_width=True,
             hide_index=True,
         )
 
-        st.download_button(
-            "CSV indir",
-            log_df.to_csv(
-                index=False
-            ).encode(
-                "utf-8"
-            ),
-            file_name=(
-                "binance_ai_trades.csv"
-            ),
-            mime="text/csv",
-        )
-    else:
-        st.info(
-            "Henüz işlem logu yok."
-        )
-
 # ============================================================
-# SECURITY
+# MODEL INFO
 # ============================================================
 
-with tab_security:
-    st.subheader(
-        "API Güvenliği"
+with tab_model:
+    st.subheader("Derin öğrenme mimarisi")
+    st.code(
+        """
+200 causal features
+        ↓
+Feature Projection
+        ↓
+ ┌──────────────┬──────────────────┬───────────────────┐
+ │ TCN branch   │ BiLSTM + BiGRU   │ Transformer × 3   │
+ │ 3/5/7 kernel │ recurrent memory │ long-range context │
+ └──────────────┴──────────────────┴───────────────────┘
+        ↓
+Learned Branch Gating
+        ↓
+8-head Self Attention
+        ↓
+Learned Last / Mean / Max Pooling
+        ↓
+Dense classifier
+        ↓
+SELL / WAIT / BUY
+        ↓
+Monte-Carlo Dropout
+        ↓
+Prediction uncertainty + confidence
+        ↓
+Spot/Futures Router
+        """,
+        language="text",
     )
+    st.info(
+        "Bu yapı güçlüdür ama 'en hızlı kâr' veya garantili kâr diye bir model yoktur. "
+        "Router düşük güven, yüksek spread, yüksek funding veya aşırı belirsizlikte işlem puanını düşürür."
+    )
+
+# ============================================================
+# DIAGNOSTICS / 451
+# ============================================================
+
+with tab_diag:
+    st.subheader("API ve HTTP 451 teşhisi")
+
+    if st.session_state.last_network_diag:
+        st.json(st.session_state.last_network_diag)
+
+    if st.button("🌐 Sadece ağ erişimini test et"):
+        results = {}
+        try:
+            data, base = spot_public_request("/api/v3/time")
+            results["Spot public"] = f"OK — {base} — {data.get('serverTime')}"
+        except Exception as exc:
+            results["Spot public"] = str(exc)
+
+        try:
+            data = futures_public_request("/fapi/v1/time")
+            results["Futures public"] = f"OK — {data.get('serverTime')}"
+        except Exception as exc:
+            results["Futures public"] = str(exc)
+
+        st.json(results)
 
     st.markdown(
         """
-- Binance API Secret Key'i kimseyle paylaşma.
-- **Withdrawal / çekim yetkisini açma.**
-- Sadece gerekli Spot işlem yetkisini kullan.
-- Mümkünse API anahtarını sabit IP ile sınırla.
-- İlk testleri Paper Mode ile yap.
-- Live Mode gerçek para kullanır.
-- Derin öğrenme modeli kâr garantisi vermez.
+**451 ne demek?**
+
+`/api/v3/time` API anahtarı istemeyen public bir endpointtir. Burada 451
+alıyorsan sorun Secret Key değil; Binance isteği ağ/bölge düzeyinde
+reddediyor. Bu uygulama coğrafi/yasal kısıtlamayı aşmaya çalışmaz.
+
+**API izinleri**
+
+- Spot için: `Enable Spot & Margin Trading`
+- Futures için: `Enable Futures`
+- Withdrawal kapalı tutulmalı.
         """
     )
 
 st.caption(
-    "Binance Spot Deep AI 200 • "
-    "AI tahminleri finansal sonuç garantisi değildir."
+    "Live Futures kaldıraç nedeniyle yüksek risk taşır. "
+    "Önce Paper Mode ve out-of-sample test kullan."
 )
