@@ -5,15 +5,14 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
 
 import torch
 import torch.nn as nn
 
 
-# =========================================================
+# ============================================================
 # AYARLAR
-# =========================================================
+# ============================================================
 
 BINANCE_URL = "https://api.binance.com"
 
@@ -26,9 +25,9 @@ LOOKAHEAD = 12
 SEQ_LEN = 96
 
 
-# =========================================================
-# STREAMLIT
-# =========================================================
+# ============================================================
+# STREAMLIT AYARLARI
+# ============================================================
 
 st.set_page_config(
     page_title="Binance Spot AI Scanner",
@@ -47,29 +46,27 @@ st.markdown("""
 
 .buy {
     color: #00d084;
-    font-weight: bold;
+    font-weight: 800;
 }
 
 .sell {
     color: #ff4d67;
-    font-weight: bold;
+    font-weight: 800;
 }
 
 </style>
 """, unsafe_allow_html=True)
 
 
-# =========================================================
-# BINANCE EXCHANGE INFO
-# =========================================================
+# ============================================================
+# BINANCE API
+# ============================================================
 
 @st.cache_data(ttl=300)
 def get_exchange_info():
 
-    url = BINANCE_URL + "/api/v3/exchangeInfo"
-
     response = requests.get(
-        url,
+        BINANCE_URL + "/api/v3/exchangeInfo",
         timeout=30,
         headers={
             "User-Agent": "Binance-Spot-AI"
@@ -85,7 +82,7 @@ def get_spot_symbols():
 
     data = get_exchange_info()
 
-    symbols = []
+    result = []
 
     for item in data["symbols"]:
 
@@ -101,42 +98,37 @@ def get_spot_symbols():
         ):
             continue
 
-        symbols.append(
+        result.append(
             item["symbol"]
         )
 
-    return symbols
+    return result
 
 
-# =========================================================
-# 500.000 MUM VERİSİ
-# =========================================================
+# ============================================================
+# MUM VERİSİ
+# ============================================================
 
-@st.cache_data(ttl=60)
-def get_klines(
+def download_initial_500k(
     symbol,
     candle_count
 ):
 
-    all_data = []
+    all_rows = []
 
     end_time = None
 
-    while len(all_data) < candle_count:
+    while len(all_rows) < candle_count:
 
         limit = min(
             1000,
-            candle_count - len(all_data)
+            candle_count - len(all_rows)
         )
 
         params = {
-
             "symbol": symbol,
-
             "interval": INTERVAL,
-
             "limit": limit
-
         }
 
         if end_time is not None:
@@ -144,16 +136,11 @@ def get_klines(
             params["endTime"] = end_time
 
         response = requests.get(
-
             BINANCE_URL + "/api/v3/klines",
-
             params=params,
-
             timeout=30,
-
             headers={
-                "User-Agent":
-                "Binance-Spot-AI"
+                "User-Agent": "Binance-Spot-AI"
             }
         )
 
@@ -164,7 +151,7 @@ def get_klines(
         if not batch:
             break
 
-        all_data = batch + all_data
+        all_rows = batch + all_rows
 
         end_time = batch[0][0] - 1
 
@@ -173,6 +160,45 @@ def get_klines(
 
         time.sleep(0.04)
 
+
+    return convert_klines(
+        all_rows[-candle_count:]
+    )
+
+
+def download_new_candles(
+    symbol,
+    last_open_time
+):
+
+    params = {
+        "symbol": symbol,
+        "interval": INTERVAL,
+        "startTime": int(last_open_time) + 1,
+        "limit": 1000
+    }
+
+    response = requests.get(
+        BINANCE_URL + "/api/v3/klines",
+        params=params,
+        timeout=30,
+        headers={
+            "User-Agent": "Binance-Spot-AI"
+        }
+    )
+
+    response.raise_for_status()
+
+    rows = response.json()
+
+    if not rows:
+
+        return pd.DataFrame()
+
+    return convert_klines(rows)
+
+
+def convert_klines(rows):
 
     columns = [
 
@@ -191,14 +217,13 @@ def get_klines(
 
     ]
 
-
     df = pd.DataFrame(
-        all_data[-candle_count:],
+        rows,
         columns=columns
     )
 
 
-    numeric_columns = [
+    numeric = [
 
         "open",
         "high",
@@ -210,7 +235,7 @@ def get_klines(
     ]
 
 
-    for column in numeric_columns:
+    for column in numeric:
 
         df[column] = pd.to_numeric(
             df[column],
@@ -221,7 +246,7 @@ def get_klines(
     df = df.dropna()
 
     df = df.drop_duplicates(
-        subset=["open_time"]
+        "open_time"
     )
 
     df = df.sort_values(
@@ -232,13 +257,97 @@ def get_klines(
         drop=True
     )
 
-
     return df
 
 
-# =========================================================
-# TEKNİK GÖSTERGELER
-# =========================================================
+# ============================================================
+# 500K CACHE
+# ============================================================
+
+def update_symbol_cache(
+    symbol,
+    candle_count
+):
+
+    if "candle_cache" not in st.session_state:
+
+        st.session_state.candle_cache = {}
+
+
+    cache = st.session_state.candle_cache
+
+
+    # İlk kez
+    if symbol not in cache:
+
+        df = download_initial_500k(
+            symbol,
+            candle_count
+        )
+
+        cache[symbol] = df
+
+        return df, True
+
+
+    # Daha önce var
+    old = cache[symbol]
+
+
+    if old.empty:
+
+        df = download_initial_500k(
+            symbol,
+            candle_count
+        )
+
+        cache[symbol] = df
+
+        return df, True
+
+
+    last_time = int(
+        old["open_time"].iloc[-1]
+    )
+
+
+    new = download_new_candles(
+        symbol,
+        last_time
+    )
+
+
+    if not new.empty:
+
+        df = pd.concat(
+            [
+                old,
+                new
+            ],
+            ignore_index=True
+        )
+
+
+        df = (
+            df
+            .drop_duplicates("open_time")
+            .sort_values("open_time")
+            .tail(candle_count)
+            .reset_index(drop=True)
+        )
+
+
+        cache[symbol] = df
+
+        return df, True
+
+
+    return old, False
+
+
+# ============================================================
+# FEATURES
+# ============================================================
 
 FEATURES = [
 
@@ -287,7 +396,6 @@ def create_features(df):
     # EMA
 
     for period in [
-
         5,
         12,
         20,
@@ -296,18 +404,18 @@ def create_features(df):
         200,
         500,
         800
-
     ]:
 
-        data[
-            f"ema{period}"
-        ] = (
+        data[f"ema{period}"] = (
 
-            close.ewm(
+            close
+            .ewm(
                 span=period,
                 adjust=False
-            ).mean()
-            / close
+            )
+            .mean()
+            /
+            close
             - 1
 
         )
@@ -316,39 +424,35 @@ def create_features(df):
     # RSI
 
     for period in [
-
         7,
         14,
         21
-
     ]:
 
         delta = close.diff()
 
-        gain = delta.clip(
-            lower=0
-        ).rolling(
-            period
-        ).mean()
-
-        loss = (
-            -delta.clip(
-                upper=0
-            )
+        gain = (
+            delta
+            .clip(lower=0)
             .rolling(period)
             .mean()
         )
 
-        rs = gain / (
-            loss + 1e-12
+        loss = (
+            -delta
+            .clip(upper=0)
+            .rolling(period)
+            .mean()
         )
 
-        data[
-            f"rsi{period}"
-        ] = (
+        rs = (
+            gain /
+            (loss + 1e-12)
+        )
 
-            100
-            -
+        data[f"rsi{period}"] = (
+
+            100 -
             (
                 100 /
                 (1 + rs)
@@ -357,7 +461,7 @@ def create_features(df):
         )
 
 
-    # Bollinger Bands
+    # Bollinger
 
     middle = (
         close
@@ -375,7 +479,8 @@ def create_features(df):
     data["bb_upper"] = (
 
         (middle + 2 * std)
-        / close
+        /
+        close
         - 1
 
     )
@@ -384,7 +489,8 @@ def create_features(df):
     data["bb_lower"] = (
 
         (middle - 2 * std)
-        / close
+        /
+        close
         - 1
 
     )
@@ -474,7 +580,7 @@ def create_features(df):
     )
 
 
-    # Future return
+    # Target
 
     data["future_return"] = (
 
@@ -496,19 +602,16 @@ def create_features(df):
 
     data = data.dropna()
 
-    data = data.reset_index(
+    return data.reset_index(
         drop=True
     )
 
 
-    return data
-
-
-# =========================================================
+# ============================================================
 # TRANSFORMER
-# =========================================================
+# ============================================================
 
-class AIModel(
+class TransformerModel(
     nn.Module
 ):
 
@@ -520,39 +623,27 @@ class AIModel(
         super().__init__()
 
 
-        self.projection = nn.Linear(
+        self.input = nn.Linear(
             feature_count,
             96
         )
 
 
-        encoder_layer = (
-
+        layer = (
             nn.TransformerEncoderLayer(
-
                 d_model=96,
-
                 nhead=8,
-
                 batch_first=True,
-
                 dropout=0.10
-
             )
-
         )
 
 
         self.encoder = (
-
             nn.TransformerEncoder(
-
-                encoder_layer,
-
+                layer,
                 num_layers=3
-
             )
-
         )
 
 
@@ -570,82 +661,72 @@ class AIModel(
 
     def forward(self, x):
 
-        x = self.projection(x)
+        x = self.input(x)
 
         x = self.encoder(x)
 
         x = x[:, -1]
 
-        classification = (
-            self.classifier(x)
-        )
-
-        regression = (
+        return (
+            self.classifier(x),
             self.regression(x)
         )
 
-        return (
-            classification,
-            regression
-        )
 
+# ============================================================
+# AI PREDICTION
+# ============================================================
 
-# =========================================================
-# DEEP LEARNING
-# =========================================================
+def predict_ai(data):
 
-def deep_learning_prediction(
-    data
-):
-
-    if len(data) < (
-        SEQ_LEN + 300
-    ):
+    if len(data) < SEQ_LEN + 300:
 
         return None
 
 
-    features = data[
-        FEATURES
-    ].values.astype(
-        np.float32
+    values = (
+        data[FEATURES]
+        .values
+        .astype(np.float32)
     )
 
 
-    future_return = (
+    future = (
         data["future_return"]
         .values
         .astype(np.float32)
     )
 
 
-    n = len(features) - LOOKAHEAD
+    usable = (
+        len(values)
+        -
+        LOOKAHEAD
+    )
 
-
-    # Normalization
 
     mean = (
-        features[:n]
+        values[:usable]
         .mean(axis=0)
     )
 
+
     std = (
-        features[:n]
+        values[:usable]
         .std(axis=0)
-        + 1e-6
+        +
+        1e-6
     )
 
 
     normalized = (
-        features - mean
+        values - mean
     ) / std
 
 
-    # Training samples
-
     sample_count = min(
         2500,
-        n - SEQ_LEN
+        usable - SEQ_LEN
     )
 
 
@@ -653,7 +734,7 @@ def deep_learning_prediction(
 
         SEQ_LEN,
 
-        n - 1,
+        usable - 1,
 
         sample_count,
 
@@ -673,11 +754,9 @@ def deep_learning_prediction(
     ])
 
 
-    returns = (
-        future_return[
-            indexes
-        ]
-    )
+    returns = future[
+        indexes
+    ]
 
 
     labels = (
@@ -695,73 +774,55 @@ def deep_learning_prediction(
 
 
     device = (
-
         "cuda"
         if torch.cuda.is_available()
         else
         "cpu"
-
     )
 
 
-    model = AIModel(
+    model = TransformerModel(
         len(FEATURES)
     ).to(device)
 
 
     optimizer = (
         torch.optim.AdamW(
-
             model.parameters(),
-
             lr=0.0002,
-
             weight_decay=0.0001
-
         )
     )
 
 
-    classification_loss = (
+    loss_class = (
         nn.CrossEntropyLoss()
     )
 
 
-    regression_loss = (
+    loss_reg = (
         nn.SmoothL1Loss()
     )
 
 
     X_tensor = torch.tensor(
-
         X,
-
         dtype=torch.float32,
-
         device=device
-
     )
 
 
     y_tensor = torch.tensor(
-
         labels,
-
         dtype=torch.long,
-
         device=device
-
     )
 
 
     return_tensor = torch.tensor(
-
         returns,
-
         dtype=torch.float32,
-
         device=device
-
     )
 
 
@@ -785,11 +846,11 @@ def deep_learning_prediction(
         ):
 
             batch = permutation[
-                start:start+64
+                start:start + 64
             ]
 
 
-            logits, predicted_return = (
+            logits, regression = (
                 model(
                     X_tensor[batch]
                 )
@@ -798,7 +859,7 @@ def deep_learning_prediction(
 
             loss = (
 
-                classification_loss(
+                loss_class(
                     logits,
                     y_tensor[batch]
                 )
@@ -807,8 +868,8 @@ def deep_learning_prediction(
 
                 0.35
                 *
-                regression_loss(
-                    predicted_return.squeeze(),
+                loss_reg(
+                    regression.squeeze(),
                     return_tensor[batch]
                 )
 
@@ -822,14 +883,16 @@ def deep_learning_prediction(
             optimizer.step()
 
 
-    # Current prediction
+    # Güncel tahmin
 
     model.eval()
 
 
     current = torch.tensor(
 
-        normalized[-SEQ_LEN:][None],
+        normalized[
+            -SEQ_LEN:
+        ][None],
 
         dtype=torch.float32,
 
@@ -840,7 +903,7 @@ def deep_learning_prediction(
 
     with torch.no_grad():
 
-        logits, predicted_return = (
+        logits, regression = (
             model(current)
         )
 
@@ -855,52 +918,44 @@ def deep_learning_prediction(
         )
 
 
-        expected_return = (
-
+        predicted_return = (
             float(
-                predicted_return
+                regression
                 .squeeze()
                 .cpu()
             )
-
             * 100
-
         )
 
 
     confidence = (
-        float(
-            max(probabilities)
-        )
+        max(probabilities)
         * 100
     )
 
 
-    if probabilities[1] >= 0.5:
+    signal = (
 
-        signal = "BUY"
-
-    else:
-
-        signal = "SELL"
-
-
-    return (
-
-        signal,
-
-        confidence,
-
-        expected_return
+        "BUY"
+        if probabilities[1] >= 0.5
+        else
+        "SELL"
 
     )
 
 
-# =========================================================
-# SCORING
-# =========================================================
+    return (
+        signal,
+        confidence,
+        predicted_return
+    )
 
-def calculate_score(
+
+# ============================================================
+# SKOR
+# ============================================================
+
+def calculate_scores(
     data,
     prediction
 ):
@@ -911,18 +966,19 @@ def calculate_score(
 
 
     volatility = (
-
         float(
-            data["vol50"]
-            .iloc[-1]
+            data[
+                "vol50"
+            ].iloc[-1]
         )
         * 100
-
     )
 
 
     momentum = float(
+
         np.clip(
+
             (
                 data[
                     "momentum48"
@@ -930,13 +986,17 @@ def calculate_score(
                 + 0.10
             )
             * 500,
+
             0,
             100
+
         )
+
     )
 
 
     trend = float(
+
         np.clip(
 
             50
@@ -956,67 +1016,76 @@ def calculate_score(
             100
 
         )
+
     )
 
 
     risk = float(
+
         np.clip(
+
             35
             +
-            volatility
-            * 250,
+            volatility * 250,
+
             0,
             100
+
         )
+
+    )
+
+
+    quote_volume = float(
+
+        data[
+            "quote_volume"
+        ]
+        .tail(96)
+        .mean()
+
     )
 
 
     liquidity = float(
+
         np.clip(
+
             np.log10(
-                data[
-                    "quote_volume"
-                ]
-                .tail(96)
-                .mean()
-                + 1
-            )
-            * 10,
+                quote_volume + 1
+            ) * 10,
+
             0,
             100
+
         )
+
     )
 
 
-    ranking_score = (
+    score = (
 
-        expected
-        * 0.45
-
-        +
-
-        confidence
-        * 0.25
+        expected * 0.45
 
         +
 
-        momentum
-        * 0.12
+        confidence * 0.25
 
         +
 
-        trend
-        * 0.10
+        momentum * 0.12
 
         +
 
-        liquidity
-        * 0.08
+        trend * 0.10
+
+        +
+
+        liquidity * 0.08
 
         -
 
-        risk
-        * 0.20
+        risk * 0.20
 
     )
 
@@ -1025,9 +1094,9 @@ def calculate_score(
 
         "signal": signal,
 
-        "confidence": confidence,
+        "expected": expected,
 
-        "expected_return": expected,
+        "confidence": confidence,
 
         "risk": risk,
 
@@ -1037,23 +1106,25 @@ def calculate_score(
 
         "liquidity": liquidity,
 
-        "score": ranking_score
+        "score": score
 
     }
 
 
-# =========================================================
-# PARİTE TARAMA
-# =========================================================
+# ============================================================
+# TEK PARİTE
+# ============================================================
 
-def scan_symbol(
+def scan_pair(
     symbol,
     candle_count
 ):
 
-    df = get_klines(
-        symbol,
-        candle_count
+    df, updated = (
+        update_symbol_cache(
+            symbol,
+            candle_count
+        )
     )
 
 
@@ -1062,9 +1133,7 @@ def scan_symbol(
         return None
 
 
-    # Likidite filtresi
-
-    average_volume = float(
+    quote_volume = float(
 
         df[
             "quote_volume"
@@ -1075,20 +1144,18 @@ def scan_symbol(
     )
 
 
-    if average_volume < 1_000_000:
+    if quote_volume < 1_000_000:
 
         return None
 
 
-    data = create_features(
+    features = create_features(
         df
     )
 
 
-    prediction = (
-        deep_learning_prediction(
-            data
-        )
+    prediction = predict_ai(
+        features
     )
 
 
@@ -1097,8 +1164,8 @@ def scan_symbol(
         return None
 
 
-    score = calculate_score(
-        data,
+    scores = calculate_scores(
+        features,
         prediction
     )
 
@@ -1107,7 +1174,7 @@ def scan_symbol(
 
         "symbol": symbol,
 
-        **score,
+        **scores,
 
         "price": float(
             df[
@@ -1115,47 +1182,35 @@ def scan_symbol(
             ].iloc[-1]
         ),
 
-        "candles": len(df)
+        "candles": len(df),
+
+        "new_candles": updated
 
     }
 
 
-# =========================================================
-# BAŞLIK
-# =========================================================
-
-st.title(
-    "📈 Binance Spot AI Scanner"
-)
-
-st.caption(
-    "500.000 mum · 15 dakika · "
-    "Deep Learning · BUY / SELL"
-)
-
-
-# =========================================================
+# ============================================================
 # SIDEBAR
-# =========================================================
+# ============================================================
 
 with st.sidebar:
 
     st.header(
-        "Tarama Ayarları"
+        "⚙️ Ayarlar"
     )
 
 
     candle_count = st.number_input(
 
-        "Mum sayısı",
+        "Geçmiş mum",
 
-        min_value=5000,
+        min_value=5_000,
 
-        max_value=500000,
+        max_value=500_000,
 
-        value=20000,
+        value=500_000,
 
-        step=5000
+        step=5_000
 
     )
 
@@ -1177,14 +1232,14 @@ with st.sidebar:
 
     auto_refresh = st.checkbox(
 
-        "Her 15 dakikada yenile",
+        "15 dakikada otomatik tara",
 
         value=True
 
     )
 
 
-    scan_button = st.button(
+    force_scan = st.button(
 
         "🚀 Şimdi Tara",
 
@@ -1195,41 +1250,22 @@ with st.sidebar:
 
     st.divider()
 
-
     st.write(
-        "Timeframe:",
-        "15 dakika"
+        "Timeframe: **15 dakika**"
     )
 
     st.write(
-        "Model:",
-        "Transformer"
+        "Model: **Transformer**"
     )
 
     st.write(
-        "Horizon:",
-        "12 mum / 3 saat"
+        "Horizon: **12 mum / 3 saat**"
     )
 
 
-# =========================================================
-# 15 DAKİKALIK REFRESH
-# =========================================================
-
-if auto_refresh:
-
-    st_autorefresh(
-
-        interval=900_000,
-
-        key="15_minute_refresh"
-
-    )
-
-
-# =========================================================
+# ============================================================
 # SESSION STATE
-# =========================================================
+# ============================================================
 
 if "results" not in st.session_state:
 
@@ -1241,262 +1277,277 @@ if "last_scan" not in st.session_state:
     st.session_state.last_scan = None
 
 
-# =========================================================
-# SCAN KARARI
-# =========================================================
+if "scan_number" not in st.session_state:
 
-if (
-    scan_button
-    or
-    len(
-        st.session_state.results
-    ) == 0
-):
+    st.session_state.scan_number = 0
 
 
-    try:
+# ============================================================
+# TARAMA FONKSİYONU
+# ============================================================
 
-        symbols = (
-            get_spot_symbols()
-        )
+def run_scan():
+
+    symbols = (
+        get_spot_symbols()
+    )
 
 
-        priority = [
+    priority = [
 
-            "BTCUSDT",
-            "ETHUSDT",
-            "BNBUSDT",
-            "SOLUSDT",
-            "XRPUSDT",
-            "DOGEUSDT",
-            "ADAUSDT",
-            "AVAXUSDT",
-            "LINKUSDT",
-            "DOTUSDT",
-            "TRXUSDT",
-            "LTCUSDT",
-            "BCHUSDT",
-            "ATOMUSDT",
-            "UNIUSDT"
+        "BTCUSDT",
+        "ETHUSDT",
+        "BNBUSDT",
+        "SOLUSDT",
+        "XRPUSDT",
+        "DOGEUSDT",
+        "ADAUSDT",
+        "AVAXUSDT",
+        "LINKUSDT",
+        "DOTUSDT",
+        "TRXUSDT",
+        "LTCUSDT",
+        "BCHUSDT",
+        "ATOMUSDT",
+        "UNIUSDT"
 
+    ]
+
+
+    ordered = (
+
+        [
+            x
+            for x in priority
+            if x in symbols
         ]
 
+        +
 
-        ordered = (
-
-            [
-                x
-                for x in priority
-                if x in symbols
-            ]
-
-            +
-
-            [
-                x
-                for x in symbols
-                if x not in priority
-            ]
-
-        )
-
-
-        selected = ordered[
-            :int(pair_count)
+        [
+            x
+            for x in symbols
+            if x not in priority
         ]
 
+    )
 
-        progress = st.progress(
-            0
+
+    selected = ordered[
+        :int(pair_count)
+    ]
+
+
+    results = []
+
+
+    progress = st.progress(
+        0
+    )
+
+
+    status = st.empty()
+
+
+    for i, symbol in enumerate(
+        selected,
+        1
+    ):
+
+        status.write(
+
+            f"🔎 {symbol} "
+            f"taranıyor "
+            f"({i}/{len(selected)})"
+
         )
 
 
-        status = st.empty()
+        try:
 
+            result = scan_pair(
 
-        results = []
+                symbol,
 
-
-        for index, symbol in enumerate(
-            selected,
-            1
-        ):
-
-
-            status.write(
-
-                f"🔎 **{symbol}** "
-                f"taranıyor "
-                f"({index}/{len(selected)})"
+                int(candle_count)
 
             )
 
 
-            try:
+            if result:
 
-                result = scan_symbol(
-
-                    symbol,
-
-                    int(
-                        candle_count
-                    )
-
+                results.append(
+                    result
                 )
 
 
-                if result:
+        except Exception as error:
 
-                    results.append(
-                        result
-                    )
-
-
-            except Exception as error:
-
-                st.warning(
-
-                    f"{symbol}: "
-                    f"{str(error)[:100]}"
-
-                )
-
-
-            progress.progress(
-
-                index /
-                len(selected)
-
+            st.warning(
+                f"{symbol}: "
+                f"{str(error)[:100]}"
             )
 
 
-        results.sort(
-
-            key=lambda x:
-            x["score"],
-
-            reverse=True
-
+        progress.progress(
+            i / len(selected)
         )
 
 
-        st.session_state.results = (
-            results[:10]
+    results.sort(
+
+        key=lambda x:
+        x["score"],
+
+        reverse=True
+
+    )
+
+
+    st.session_state.results = (
+        results[:10]
+    )
+
+
+    st.session_state.last_scan = (
+        datetime.now(
+            timezone.utc
         )
+    )
 
 
-        st.session_state.last_scan = (
-            datetime.now(
-                timezone.utc
-            )
-        )
+    st.session_state.scan_number += 1
 
 
-        progress.empty()
+    progress.empty()
 
-        status.empty()
-
-
-    except Exception as error:
-
-        st.error(
-
-            "Binance API bağlantısı "
-            "başarısız: "
-            + str(error)
-
-        )
+    status.empty()
 
 
-# =========================================================
-# SONUÇLAR
-# =========================================================
+# ============================================================
+# 15 DAKİKALIK STREAMLIT FRAGMENT
+# ============================================================
 
-results = (
-    st.session_state.results
+run_every = (
+    "15m"
+    if auto_refresh
+    else None
 )
 
 
-col1, col2, col3, col4 = (
-    st.columns(4)
+@st.fragment(
+    run_every=run_every,
+    key="ai_scanner"
 )
+def scanner_fragment():
+
+    # İlk açılış veya manuel tarama
+    if (
+        not st.session_state.results
+        or
+        force_scan
+    ):
+
+        run_scan()
 
 
-with col1:
+    # --------------------------------------------------------
+    # BAŞLIK
+    # --------------------------------------------------------
 
-    st.metric(
-
-        "Piyasa",
-
-        "BINANCE SPOT"
-
-    )
-
-
-with col2:
-
-    st.metric(
-
-        "Öneri",
-
-        len(results)
-
-    )
-
-
-with col3:
-
-    st.metric(
-
-        "Mum",
-
-        f"{int(candle_count):,}"
-
-    )
-
-
-with col4:
-
-    st.metric(
-
-        "Yenileme",
-
-        "15 dakika"
-
-    )
-
-
-if st.session_state.last_scan:
-
-    local_time = (
-        st.session_state
-        .last_scan
-        .astimezone()
+    st.title(
+        "📈 Binance Spot AI Scanner"
     )
 
 
     st.caption(
 
-        "Son tarama: "
-        +
-        local_time.strftime(
-            "%d.%m.%Y %H:%M:%S"
+        "500.000 mum · 15 dakika · "
+        "Deep Learning · BUY / SELL"
+
+    )
+
+
+    # --------------------------------------------------------
+    # ÜST BİLGİ
+    # --------------------------------------------------------
+
+    col1, col2, col3, col4 = (
+        st.columns(4)
+    )
+
+
+    with col1:
+
+        st.metric(
+            "Piyasa",
+            "BINANCE SPOT"
         )
 
+
+    with col2:
+
+        st.metric(
+            "Öneri",
+            len(
+                st.session_state.results
+            )
+        )
+
+
+    with col3:
+
+        st.metric(
+            "Tarama",
+            st.session_state.scan_number
+        )
+
+
+    with col4:
+
+        st.metric(
+            "Aralık",
+            "15 dk"
+        )
+
+
+    if st.session_state.last_scan:
+
+        local_time = (
+            st.session_state
+            .last_scan
+            .astimezone()
+        )
+
+
+        st.caption(
+
+            "Son tarama: "
+            +
+            local_time.strftime(
+                "%d.%m.%Y %H:%M:%S"
+            )
+
+        )
+
+
+    # --------------------------------------------------------
+    # TABLO
+    # --------------------------------------------------------
+
+    results = (
+        st.session_state.results
     )
 
 
-# =========================================================
-# TABLO
-# =========================================================
+    if not results:
 
-if not results:
+        st.warning(
+            "Henüz sinyal oluşmadı."
+        )
 
-    st.warning(
-        "Henüz öneri bulunamadı."
-    )
+        return
 
-else:
 
     table = []
 
@@ -1518,17 +1569,13 @@ else:
 
             "BEKLENEN %":
             round(
-                item[
-                    "expected_return"
-                ],
+                item["expected"],
                 3
             ),
 
             "CONFIDENCE %":
             round(
-                item[
-                    "confidence"
-                ],
+                item["confidence"],
                 1
             ),
 
@@ -1562,14 +1609,14 @@ else:
         })
 
 
-    df_results = pd.DataFrame(
+    result_df = pd.DataFrame(
         table
     )
 
 
     st.dataframe(
 
-        df_results,
+        result_df,
 
         use_container_width=True,
 
@@ -1578,16 +1625,17 @@ else:
     )
 
 
-# =========================================================
-# UYARI
-# =========================================================
+    st.info(
 
-st.info(
+        "Her 15 dakikada yeni mumlar alınır, "
+        "500K'lık geçmiş pencere güncellenir ve "
+        "Top 10 yeniden hesaplanır."
 
-    "Bu sistem yalnızca BUY/SELL model sinyali üretir. "
-    "Binance hesabına emir göndermez. "
-    "Beklenen getiri garanti edilmiş kâr değildir. "
-    "500.000 mum ve çok sayıda coin taraması ciddi CPU/RAM/API "
-    "kaynağı gerektirir."
+    )
 
-)
+
+# ============================================================
+# ÇALIŞTIR
+# ============================================================
+
+scanner_fragment()
