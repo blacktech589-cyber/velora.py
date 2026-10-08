@@ -29,6 +29,11 @@ REQUEST_TIMEOUT = 30
 
 TIMEFRAME = "15m"
 
+# Scalping target: price must move at least 10% within the next
+# two 15-minute candles (maximum 30 minutes).
+SCALP_HORIZON_BARS = 2
+SCALP_TARGET_RETURN = 0.10
+
 # Minimum candles needed after feature engineering.
 MIN_CANDLES = 300
 
@@ -68,7 +73,7 @@ st.set_page_config(
 
 st.title("📊 Spot AI Scanner PRO")
 st.caption(
-    "15m • Historical AI • Walk-Forward Test • Top 10 BUY / SELL • No Order Execution"
+    "15m SCALPING • +10%/-10% Target • Max 30 Minutes • Walk-Forward AI • No Order Execution"
 )
 
 
@@ -677,38 +682,58 @@ def build_features(df):
 # TARGET
 # ============================================================
 
-def make_target(df, future_bars):
+def make_target(df, future_bars=SCALP_HORIZON_BARS):
     x = df.copy()
 
-    future_return = (
-        x["close"].shift(-future_bars)
-        / x["close"]
-        - 1
+    # IMPORTANT: this is an intraperiod scalp target.
+    # We look at the highest high and lowest low in the NEXT
+    # two 15-minute candles, not only the close 30 minutes later.
+    future_highs = pd.concat(
+        [x["high"].shift(-i) for i in range(1, future_bars + 1)],
+        axis=1,
     )
 
-    x["future_return"] = future_return
-
-    base_vol = x["volatility_24"].fillna(
-        x["ret_1"].std()
+    future_lows = pd.concat(
+        [x["low"].shift(-i) for i in range(1, future_bars + 1)],
+        axis=1,
     )
 
-    # Volatility-adaptive threshold.
-    # Minimum 0.20% keeps tiny moves from becoming BUY/SELL.
-    threshold = (
-        base_vol * np.sqrt(future_bars)
-    ).clip(lower=0.002)
+    x["future_max_high"] = future_highs.max(axis=1, skipna=False)
+    x["future_min_low"] = future_lows.min(axis=1, skipna=False)
 
-    x["target"] = 1  # HOLD
+    x["future_upside"] = (
+        x["future_max_high"] / x["close"] - 1
+    )
 
-    x.loc[
-        future_return > threshold,
-        "target",
-    ] = 2  # BUY
+    x["future_downside"] = (
+        x["future_min_low"] / x["close"] - 1
+    )
 
-    x.loc[
-        future_return < -threshold,
-        "target",
-    ] = 0  # SELL
+    # Legacy-compatible field: for a scalp, the directional return
+    # is the maximum excursion in the next 30 minutes.
+    x["future_return"] = np.where(
+        x["future_upside"] >= abs(x["future_downside"]),
+        x["future_upside"],
+        x["future_downside"],
+    )
+
+    # 0 = SELL, 1 = HOLD, 2 = BUY.
+    # BUY means +10% was actually reachable within <=30 minutes.
+    # SELL means -10% was actually reachable within <=30 minutes.
+    x["target"] = 1
+
+    buy_mask = (
+        (x["future_upside"] >= SCALP_TARGET_RETURN)
+        & (x["future_upside"] >= x["future_downside"].abs())
+    )
+
+    sell_mask = (
+        (x["future_downside"] <= -SCALP_TARGET_RETURN)
+        & (x["future_downside"].abs() > x["future_upside"])
+    )
+
+    x.loc[buy_mask, "target"] = 2
+    x.loc[sell_mask, "target"] = 0
 
     return x
 
@@ -835,6 +860,8 @@ def train_predict(df, future_bars, train_limit):
             subset=FEATURES + [
                 "target",
                 "future_return",
+                "future_upside",
+                "future_downside",
             ]
         )
         .copy()
@@ -915,12 +942,19 @@ def train_predict(df, future_bars, train_limit):
         )
     )
 
-    # Train regression model on historical train data.
-    regressor = make_regressor()
+    # Train two regression models aligned with the 10%/30-minute target:
+    # one estimates maximum upside and the other maximum downside.
+    upside_regressor = make_regressor()
+    downside_regressor = make_regressor()
 
-    regressor.fit(
+    upside_regressor.fit(
         train[FEATURES].astype(float),
-        train["future_return"].astype(float),
+        train["future_upside"].astype(float),
+    )
+
+    downside_regressor.fit(
+        train[FEATURES].astype(float),
+        train["future_downside"].astype(float),
     )
 
     # Latest available feature row.
@@ -957,10 +991,23 @@ def train_predict(df, future_bars, train_limit):
     p_hold = class_map.get(1, 0.0)
     p_buy = class_map.get(2, 0.0)
 
-    expected_return = float(
-        regressor.predict(
+    expected_upside = float(
+        upside_regressor.predict(
             X_latest
         )[0]
+    )
+
+    expected_downside = float(
+        downside_regressor.predict(
+            X_latest
+        )[0]
+    )
+
+    # Direction-specific expected move.
+    expected_return = (
+        expected_upside
+        if p_buy >= p_sell
+        else expected_downside
     )
 
     # --------------------------------------------------------
@@ -1018,9 +1065,10 @@ def train_predict(df, future_bars, train_limit):
             )
         )
 
-    # Expected-return contribution.
+    # Expected 30-minute move contribution.
+    # A 10% target corresponds to the hard scalp threshold.
     return_score = float(
-        np.tanh(expected_return * 20)
+        np.tanh(expected_return * 10)
     )
 
     # Directional score:
@@ -1049,17 +1097,21 @@ def train_predict(df, future_bars, train_limit):
     buy_edge = p_buy - p_sell
     sell_edge = p_sell - p_buy
 
+    # HARD SCALP RULE:
+    # BUY requires the model to estimate that +10% can be reached
+    # within the next two 15-minute candles (<=30 minutes).
+    # SELL is symmetric at -10%.
     buy_condition = (
         p_buy >= 0.45
         and buy_edge >= 0.10
-        and expected_return > 0
+        and expected_upside >= SCALP_TARGET_RETURN
         and directional_score >= 55
     )
 
     sell_condition = (
         p_sell >= 0.45
         and sell_edge >= 0.10
-        and expected_return < 0
+        and expected_downside <= -SCALP_TARGET_RETURN
         and directional_score <= 45
     )
 
@@ -1148,6 +1200,10 @@ def train_predict(df, future_bars, train_limit):
         "p_hold": p_hold,
         "p_sell": p_sell,
         "expected_return": expected_return,
+        "expected_upside": expected_upside,
+        "expected_downside": expected_downside,
+        "scalp_target": SCALP_TARGET_RETURN,
+        "scalp_horizon_minutes": SCALP_HORIZON_BARS * 15,
         "price": float(latest["close"]),
         "ai_score": float(ai_score),
         "buy_score": buy_score,
@@ -1201,7 +1257,7 @@ if source == "CSV / Historical 500K":
     )
 
 target = st.sidebar.selectbox(
-    "Candle Target",
+    "Historical Candle Target",
     [
         10_000,
         50_000,
@@ -1219,11 +1275,11 @@ symbol_limit = st.sidebar.slider(
     10,
 )
 
-future_bars = st.sidebar.slider(
-    "Future Bars",
-    3,
-    48,
-    12,
+future_bars = SCALP_HORIZON_BARS
+
+st.sidebar.info(
+    "Scalping hedefi: +10% / -10%\n"
+    "maksimum 30 dakika (2 × 15m mum)."
 )
 
 train_limit = st.sidebar.slider(
@@ -1510,7 +1566,7 @@ with c2:
 
 with c3:
     st.metric(
-        "Candle Target",
+        "Historical Candle Target",
         f"{target:,}",
     )
 
@@ -1535,6 +1591,11 @@ results = st.session_state.results
 if results.empty:
 
     st.warning("Henüz sonuç yok.")
+    st.info(
+        "Bu sürüm yalnızca 15 dakikalık veride, sonraki 2 mum içinde "
+        "+10% yükseliş veya -10% düşüş ihtimalini arar. "
+        "10% hedefini karşılamayan sinyaller BUY/SELL olarak listelenmez."
+    )
 
     if source == "Kraken REST":
         st.info(
@@ -1630,6 +1691,8 @@ else:
             "sell_score",
             "confidence",
             "expected_return",
+            "expected_upside",
+            "expected_downside",
             "p_buy",
             "p_hold",
             "p_sell",
@@ -1735,7 +1798,7 @@ else:
 
     with c:
         st.metric(
-            "Expected Return",
+            "Expected 30m Move",
             f"{row['expected_return'] * 100:.3f}%",
         )
 
@@ -1751,6 +1814,8 @@ else:
             "BUY Probability",
             "HOLD Probability",
             "SELL Probability",
+            "Expected Upside (30m)",
+            "Expected Downside (30m)",
             "BUY Score",
             "SELL Score",
             "Directional Score",
@@ -1774,6 +1839,8 @@ else:
             f"{row['p_buy'] * 100:.2f}%",
             f"{row['p_hold'] * 100:.2f}%",
             f"{row['p_sell'] * 100:.2f}%",
+            f"{row['expected_upside'] * 100:.3f}%",
+            f"{row['expected_downside'] * 100:.3f}%",
             f"{row['buy_score']:.2f}/100",
             f"{row['sell_score']:.2f}/100",
             f"{row['directional_score']:.2f}/100",
@@ -1878,7 +1945,7 @@ with st.expander("🗄️ Candle Cache"):
 st.divider()
 
 st.caption(
-    "Spot AI Scanner PRO • 15m • Walk-Forward AI • "
+    "Spot AI Scanner PRO • 15m Scalping • +10% in ≤30m • "
     "500K Historical Target • No Order Execution"
 )
 
