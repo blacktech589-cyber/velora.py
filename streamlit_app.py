@@ -1,5 +1,4 @@
 import os
-import math
 import time
 import traceback
 from datetime import datetime, timezone
@@ -9,44 +8,25 @@ import pandas as pd
 import requests
 import streamlit as st
 
-
-# ============================================================
-# SAFE PYTORCH IMPORT
-# ============================================================
-
-TORCH_AVAILABLE = False
-TORCH_IMPORT_ERROR = ""
-
-try:
-    import torch
-    import torch.nn as nn
-    from torch.utils.data import DataLoader, TensorDataset
-
-    TORCH_AVAILABLE = True
-
-except Exception as exc:
-    TORCH_AVAILABLE = False
-    TORCH_IMPORT_ERROR = str(exc)
-
-    torch = None
-    nn = None
-    DataLoader = None
-    TensorDataset = None
+from sklearn.neural_network import MLPClassifier
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
 
 
 # ============================================================
-# STREAMLIT
+# STREAMLIT CONFIG
 # ============================================================
 
 st.set_page_config(
     page_title="Spot AI Scanner",
     page_icon="📈",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
 
 # ============================================================
-# SETTINGS
+# CONFIGURATION
 # ============================================================
 
 BASE_URL = os.getenv(
@@ -56,35 +36,29 @@ BASE_URL = os.getenv(
 
 INTERVAL = "15m"
 
-MAX_KLINE_LIMIT = 1000
+KLINE_LIMIT = 1000
 
-SEQ_LEN = 128
+DEFAULT_CANDLE_TARGET = 500_000
+
+DEFAULT_SYMBOL_COUNT = 10
 
 FUTURE_BARS = 12
 
 BUY_SELL_THRESHOLD = 0.003
 
-DEVICE = (
-    "cuda"
-    if TORCH_AVAILABLE and torch.cuda.is_available()
-    else "cpu"
-)
-
 REQUEST_TIMEOUT = 30
 
-EPOCHS = 3
+MAX_TRAINING_SAMPLES = 3000
 
-BATCH_SIZE = 128
-
-LEARNING_RATE = 0.0001
+RANDOM_STATE = 42
 
 
 # ============================================================
 # SESSION STATE
 # ============================================================
 
-if "cache" not in st.session_state:
-    st.session_state.cache = {}
+if "candle_cache" not in st.session_state:
+    st.session_state.candle_cache = {}
 
 if "results" not in st.session_state:
     st.session_state.results = pd.DataFrame()
@@ -92,47 +66,15 @@ if "results" not in st.session_state:
 if "last_scan" not in st.session_state:
     st.session_state.last_scan = None
 
-if "error" not in st.session_state:
-    st.session_state.error = ""
+if "last_error" not in st.session_state:
+    st.session_state.last_error = ""
+
+if "scan_count" not in st.session_state:
+    st.session_state.scan_count = 0
 
 
 # ============================================================
-# HELPERS
-# ============================================================
-
-def safe_float(value, default=0.0):
-
-    try:
-
-        result = float(value)
-
-        if not np.isfinite(result):
-            return default
-
-        return result
-
-    except Exception:
-
-        return default
-
-
-def clamp(value, minimum, maximum):
-
-    return max(
-        minimum,
-        min(maximum, value)
-    )
-
-
-def now_utc():
-
-    return datetime.now(
-        timezone.utc
-    )
-
-
-# ============================================================
-# HTTP
+# HTTP SESSION
 # ============================================================
 
 http = requests.Session()
@@ -142,9 +84,58 @@ http.headers.update({
 })
 
 
-def api_get(endpoint, params=None):
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
 
-    url = BASE_URL + endpoint
+def safe_float(value, default=0.0):
+
+    try:
+
+        value = float(value)
+
+        if not np.isfinite(value):
+
+            return default
+
+        return value
+
+    except Exception:
+
+        return default
+
+
+def clamp(value, low, high):
+
+    return max(
+        low,
+        min(
+            high,
+            value
+        )
+    )
+
+
+def utc_now():
+
+    return datetime.now(
+        timezone.utc
+    )
+
+
+# ============================================================
+# API
+# ============================================================
+
+def api_get(
+    endpoint,
+    params=None
+):
+
+    url = (
+        BASE_URL
+        + endpoint
+    )
 
     response = http.get(
         url,
@@ -155,14 +146,16 @@ def api_get(endpoint, params=None):
     if response.status_code == 451:
 
         raise RuntimeError(
-            "HTTP 451: Binance API bu ortamdan "
-            "erişime izin vermiyor."
+            "HTTP 451: Binance API bu çalışma "
+            "ortamından erişime izin vermiyor. "
+            "Bu bir Python veya Streamlit kod hatası değildir."
         )
 
     if response.status_code == 429:
 
         raise RuntimeError(
-            "HTTP 429: Binance API rate limit."
+            "HTTP 429: Binance API rate limit. "
+            "İstek sayısı azaltılmalı."
         )
 
     response.raise_for_status()
@@ -171,11 +164,11 @@ def api_get(endpoint, params=None):
 
 
 # ============================================================
-# EXCHANGE INFO
+# EXCHANGE INFORMATION
 # ============================================================
 
 @st.cache_data(ttl=900)
-def exchange_info():
+def get_exchange_info():
 
     data = api_get(
         "/api/v3/exchangeInfo"
@@ -205,11 +198,11 @@ def exchange_info():
             ""
         )
 
-        if quote not in [
+        if quote not in (
             "USDT",
             "USDC",
             "FDUSD"
-        ]:
+        ):
 
             continue
 
@@ -229,7 +222,7 @@ def exchange_info():
 
 
 # ============================================================
-# KLINES
+# KLINE API
 # ============================================================
 
 def get_klines(
@@ -244,19 +237,23 @@ def get_klines(
         "interval": INTERVAL,
         "limit": min(
             int(limit),
-            MAX_KLINE_LIMIT
+            KLINE_LIMIT
         )
     }
 
     if start_time is not None:
 
-        params["startTime"] = int(
+        params[
+            "startTime"
+        ] = int(
             start_time
         )
 
     if end_time is not None:
 
-        params["endTime"] = int(
+        params[
+            "endTime"
+        ] = int(
             end_time
         )
 
@@ -266,7 +263,11 @@ def get_klines(
     )
 
 
-def klines_dataframe(data):
+# ============================================================
+# KLINE DATAFRAME
+# ============================================================
+
+def convert_klines(data):
 
     if not data:
 
@@ -292,7 +293,7 @@ def klines_dataframe(data):
         columns=columns
     )
 
-    numeric = [
+    numeric_columns = [
         "open",
         "high",
         "low",
@@ -304,7 +305,7 @@ def klines_dataframe(data):
         "taker_buy_quote"
     ]
 
-    for column in numeric:
+    for column in numeric_columns:
 
         df[column] = pd.to_numeric(
             df[column],
@@ -313,6 +314,11 @@ def klines_dataframe(data):
 
     df["open_time"] = pd.to_numeric(
         df["open_time"],
+        errors="coerce"
+    )
+
+    df["close_time"] = pd.to_numeric(
+        df["close_time"],
         errors="coerce"
     )
 
@@ -328,7 +334,9 @@ def klines_dataframe(data):
     )
 
     df = df.drop_duplicates(
-        "open_time"
+        subset=[
+            "open_time"
+        ]
     )
 
     df = df.sort_values(
@@ -341,16 +349,16 @@ def klines_dataframe(data):
 
 
 # ============================================================
-# DOWNLOAD HISTORY
+# DOWNLOAD 500K CANDLES
 # ============================================================
 
 def download_history(
     symbol,
     target,
-    progress=None
+    progress_bar=None
 ):
 
-    pieces = []
+    parts = []
 
     remaining = int(
         target
@@ -358,18 +366,18 @@ def download_history(
 
     end_time = None
 
-    completed = 0
+    downloaded = 0
 
     while remaining > 0:
 
         limit = min(
-            MAX_KLINE_LIMIT,
+            KLINE_LIMIT,
             remaining
         )
 
         data = get_klines(
-            symbol,
-            limit,
+            symbol=symbol,
+            limit=limit,
             end_time=end_time
         )
 
@@ -377,28 +385,28 @@ def download_history(
 
             break
 
-        part = klines_dataframe(
+        batch = convert_klines(
             data
         )
 
-        if part.empty:
+        if batch.empty:
 
             break
 
-        pieces.append(
-            part
+        parts.append(
+            batch
         )
 
         received = len(
-            part
+            batch
         )
 
-        completed += received
+        downloaded += received
 
         remaining -= received
 
         oldest = int(
-            part[
+            batch[
                 "open_time"
             ].min()
         )
@@ -407,11 +415,11 @@ def download_history(
             oldest - 1
         )
 
-        if progress:
+        if progress_bar:
 
-            progress.progress(
+            progress_bar.progress(
                 min(
-                    completed / target,
+                    downloaded / target,
                     1.0
                 )
             )
@@ -424,34 +432,36 @@ def download_history(
             0.05
         )
 
-    if not pieces:
+    if not parts:
 
         return pd.DataFrame()
 
-    df = pd.concat(
-        pieces,
+    result = pd.concat(
+        parts,
         ignore_index=True
     )
 
-    df = df.drop_duplicates(
+    result = result.drop_duplicates(
+        subset=[
+            "open_time"
+        ]
+    )
+
+    result = result.sort_values(
         "open_time"
     )
 
-    df = df.sort_values(
-        "open_time"
-    )
-
-    df = df.tail(
+    result = result.tail(
         target
     )
 
-    return df.reset_index(
+    return result.reset_index(
         drop=True
     )
 
 
 # ============================================================
-# UPDATE CACHE
+# UPDATE EXISTING CANDLES
 # ============================================================
 
 def update_history(
@@ -470,23 +480,23 @@ def update_history(
             target
         )
 
-    last_time = int(
+    last_open_time = int(
         existing[
             "open_time"
         ].max()
     )
 
     data = get_klines(
-        symbol,
-        1000,
-        start_time=last_time + 1
+        symbol=symbol,
+        limit=1000,
+        start_time=last_open_time + 1
     )
 
     if not data:
 
         return existing
 
-    new_data = klines_dataframe(
+    new_data = convert_klines(
         data
     )
 
@@ -494,7 +504,7 @@ def update_history(
 
         return existing
 
-    df = pd.concat(
+    combined = pd.concat(
         [
             existing,
             new_data
@@ -502,28 +512,33 @@ def update_history(
         ignore_index=True
     )
 
-    df = df.drop_duplicates(
+    combined = combined.drop_duplicates(
+        subset=[
+            "open_time"
+        ]
+    )
+
+    combined = combined.sort_values(
         "open_time"
     )
 
-    df = df.sort_values(
-        "open_time"
-    )
-
-    df = df.tail(
+    combined = combined.tail(
         target
     )
 
-    return df.reset_index(
+    return combined.reset_index(
         drop=True
     )
 
 
 # ============================================================
-# INDICATORS
+# TECHNICAL INDICATORS
 # ============================================================
 
-def EMA(series, period):
+def ema(
+    series,
+    period
+):
 
     return series.ewm(
         span=period,
@@ -531,7 +546,10 @@ def EMA(series, period):
     ).mean()
 
 
-def RSI(series, period=14):
+def rsi(
+    series,
+    period=14
+):
 
     delta = series.diff()
 
@@ -553,41 +571,54 @@ def RSI(series, period=14):
         adjust=False
     ).mean()
 
-    rs = avg_gain / (
-        avg_loss + 1e-12
+    rs = (
+        avg_gain
+        / (
+            avg_loss
+            + 1e-12
+        )
     )
 
-    return 100 - (
-        100 / (1 + rs)
+    return (
+        100
+        - (
+            100
+            / (
+                1 + rs
+            )
+        )
     )
 
 
-def ATR(df, period=14):
+def atr(
+    df,
+    period=14
+):
 
-    previous = df[
-        "close"
-    ].shift(1)
+    previous_close = (
+        df["close"].shift(1)
+    )
 
-    a = (
+    tr1 = (
         df["high"]
         - df["low"]
     )
 
-    b = (
+    tr2 = (
         df["high"]
-        - previous
+        - previous_close
     ).abs()
 
-    c = (
+    tr3 = (
         df["low"]
-        - previous
+        - previous_close
     ).abs()
 
     tr = pd.concat(
         [
-            a,
-            b,
-            c
+            tr1,
+            tr2,
+            tr3
         ],
         axis=1
     ).max(
@@ -600,14 +631,16 @@ def ATR(df, period=14):
     ).mean()
 
 
-def MACD(series):
+def macd(
+    series
+):
 
-    fast = EMA(
+    fast = ema(
         series,
         12
     )
 
-    slow = EMA(
+    slow = ema(
         series,
         26
     )
@@ -616,7 +649,7 @@ def MACD(series):
         fast - slow
     )
 
-    signal = EMA(
+    signal = ema(
         line,
         9
     )
@@ -632,7 +665,10 @@ def MACD(series):
     )
 
 
-def ADX(df, period=14):
+def adx(
+    df,
+    period=14
+):
 
     high = df["high"]
 
@@ -642,32 +678,32 @@ def ADX(df, period=14):
 
     previous_low = low.shift(1)
 
-    up = (
+    up_move = (
         high
         - previous_high
     )
 
-    down = (
+    down_move = (
         previous_low
         - low
     )
 
-    plus_dm = up.where(
+    plus_dm = up_move.where(
         (
-            up > down
+            up_move > down_move
         )
         & (
-            up > 0
+            up_move > 0
         ),
         0
     )
 
-    minus_dm = down.where(
+    minus_dm = down_move.where(
         (
-            down > up
+            down_move > up_move
         )
         & (
-            down > 0
+            down_move > 0
         ),
         0
     )
@@ -679,8 +715,14 @@ def ADX(df, period=14):
     tr = pd.concat(
         [
             high - low,
-            (high - previous_close).abs(),
-            (low - previous_close).abs()
+            (
+                high
+                - previous_close
+            ).abs(),
+            (
+                low
+                - previous_close
+            ).abs()
         ],
         axis=1
     ).max(
@@ -699,7 +741,8 @@ def ADX(df, period=14):
             adjust=False
         ).mean()
         / (
-            atr_value + 1e-12
+            atr_value
+            + 1e-12
         )
     )
 
@@ -710,7 +753,8 @@ def ADX(df, period=14):
             adjust=False
         ).mean()
         / (
-            atr_value + 1e-12
+            atr_value
+            + 1e-12
         )
     )
 
@@ -734,7 +778,7 @@ def ADX(df, period=14):
 
 
 # ============================================================
-# FEATURES
+# FEATURE ENGINEERING
 # ============================================================
 
 FEATURES = [
@@ -744,38 +788,53 @@ FEATURES = [
     "ret12",
     "ret24",
     "ret48",
-    "ema5",
-    "ema20",
-    "ema50",
-    "ema100",
-    "ema200",
-    "ema500",
-    "ema800",
+
+    "ema5_dist",
+    "ema20_dist",
+    "ema50_dist",
+    "ema100_dist",
+    "ema200_dist",
+    "ema500_dist",
+    "ema800_dist",
+
     "ema20_50",
     "ema50_200",
+
     "rsi7",
     "rsi14",
     "rsi21",
+
     "macd",
     "macd_signal",
     "macd_hist",
+
     "bb_position",
     "bb_width",
+
     "atr_pct",
+
     "adx",
+
     "volume_ratio",
+
     "body_pct",
     "range_pct",
+
     "volatility24",
     "volatility48",
-    "high_distance",
-    "low_distance",
+
+    "distance_high",
+    "distance_low",
+
     "drawdown",
+
     "price_z"
 ]
 
 
-def make_features(df):
+def build_features(
+    df
+):
 
     df = df.copy()
 
@@ -789,188 +848,228 @@ def make_features(df):
 
     volume = df["volume"]
 
-    # Returns
-    df["ret1"] = close.pct_change(1)
+    # --------------------------------------------------------
+    # RETURNS
+    # --------------------------------------------------------
 
-    df["ret3"] = close.pct_change(3)
+    df["ret1"] = (
+        close.pct_change(1)
+    )
 
-    df["ret6"] = close.pct_change(6)
+    df["ret3"] = (
+        close.pct_change(3)
+    )
 
-    df["ret12"] = close.pct_change(12)
+    df["ret6"] = (
+        close.pct_change(6)
+    )
 
-    df["ret24"] = close.pct_change(24)
+    df["ret12"] = (
+        close.pct_change(12)
+    )
 
-    df["ret48"] = close.pct_change(48)
+    df["ret24"] = (
+        close.pct_change(24)
+    )
 
-    # EMAs
-    e5 = EMA(
+    df["ret48"] = (
+        close.pct_change(48)
+    )
+
+    # --------------------------------------------------------
+    # EMA
+    # --------------------------------------------------------
+
+    e5 = ema(
         close,
         5
     )
 
-    e20 = EMA(
+    e20 = ema(
         close,
         20
     )
 
-    e50 = EMA(
+    e50 = ema(
         close,
         50
     )
 
-    e100 = EMA(
+    e100 = ema(
         close,
         100
     )
 
-    e200 = EMA(
+    e200 = ema(
         close,
         200
     )
 
-    e500 = EMA(
+    e500 = ema(
         close,
         500
     )
 
-    e800 = EMA(
+    e800 = ema(
         close,
         800
     )
 
-    df["ema5"] = (
-        close / (
+    df["ema5_dist"] = (
+        close
+        / (
             e5 + 1e-12
         )
     ) - 1
 
-    df["ema20"] = (
-        close / (
+    df["ema20_dist"] = (
+        close
+        / (
             e20 + 1e-12
         )
     ) - 1
 
-    df["ema50"] = (
-        close / (
+    df["ema50_dist"] = (
+        close
+        / (
             e50 + 1e-12
         )
     ) - 1
 
-    df["ema100"] = (
-        close / (
+    df["ema100_dist"] = (
+        close
+        / (
             e100 + 1e-12
         )
     ) - 1
 
-    df["ema200"] = (
-        close / (
+    df["ema200_dist"] = (
+        close
+        / (
             e200 + 1e-12
         )
     ) - 1
 
-    df["ema500"] = (
-        close / (
+    df["ema500_dist"] = (
+        close
+        / (
             e500 + 1e-12
         )
     ) - 1
 
-    df["ema800"] = (
-        close / (
+    df["ema800_dist"] = (
+        close
+        / (
             e800 + 1e-12
         )
     ) - 1
 
     df["ema20_50"] = (
-        e20 / (
+        e20
+        / (
             e50 + 1e-12
         )
     ) - 1
 
     df["ema50_200"] = (
-        e50 / (
+        e50
+        / (
             e200 + 1e-12
         )
     ) - 1
 
+    # --------------------------------------------------------
     # RSI
-    df["rsi7"] = RSI(
+    # --------------------------------------------------------
+
+    df["rsi7"] = rsi(
         close,
         7
     )
 
-    df["rsi14"] = RSI(
+    df["rsi14"] = rsi(
         close,
         14
     )
 
-    df["rsi21"] = RSI(
+    df["rsi21"] = rsi(
         close,
         21
     )
 
+    # --------------------------------------------------------
     # MACD
-    m_line, m_signal, m_hist = MACD(
+    # --------------------------------------------------------
+
+    macd_line, macd_signal, macd_hist = macd(
         close
     )
 
     df["macd"] = (
-        m_line
+        macd_line
         / (
             close + 1e-12
         )
     )
 
     df["macd_signal"] = (
-        m_signal
+        macd_signal
         / (
             close + 1e-12
         )
     )
 
     df["macd_hist"] = (
-        m_hist
+        macd_hist
         / (
             close + 1e-12
         )
     )
 
-    # Bollinger
-    middle = close.rolling(
+    # --------------------------------------------------------
+    # BOLLINGER
+    # --------------------------------------------------------
+
+    bb_middle = close.rolling(
         20
     ).mean()
 
-    std = close.rolling(
+    bb_std = close.rolling(
         20
     ).std()
 
-    upper = (
-        middle
-        + 2 * std
+    bb_upper = (
+        bb_middle
+        + 2 * bb_std
     )
 
-    lower = (
-        middle
-        - 2 * std
+    bb_lower = (
+        bb_middle
+        - 2 * bb_std
     )
 
     df["bb_position"] = (
         close
-        - lower
+        - bb_lower
     ) / (
-        upper
-        - lower
+        bb_upper
+        - bb_lower
         + 1e-12
     )
 
     df["bb_width"] = (
-        upper - lower
+        bb_upper
+        - bb_lower
     ) / (
-        middle.abs()
+        bb_middle.abs()
         + 1e-12
     )
 
+    # --------------------------------------------------------
     # ATR
-    atr_value = ATR(
+    # --------------------------------------------------------
+
+    atr_value = atr(
         df
     )
 
@@ -981,41 +1080,56 @@ def make_features(df):
         )
     )
 
+    # --------------------------------------------------------
     # ADX
-    df["adx"] = ADX(
+    # --------------------------------------------------------
+
+    df["adx"] = adx(
         df
     )
 
-    # Volume
-    volume_average = (
-        volume.rolling(
-            20
-        ).mean()
+    # --------------------------------------------------------
+    # VOLUME
+    # --------------------------------------------------------
+
+    average_volume = (
+        volume
+        .rolling(20)
+        .mean()
     )
 
     df["volume_ratio"] = (
         volume
         / (
-            volume_average
+            average_volume
             + 1e-12
         )
     )
 
-    # Candle
+    # --------------------------------------------------------
+    # CANDLE
+    # --------------------------------------------------------
+
     df["body_pct"] = (
         close
         - open_price
     ) / (
-        close + 1e-12
+        close
+        + 1e-12
     )
 
     df["range_pct"] = (
-        high - low
+        high
+        - low
     ) / (
-        close + 1e-12
+        close
+        + 1e-12
     )
 
-    # Volatility
+    # --------------------------------------------------------
+    # VOLATILITY
+    # --------------------------------------------------------
+
     df["volatility24"] = (
         df["ret1"]
         .rolling(24)
@@ -1028,16 +1142,23 @@ def make_features(df):
         .std()
     )
 
-    # High / Low
-    rolling_high = high.rolling(
-        100
-    ).max()
+    # --------------------------------------------------------
+    # HIGH / LOW
+    # --------------------------------------------------------
 
-    rolling_low = low.rolling(
-        100
-    ).min()
+    rolling_high = (
+        high
+        .rolling(100)
+        .max()
+    )
 
-    df["high_distance"] = (
+    rolling_low = (
+        low
+        .rolling(100)
+        .min()
+    )
+
+    df["distance_high"] = (
         close
         / (
             rolling_high
@@ -1045,7 +1166,7 @@ def make_features(df):
         )
     ) - 1
 
-    df["low_distance"] = (
+    df["distance_low"] = (
         close
         / (
             rolling_low
@@ -1053,7 +1174,10 @@ def make_features(df):
         )
     ) - 1
 
-    # Drawdown
+    # --------------------------------------------------------
+    # DRAWDOWN
+    # --------------------------------------------------------
+
     df["drawdown"] = (
         close
         / (
@@ -1062,582 +1186,238 @@ def make_features(df):
         )
     ) - 1
 
-    # Z-score
-    mean = close.rolling(
-        100
-    ).mean()
+    # --------------------------------------------------------
+    # Z SCORE
+    # --------------------------------------------------------
 
-    std = close.rolling(
-        100
-    ).std()
+    rolling_mean = (
+        close
+        .rolling(100)
+        .mean()
+    )
+
+    rolling_std = (
+        close
+        .rolling(100)
+        .std()
+    )
 
     df["price_z"] = (
         close
-        - mean
+        - rolling_mean
     ) / (
-        std + 1e-12
+        rolling_std
+        + 1e-12
     )
 
     return df
 
 
 # ============================================================
-# TARGET
+# TARGET CREATION
 # ============================================================
 
-def make_targets(df):
+def create_targets(
+    df
+):
 
     df = df.copy()
 
-    future = (
-        df["close"].shift(
+    future_return = (
+        df["close"]
+        .shift(
             -FUTURE_BARS
         )
         / df["close"]
     ) - 1
 
     target = np.ones(
-        len(df)
+        len(df),
+        dtype=float
     )
 
     target[
-        future > BUY_SELL_THRESHOLD
+        future_return
+        > BUY_SELL_THRESHOLD
     ] = 2
 
     target[
-        future < -BUY_SELL_THRESHOLD
+        future_return
+        < -BUY_SELL_THRESHOLD
     ] = 0
 
     target[
-        future.isna()
+        future_return.isna()
     ] = np.nan
 
-    df["future_return"] = future
+    df["future_return"] = (
+        future_return
+    )
 
-    df["target"] = target
+    df["target"] = (
+        target
+    )
 
     return df
 
 
 # ============================================================
-# SCALER
+# AI TRAINING
 # ============================================================
 
-class Scaler:
-
-    def __init__(self):
-
-        self.mean = None
-
-        self.std = None
-
-    def fit(self, x):
-
-        self.mean = np.nanmean(
-            x,
-            axis=0
-        )
-
-        self.std = np.nanstd(
-            x,
-            axis=0
-        )
-
-        self.std[
-            self.std < 1e-8
-        ] = 1.0
-
-        return self
-
-    def transform(self, x):
-
-        return (
-            x - self.mean
-        ) / self.std
-
-
-# ============================================================
-# MODEL
-# ============================================================
-
-if TORCH_AVAILABLE:
-
-    class PositionalEncoding(nn.Module):
-
-        def __init__(
-            self,
-            d_model,
-            max_len=4096
-        ):
-
-            super().__init__()
-
-            position = torch.arange(
-                max_len,
-                dtype=torch.float32
-            ).unsqueeze(1)
-
-            div = torch.exp(
-                torch.arange(
-                    0,
-                    d_model,
-                    2,
-                    dtype=torch.float32
-                )
-                * (
-                    -math.log(10000.0)
-                    / d_model
-                )
-            )
-
-            pe = torch.zeros(
-                max_len,
-                d_model
-            )
-
-            pe[:, 0::2] = torch.sin(
-                position * div
-            )
-
-            pe[:, 1::2] = torch.cos(
-                position * div
-            )
-
-            pe = pe.unsqueeze(0)
-
-            self.register_buffer(
-                "pe",
-                pe
-            )
-
-        def forward(self, x):
-
-            length = x.shape[1]
-
-            return (
-                x
-                + self.pe[
-                    :, :length
-                ]
-            )
-
-
-    class AIModel(nn.Module):
-
-        def __init__(
-            self,
-            input_size
-        ):
-
-            super().__init__()
-
-            d_model = 128
-
-            self.input = nn.Linear(
-                input_size,
-                d_model
-            )
-
-            self.position = PositionalEncoding(
-                d_model
-            )
-
-            layer = nn.TransformerEncoderLayer(
-                d_model=d_model,
-                nhead=8,
-                dim_feedforward=512,
-                dropout=0.15,
-                activation="gelu",
-                batch_first=True,
-                norm_first=True
-            )
-
-            self.encoder = nn.TransformerEncoder(
-                layer,
-                num_layers=4
-            )
-
-            self.norm = nn.LayerNorm(
-                d_model
-            )
-
-            self.classifier = nn.Sequential(
-                nn.Linear(
-                    d_model,
-                    64
-                ),
-                nn.GELU(),
-                nn.Dropout(0.15),
-                nn.Linear(
-                    64,
-                    3
-                )
-            )
-
-            self.regressor = nn.Sequential(
-                nn.Linear(
-                    d_model,
-                    64
-                ),
-                nn.GELU(),
-                nn.Dropout(0.15),
-                nn.Linear(
-                    64,
-                    1
-                )
-            )
-
-        def forward(self, x):
-
-            x = self.input(
-                x
-            )
-
-            x = self.position(
-                x
-            )
-
-            x = self.encoder(
-                x
-            )
-
-            x = self.norm(
-                x
-            )
-
-            x = x.mean(
-                dim=1
-            )
-
-            classification = (
-                self.classifier(x)
-            )
-
-            regression = (
-                self.regressor(x)
-                .squeeze(-1)
-            )
-
-            return (
-                classification,
-                regression
-            )
-
-else:
-
-    PositionalEncoding = None
-    AIModel = None
-
-
-# ============================================================
-# PREPARE DATA
-# ============================================================
-
-def prepare_data(
-    data,
-    scaler
-):
-
-    x = data[
-        FEATURES
-    ].values.astype(
-        np.float32
-    )
-
-    y = data[
-        "target"
-    ].values.astype(
-        np.int64
-    )
-
-    r = data[
-        "future_return"
-    ].values.astype(
-        np.float32
-    )
-
-    x = scaler.transform(
-        x
-    ).astype(
-        np.float32
-    )
-
-    sequences = []
-
-    classes = []
-
-    returns = []
-
-    start = max(
-        SEQ_LEN,
-        len(x) - 2500
-    )
-
-    for i in range(
-        start,
-        len(x)
-    ):
-
-        sequence = x[
-            i - SEQ_LEN:i
-        ]
-
-        if len(sequence) != SEQ_LEN:
-
-            continue
-
-        sequences.append(
-            sequence
-        )
-
-        classes.append(
-            y[i]
-        )
-
-        returns.append(
-            r[i]
-        )
-
-    if not sequences:
-
-        return None
-
-    return (
-        np.asarray(
-            sequences,
-            dtype=np.float32
-        ),
-        np.asarray(
-            classes,
-            dtype=np.int64
-        ),
-        np.asarray(
-            returns,
-            dtype=np.float32
-        )
-    )
-
-
-# ============================================================
-# TRAIN MODEL
-# ============================================================
-
-def train(
+def train_ai(
     data
 ):
 
-    if not TORCH_AVAILABLE:
+    if len(data) < 500:
 
         raise RuntimeError(
-            "PyTorch bulunamadı: "
-            + TORCH_IMPORT_ERROR
+            "AI eğitimi için en az "
+            "500 temiz satır gerekli."
         )
 
-    if len(data) < (
-        SEQ_LEN + 100
-    ):
+    train_data = data.tail(
+        MAX_TRAINING_SAMPLES
+    ).copy()
 
-        raise RuntimeError(
-            "Eğitim için yeterli veri yok."
-        )
+    x = train_data[
+        FEATURES
+    ].values
 
-    scaler = Scaler()
+    y = train_data[
+        "target"
+    ].astype(
+        int
+    ).values
 
-    scaler.fit(
-        data[
-            FEATURES
-        ].values.astype(
-            np.float32
-        )
+    returns = train_data[
+        "future_return"
+    ].values
+
+    scaler = StandardScaler()
+
+    x_scaled = scaler.fit_transform(
+        x
     )
 
-    prepared = prepare_data(
-        data,
-        scaler
+    classifier = MLPClassifier(
+        hidden_layer_sizes=(
+            128,
+            64
+        ),
+        activation="relu",
+        solver="adam",
+        alpha=0.0001,
+        batch_size=128,
+        learning_rate_init=0.001,
+        max_iter=25,
+        early_stopping=True,
+        validation_fraction=0.15,
+        random_state=RANDOM_STATE
     )
 
-    if prepared is None:
-
-        raise RuntimeError(
-            "Training sequence oluşturulamadı."
-        )
-
-    x, y, r = prepared
-
-    x = torch.tensor(
-        x,
-        dtype=torch.float32
+    classifier.fit(
+        x_scaled,
+        y
     )
 
-    y = torch.tensor(
-        y,
-        dtype=torch.long
+    regression = Ridge(
+        alpha=1.0
     )
 
-    r = torch.tensor(
-        r,
-        dtype=torch.float32
+    regression.fit(
+        x_scaled,
+        returns
     )
-
-    dataset = TensorDataset(
-        x,
-        y,
-        r
-    )
-
-    loader = DataLoader(
-        dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True
-    )
-
-    model = AIModel(
-        len(FEATURES)
-    ).to(
-        DEVICE
-    )
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=LEARNING_RATE,
-        weight_decay=0.0001
-    )
-
-    class_loss = nn.CrossEntropyLoss()
-
-    regression_loss = nn.HuberLoss()
-
-    model.train()
-
-    for _ in range(
-        EPOCHS
-    ):
-
-        for batch_x, batch_y, batch_r in loader:
-
-            batch_x = batch_x.to(
-                DEVICE
-            )
-
-            batch_y = batch_y.to(
-                DEVICE
-            )
-
-            batch_r = batch_r.to(
-                DEVICE
-            )
-
-            optimizer.zero_grad()
-
-            logits, prediction = model(
-                batch_x
-            )
-
-            loss1 = class_loss(
-                logits,
-                batch_y
-            )
-
-            loss2 = regression_loss(
-                prediction,
-                batch_r
-            )
-
-            loss = (
-                loss1
-                + 2.0 * loss2
-            )
-
-            loss.backward()
-
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                1.0
-            )
-
-            optimizer.step()
 
     return (
-        model,
+        classifier,
+        regression,
         scaler
     )
 
 
 # ============================================================
-# PREDICT
+# AI PREDICTION
 # ============================================================
 
-def predict(
-    model,
+def predict_ai(
+    classifier,
+    regression,
     scaler,
     data
 ):
 
-    values = data[
+    latest = data[
         FEATURES
-    ].values.astype(
-        np.float32
+    ].iloc[
+        -1:
+    ].values
+
+    latest_scaled = scaler.transform(
+        latest
     )
 
-    values = scaler.transform(
-        values
-    ).astype(
-        np.float32
+    probabilities = (
+        classifier.predict_proba(
+            latest_scaled
+        )[0]
     )
 
-    sequence = values[
-        -SEQ_LEN:
+    classes = (
+        classifier.classes_
+    )
+
+    probability_map = {
+        0: 0.0,
+        1: 0.0,
+        2: 0.0
+    }
+
+    for cls, probability in zip(
+        classes,
+        probabilities
+    ):
+
+        probability_map[
+            int(cls)
+        ] = float(
+            probability
+        )
+
+    sell_probability = (
+        probability_map[0]
+    )
+
+    hold_probability = (
+        probability_map[1]
+    )
+
+    buy_probability = (
+        probability_map[2]
+    )
+
+    probabilities_list = [
+        sell_probability,
+        hold_probability,
+        buy_probability
     ]
 
-    tensor = torch.tensor(
-        sequence,
-        dtype=torch.float32
-    ).unsqueeze(
-        0
-    ).to(
-        DEVICE
-    )
-
-    model.eval()
-
-    with torch.no_grad():
-
-        logits, regression = model(
-            tensor
-        )
-
-        probabilities = torch.softmax(
-            logits,
-            dim=1
-        )[0].cpu().numpy()
-
-        expected = (
-            regression.item()
-        )
-
-    sell = safe_float(
-        probabilities[0]
-    )
-
-    hold = safe_float(
-        probabilities[1]
-    )
-
-    buy = safe_float(
-        probabilities[2]
-    )
-
     maximum = max(
-        sell,
-        hold,
-        buy
+        probabilities_list
     )
 
-    if buy == maximum:
+    if (
+        buy_probability
+        == maximum
+    ):
 
         signal = "BUY"
 
-    elif sell == maximum:
+    elif (
+        sell_probability
+        == maximum
+    ):
 
         signal = "SELL"
 
@@ -1645,30 +1425,36 @@ def predict(
 
         signal = "HOLD"
 
+    expected_return = float(
+        regression.predict(
+            latest_scaled
+        )[0]
+    )
+
     return {
         "signal": signal,
-        "buy": buy,
-        "sell": sell,
-        "hold": hold,
+        "sell": sell_probability,
+        "hold": hold_probability,
+        "buy": buy_probability,
         "confidence": maximum,
-        "expected": expected
+        "expected": expected_return
     }
 
 
 # ============================================================
-# ANALYSIS
+# SYMBOL ANALYSIS
 # ============================================================
 
-def analyze(
+def analyze_symbol(
     symbol,
     candles
 ):
 
-    features = make_features(
+    features = build_features(
         candles
     )
 
-    features = make_targets(
+    features = create_targets(
         features
     )
 
@@ -1686,66 +1472,76 @@ def analyze(
         np.nan
     ).dropna()
 
-    if len(clean) < (
-        SEQ_LEN + 100
-    ):
+    if len(clean) < 500:
 
         raise RuntimeError(
-            f"{symbol}: temiz veri yetersiz."
+            f"{symbol}: AI için yeterli "
+            "temiz veri bulunamadı."
         )
 
-    model, scaler = train(
+    classifier, regression, scaler = train_ai(
         clean
     )
 
-    prediction = predict(
-        model,
+    prediction = predict_ai(
+        classifier,
+        regression,
         scaler,
         clean
     )
 
-    row = features.dropna(
-        subset=FEATURES
-    ).iloc[-1]
+    latest = (
+        features
+        .dropna(
+            subset=FEATURES
+        )
+        .iloc[-1]
+    )
 
     price = safe_float(
-        row["close"]
+        latest["close"]
     )
 
     rsi_value = safe_float(
-        row["rsi14"],
+        latest["rsi14"],
         50
     )
 
     adx_value = safe_float(
-        row["adx"]
+        latest["adx"]
     )
 
     volume_ratio = safe_float(
-        row["volume_ratio"],
+        latest["volume_ratio"],
         1
     )
 
     volatility = safe_float(
-        row["volatility24"]
-    )
-
-    trend = safe_float(
-        row["ema50_200"]
+        latest["volatility24"]
     )
 
     momentum = safe_float(
-        row["ret24"]
+        latest["ret24"]
+    )
+
+    trend = safe_float(
+        latest["ema50_200"]
+    )
+
+    atr_pct = safe_float(
+        latest["atr_pct"]
     )
 
     trend_score = clamp(
-        50 + trend * 1000,
+        50
+        + trend * 1000,
         0,
         100
     )
 
     momentum_score = clamp(
-        50 + momentum * 500,
+        50
+        + momentum * 500,
         0,
         100
     )
@@ -1759,88 +1555,126 @@ def analyze(
     risk_score = clamp(
         50
         + volatility * 500
-        + safe_float(
-            row["atr_pct"]
-        ) * 300,
+        + atr_pct * 300,
         0,
         100
     )
 
-    score = (
-        (
-            prediction["buy"]
-            - prediction["sell"]
-        )
-        * 100
-        * 0.35
-    )
+    direction_score = (
+        prediction["buy"]
+        - prediction["sell"]
+    ) * 100
 
-    score += (
-        prediction["confidence"]
-        * 100
-        * 0.20
-    )
-
-    score += (
-        trend_score
-        * 0.15
-    )
-
-    score += (
-        momentum_score
-        * 0.10
-    )
-
-    score += (
-        liquidity_score
-        * 0.05
-    )
-
-    score += (
+    expected_score = (
         prediction["expected"]
         * 10000
-        * 0.15
     )
 
-    score -= (
-        risk_score
-        * 0.05
+    ai_score = (
+        direction_score * 0.35
+        + prediction["confidence"]
+        * 100
+        * 0.20
+        + trend_score * 0.15
+        + momentum_score * 0.10
+        + liquidity_score * 0.05
+        + expected_score * 0.15
+        - risk_score * 0.05
     )
 
     return {
         "symbol": symbol,
-        "signal": prediction["signal"],
-        "ai_score": score,
-        "confidence_pct": prediction["confidence"] * 100,
-        "buy_probability_pct": prediction["buy"] * 100,
-        "sell_probability_pct": prediction["sell"] * 100,
-        "hold_probability_pct": prediction["hold"] * 100,
-        "expected_return_pct": prediction["expected"] * 100,
-        "price": price,
-        "rsi": rsi_value,
-        "adx": adx_value,
-        "volume_ratio": volume_ratio,
-        "volatility_pct": volatility * 100,
-        "momentum_pct": momentum * 100,
-        "trend_pct": trend * 100,
-        "risk_score": risk_score,
-        "liquidity_score": liquidity_score,
-        "candle_count": len(candles)
+
+        "signal":
+            prediction["signal"],
+
+        "ai_score":
+            float(ai_score),
+
+        "confidence_pct":
+            prediction["confidence"] * 100,
+
+        "buy_probability_pct":
+            prediction["buy"] * 100,
+
+        "sell_probability_pct":
+            prediction["sell"] * 100,
+
+        "hold_probability_pct":
+            prediction["hold"] * 100,
+
+        "expected_return_pct":
+            prediction["expected"] * 100,
+
+        "price":
+            price,
+
+        "rsi":
+            rsi_value,
+
+        "adx":
+            adx_value,
+
+        "volume_ratio":
+            volume_ratio,
+
+        "volatility_pct":
+            volatility * 100,
+
+        "atr_pct":
+            atr_pct * 100,
+
+        "momentum_pct":
+            momentum * 100,
+
+        "trend_pct":
+            trend * 100,
+
+        "risk_score":
+            risk_score,
+
+        "liquidity_score":
+            liquidity_score,
+
+        "candle_count":
+            len(candles)
     }
 
 
 # ============================================================
-# SCAN
+# SELECT SYMBOLS
 # ============================================================
 
-def scan(
+def select_symbols(
+    symbols,
+    count
+):
+
+    usdt = [
+        symbol
+        for symbol in symbols
+        if symbol.endswith(
+            "USDT"
+        )
+    ]
+
+    return usdt[
+        :int(count)
+    ]
+
+
+# ============================================================
+# COMPLETE SCAN
+# ============================================================
+
+def run_scan(
     symbols,
     target,
     progress,
     status
 ):
 
-    output = []
+    results = []
 
     errors = []
 
@@ -1850,29 +1684,41 @@ def scan(
 
     for index, symbol in enumerate(
         symbols,
-        1
+        start=1
     ):
 
         status.info(
-            f"{symbol} taranıyor "
+            f"🔎 {symbol} "
+            f"analiz ediliyor "
             f"({index}/{total})"
         )
 
         progress.progress(
-            (index - 1) / total
+            (index - 1)
+            / max(
+                total,
+                1
+            )
         )
 
         try:
 
-            old = (
-                st.session_state.cache
+            existing = (
+                st.session_state
+                .candle_cache
                 .get(symbol)
             )
 
             if (
-                old is None
-                or len(old) < target
+                existing is None
+                or len(existing)
+                < target
             ):
+
+                status.info(
+                    f"📥 {symbol}: "
+                    f"{target:,} mum hazırlanıyor..."
+                )
 
                 candles = download_history(
                     symbol,
@@ -1881,28 +1727,33 @@ def scan(
 
             else:
 
+                status.info(
+                    f"🔄 {symbol}: "
+                    "yeni 15m mumlar ekleniyor..."
+                )
+
                 candles = update_history(
                     symbol,
-                    old,
+                    existing,
                     target
                 )
 
             if candles.empty:
 
                 raise RuntimeError(
-                    "Candle verisi boş."
+                    "Candle verisi alınamadı."
                 )
 
-            st.session_state.cache[
+            st.session_state.candle_cache[
                 symbol
             ] = candles
 
-            result = analyze(
+            result = analyze_symbol(
                 symbol,
                 candles
             )
 
-            output.append(
+            results.append(
                 result
             )
 
@@ -1918,79 +1769,51 @@ def scan(
 
     if errors:
 
-        st.session_state.error = (
+        st.session_state.last_error = (
             "\n".join(
                 errors
             )
         )
 
+    else:
+
+        st.session_state.last_error = ""
+
     return pd.DataFrame(
-        output
+        results
     )
-
-
-# ============================================================
-# HEADER
-# ============================================================
-
-st.title(
-    "📈 Binance Spot AI Deep Learning Scanner"
-)
-
-st.write(
-    "15m Spot market • Transformer • "
-    "500K candle target • Top 10 BUY/SELL"
-)
-
-
-# ============================================================
-# TORCH CHECK
-# ============================================================
-
-if not TORCH_AVAILABLE:
-
-    st.error(
-        "PyTorch yüklenemedi."
-    )
-
-    st.code(
-        TORCH_IMPORT_ERROR
-        or "Bilinmeyen hata"
-    )
-
-    st.markdown(
-        """
-requirements.txt:
-
-streamlit>=1.37,<2.0
-requests>=2.32
-pandas>=2.2
-numpy>=1.26,<2.0
-torch==2.4.1
-
-runtime.txt:
-
-python-3.11
-"""
-    )
-
-    st.stop()
 
 
 # ============================================================
 # SIDEBAR
 # ============================================================
 
-st.sidebar.header(
-    "⚙️ Ayarlar"
+st.sidebar.title(
+    "⚙️ Scanner Settings"
+)
+
+st.sidebar.write(
+    "PyTorch kullanılmıyor."
+)
+
+st.sidebar.write(
+    "AI: scikit-learn MLP"
+)
+
+st.sidebar.write(
+    f"Interval: {INTERVAL}"
+)
+
+st.sidebar.write(
+    "Orders: DISABLED"
 )
 
 candle_target = st.sidebar.number_input(
-    "Hedef mum",
-    min_value=10000,
-    max_value=500000,
-    value=500000,
-    step=10000
+    "Hedef candle",
+    min_value=10_000,
+    max_value=500_000,
+    value=500_000,
+    step=10_000
 )
 
 symbol_count = st.sidebar.number_input(
@@ -2001,43 +1824,98 @@ symbol_count = st.sidebar.number_input(
     step=1
 )
 
-automatic = st.sidebar.checkbox(
-    "15 dakikada yenile",
+auto_refresh = st.sidebar.checkbox(
+    "15 dakikada otomatik yenile",
     value=True
 )
 
-st.sidebar.write(
-    f"Device: {DEVICE}"
-)
+st.sidebar.divider()
 
 st.sidebar.write(
-    f"Interval: {INTERVAL}"
-)
-
-st.sidebar.write(
-    f"Sequence: {SEQ_LEN}"
-)
-
-st.sidebar.write(
-    f"Future bars: {FUTURE_BARS}"
+    f"API: {BASE_URL}"
 )
 
 
 # ============================================================
-# SCANNER FUNCTION
+# HEADER
+# ============================================================
+
+st.title(
+    "📈 Binance Spot AI Deep Learning Scanner"
+)
+
+st.markdown(
+    "15m Spot market • AI classification • "
+    "500K candle target • Top 10 BUY/SELL"
+)
+
+st.info(
+    "Bu sürüm PyTorch kullanmaz. "
+    "Streamlit Cloud üzerinde doğrudan "
+    "scikit-learn ile çalışır."
+)
+
+
+# ============================================================
+# SCANNER
 # ============================================================
 
 def scanner():
 
     st.subheader(
-        "🔎 Scanner"
+        "🔎 Market Scanner"
     )
 
-    if st.button(
+    col1, col2, col3, col4 = st.columns(
+        4
+    )
+
+    with col1:
+
+        st.metric(
+            "Son tarama",
+            st.session_state.last_scan
+            or "-"
+        )
+
+    with col2:
+
+        st.metric(
+            "Cache parite",
+            len(
+                st.session_state.candle_cache
+            )
+        )
+
+    with col3:
+
+        st.metric(
+            "Sonuç",
+            len(
+                st.session_state.results
+            )
+        )
+
+    with col4:
+
+        st.metric(
+            "Model",
+            "MLP AI"
+        )
+
+    st.divider()
+
+    scan_button = st.button(
         "🚀 ŞİMDİ TARA",
         type="primary",
         use_container_width=True
-    ):
+    )
+
+    first_scan = (
+        st.session_state.results.empty
+    )
+
+    if scan_button or first_scan:
 
         progress = st.progress(
             0
@@ -2048,35 +1926,29 @@ def scanner():
         try:
 
             status.info(
-                "Spot sembolleri alınıyor..."
+                "Binance Spot sembolleri "
+                "alınıyor..."
             )
 
-            all_symbols = exchange_info()
+            symbols = get_exchange_info()
 
-            usdt_symbols = [
-                x
-                for x in all_symbols
-                if x.endswith(
-                    "USDT"
-                )
-            ]
-
-            selected = usdt_symbols[
-                :int(symbol_count)
-            ]
+            selected = select_symbols(
+                symbols,
+                symbol_count
+            )
 
             if not selected:
 
                 raise RuntimeError(
-                    "USDT paritesi bulunamadı."
+                    "USDT Spot paritesi bulunamadı."
                 )
 
             st.info(
-                "Taranıyor: "
+                "Taranacak pariteler: "
                 + ", ".join(selected)
             )
 
-            result = scan(
+            results = run_scan(
                 selected,
                 int(candle_target),
                 progress,
@@ -2084,14 +1956,16 @@ def scanner():
             )
 
             st.session_state.results = (
-                result
+                results
             )
 
             st.session_state.last_scan = (
-                now_utc().strftime(
+                utc_now().strftime(
                     "%Y-%m-%d %H:%M:%S UTC"
                 )
             )
+
+            st.session_state.scan_count += 1
 
             status.success(
                 "Tarama tamamlandı."
@@ -2099,29 +1973,38 @@ def scanner():
 
         except Exception as exc:
 
-            st.error(
-                f"Tarama hatası: {exc}"
+            st.session_state.last_error = (
+                traceback.format_exc()
             )
 
-            st.session_state.error = (
-                traceback.format_exc()
+            st.error(
+                f"Tarama hatası: {exc}"
             )
 
             if "451" in str(exc):
 
                 st.warning(
-                    "Binance API bu ortamdan "
-                    "erişime kapalı olabilir."
+                    "HTTP 451: Binance API bu "
+                    "ortamdan erişime izin vermiyor."
                 )
 
     df = st.session_state.results
 
     if df.empty:
 
-        st.info(
-            "Henüz sonuç yok. "
-            "ŞİMDİ TARA butonuna basın."
+        st.warning(
+            "Henüz sonuç yok."
         )
+
+        if st.session_state.last_error:
+
+            with st.expander(
+                "Hata detayları"
+            ):
+
+                st.code(
+                    st.session_state.last_error
+                )
 
         return
 
@@ -2141,33 +2024,32 @@ def scanner():
         df["signal"] == "HOLD"
     ]
 
-    c1, c2, c3, c4 = st.columns(
+    a, b, c, d = st.columns(
         4
     )
 
-    c1.metric(
-        "BUY",
+    a.metric(
+        "🟢 BUY",
         len(buy)
     )
 
-    c2.metric(
-        "SELL",
+    b.metric(
+        "🔴 SELL",
         len(sell)
     )
 
-    c3.metric(
-        "HOLD",
+    c.metric(
+        "⚪ HOLD",
         len(hold)
     )
 
-    c4.metric(
-        "Son tarama",
-        st.session_state.last_scan
-        or "-"
+    d.metric(
+        "Tarama",
+        st.session_state.scan_count
     )
 
     # ========================================================
-    # TOP BUY
+    # BUY
     # ========================================================
 
     st.header(
@@ -2176,15 +2058,18 @@ def scanner():
 
     if not buy.empty:
 
-        buy = buy.sort_values(
-            "ai_score",
+        buy_display = buy.sort_values(
+            [
+                "ai_score",
+                "confidence_pct"
+            ],
             ascending=False
         ).head(
             10
         )
 
         st.dataframe(
-            buy,
+            buy_display,
             use_container_width=True,
             hide_index=True
         )
@@ -2192,11 +2077,11 @@ def scanner():
     else:
 
         st.info(
-            "BUY sonucu yok."
+            "BUY sinyali bulunamadı."
         )
 
     # ========================================================
-    # TOP SELL
+    # SELL
     # ========================================================
 
     st.header(
@@ -2205,15 +2090,18 @@ def scanner():
 
     if not sell.empty:
 
-        sell = sell.sort_values(
-            "ai_score",
+        sell_display = sell.sort_values(
+            [
+                "ai_score",
+                "confidence_pct"
+            ],
             ascending=False
         ).head(
             10
         )
 
         st.dataframe(
-            sell,
+            sell_display,
             use_container_width=True,
             hide_index=True
         )
@@ -2221,11 +2109,11 @@ def scanner():
     else:
 
         st.info(
-            "SELL sonucu yok."
+            "SELL sinyali bulunamadı."
         )
 
     # ========================================================
-    # ALL
+    # ALL RESULTS
     # ========================================================
 
     st.header(
@@ -2255,9 +2143,10 @@ def scanner():
 
     st.download_button(
         "⬇️ CSV indir",
-        csv,
-        "spot_ai_results.csv",
-        "text/csv"
+        data=csv,
+        file_name="spot_ai_results.csv",
+        mime="text/csv",
+        use_container_width=True
     )
 
     # ========================================================
@@ -2284,27 +2173,66 @@ def scanner():
 
         row = selected.iloc[0]
 
-        a, b, c = st.columns(
-            3
+        x1, x2, x3, x4 = st.columns(
+            4
         )
 
-        a.metric(
+        x1.metric(
             "Signal",
             row["signal"]
         )
 
-        b.metric(
+        x2.metric(
             "AI Score",
             f"{row['ai_score']:.2f}"
         )
 
-        c.metric(
+        x3.metric(
             "Confidence",
             f"{row['confidence_pct']:.2f}%"
         )
 
-        st.json(
-            row.to_dict()
+        x4.metric(
+            "Expected Return",
+            f"{row['expected_return_pct']:.3f}%"
+        )
+
+        detail_columns = [
+            "symbol",
+            "price",
+            "signal",
+            "ai_score",
+            "confidence_pct",
+            "buy_probability_pct",
+            "sell_probability_pct",
+            "hold_probability_pct",
+            "expected_return_pct",
+            "rsi",
+            "adx",
+            "volume_ratio",
+            "volatility_pct",
+            "atr_pct",
+            "momentum_pct",
+            "trend_pct",
+            "risk_score",
+            "liquidity_score",
+            "candle_count"
+        ]
+
+        detail = pd.DataFrame(
+            [
+                {
+                    column: row[column]
+                    for column in detail_columns
+                    if column in row.index
+                }
+            ]
+        )
+
+        st.dataframe(
+            detail,
+            use_container_width=True,
+            hide_index=True
         )
 
     # ========================================================
@@ -2312,64 +2240,87 @@ def scanner():
     # ========================================================
 
     st.header(
-        "🗄️ Cache"
+        "🗄️ Candle Cache"
     )
 
-    cache_info = []
+    cache_rows = []
 
     for symbol, candles in (
-        st.session_state.cache.items()
+        st.session_state
+        .candle_cache
+        .items()
     ):
 
-        cache_info.append(
+        cache_rows.append(
             {
                 "symbol": symbol,
                 "candles": len(candles)
             }
         )
 
-    if cache_info:
+    if cache_rows:
 
         st.dataframe(
             pd.DataFrame(
-                cache_info
+                cache_rows
             ),
             use_container_width=True,
             hide_index=True
         )
 
     # ========================================================
-    # ERROR
+    # ERRORS
     # ========================================================
 
-    if st.session_state.error:
+    if st.session_state.last_error:
 
         with st.expander(
-            "⚠️ Hata detayları"
+            "⚠️ Son hatalar"
         ):
 
             st.code(
-                st.session_state.error
+                st.session_state.last_error
             )
 
+    # ========================================================
+    # WARNING
+    # ========================================================
 
-# ============================================================
-# RUN
-# ============================================================
-
-if automatic and hasattr(
-    st,
-    "fragment"
-):
-
-    @st.fragment(
-        run_every="15m"
+    st.warning(
+        "Bu uygulama finansal tavsiye değildir. "
+        "AI tahminleri kesin fiyat tahmini değildir. "
+        "Otomatik emir gönderilmez."
     )
-    def scheduled_scanner():
+
+
+# ============================================================
+# AUTO REFRESH
+# ============================================================
+
+if auto_refresh:
+
+    if hasattr(
+        st,
+        "fragment"
+    ):
+
+        @st.fragment(
+            run_every="15m"
+        )
+        def scheduled_scanner():
+
+            scanner()
+
+        scheduled_scanner()
+
+    else:
 
         scanner()
 
-    scheduled_scanner()
+        st.info(
+            "Otomatik 15 dakika yenileme için "
+            "Streamlit 1.37 veya daha yeni sürüm gerekir."
+        )
 
 else:
 
@@ -2383,7 +2334,6 @@ else:
 st.divider()
 
 st.caption(
-    "Spot AI Deep Learning Scanner | "
-    "15m | Transformer | 500K Target | "
-    "No Order Execution"
+    "Spot AI Scanner | 15m | 500K target | "
+    "MLP AI | No Order Execution"
 )
