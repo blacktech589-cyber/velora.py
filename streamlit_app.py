@@ -1,6 +1,3 @@
-Aşağıdaki kodu `streamlit_app.py` dosyanın tamamının yerine koy:
-
-```python
 import time
 from datetime import datetime, timezone
 
@@ -15,7 +12,7 @@ from sklearn.preprocessing import StandardScaler
 
 
 # ============================================================
-# APP CONFIG
+# CONFIG
 # ============================================================
 
 st.set_page_config(
@@ -24,30 +21,20 @@ st.set_page_config(
     layout="wide"
 )
 
-APP_TITLE = "1000+ Crypto 15M AI Crash Scanner"
-
 BINANCE_URL = "https://api.binance.com"
 GATE_URL = "https://api.gateio.ws"
 
-TIMEFRAME = "15m"
+MIN_COINS = 1000
 
-MIN_SYMBOLS = 1000
-
-CRASH_LOOKBACK_BARS = 960
-CRASH_THRESHOLD_DEFAULT = 80.0
-
-PREDICTION_BARS = 2
+CRASH_BARS = 960
+WEEKLY_BARS = 672
 
 BUY_TARGET = 0.10
 SELL_TARGET = -0.10
 
-WEEKLY_BARS = 672
+PREDICTION_BARS = 2
 
-WEEKLY_DISTANCE = 0.015
-
-MIN_TRAIN_ROWS = 400
-
-REQUEST_TIMEOUT = 20
+MIN_DATA = 300
 
 FEATURES = [
     "ret1",
@@ -89,32 +76,32 @@ FEATURES = [
 
 
 # ============================================================
-# SESSION
+# HTTP SESSION
 # ============================================================
 
 session = requests.Session()
 
 session.headers.update(
     {
-        "User-Agent":
+        "User-Agent": (
             "Mozilla/5.0 "
             "(Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 "
             "Chrome/154.0 Safari/537.36"
+        )
     }
 )
 
 
-# ============================================================
-# HTTP
-# ============================================================
-
-def get_json(url, params=None):
-
+def get_json(
+    url,
+    params=None,
+    timeout=20
+):
     response = session.get(
         url,
         params=params,
-        timeout=REQUEST_TIMEOUT
+        timeout=timeout
     )
 
     response.raise_for_status()
@@ -133,7 +120,7 @@ def get_binance_symbols():
         BINANCE_URL + "/api/v3/exchangeInfo"
     )
 
-    rows = []
+    symbols = []
 
     for item in data.get("symbols", []):
 
@@ -146,11 +133,58 @@ def get_binance_symbols():
         if item.get("quoteAsset") != "USDT":
             continue
 
-        rows.append(
+        symbols.append(
             {
                 "symbol": item["symbol"],
-                "base": item.get("baseAsset", ""),
-                "quote": item.get("quoteAsset", "")
+                "base": item.get(
+                    "baseAsset",
+                    ""
+                ),
+                "quote": "USDT"
+            }
+        )
+
+    return pd.DataFrame(symbols)
+
+
+# ============================================================
+# BINANCE VOLUME
+# ============================================================
+
+def get_binance_volume():
+
+    data = get_json(
+        BINANCE_URL + "/api/v3/ticker/24hr"
+    )
+
+    rows = []
+
+    for item in data:
+
+        symbol = item.get(
+            "symbol",
+            ""
+        )
+
+        if not symbol.endswith(
+            "USDT"
+        ):
+            continue
+
+        try:
+            volume = float(
+                item.get(
+                    "quoteVolume",
+                    0
+                )
+            )
+        except Exception:
+            volume = 0.0
+
+        rows.append(
+            {
+                "symbol": symbol,
+                "volume": volume
             }
         )
 
@@ -158,12 +192,12 @@ def get_binance_symbols():
 
 
 # ============================================================
-# BINANCE 15M DATA
+# BINANCE CANDLES
 # ============================================================
 
-def get_binance_klines(
+def get_binance_candles(
     symbol,
-    limit=1000
+    limit=960
 ):
 
     data = get_json(
@@ -171,34 +205,46 @@ def get_binance_klines(
         params={
             "symbol": symbol,
             "interval": "15m",
-            "limit": min(limit, 1000)
+            "limit": min(
+                int(limit),
+                1000
+            )
         }
     )
 
-    if not data:
-        return pd.DataFrame()
-
     rows = []
 
-    for x in data:
+    for item in data:
 
         rows.append(
             {
                 "timestamp": pd.to_datetime(
-                    int(x[0]),
+                    int(item[0]),
                     unit="ms",
                     utc=True
                 ),
-                "open": float(x[1]),
-                "high": float(x[2]),
-                "low": float(x[3]),
-                "close": float(x[4]),
-                "volume": float(x[5])
+                "open": float(item[1]),
+                "high": float(item[2]),
+                "low": float(item[3]),
+                "close": float(item[4]),
+                "volume": float(item[5])
             }
         )
 
-    return pd.DataFrame(rows).set_index(
-        "timestamp"
+    if not rows:
+        return pd.DataFrame()
+
+    return (
+        pd.DataFrame(rows)
+        .drop_duplicates(
+            "timestamp"
+        )
+        .sort_values(
+            "timestamp"
+        )
+        .set_index(
+            "timestamp"
+        )
     )
 
 
@@ -210,33 +256,39 @@ def get_binance_klines(
 def get_gate_symbols():
 
     data = get_json(
-        GATE_URL + "/api/v4/spot/currency_pairs"
+        GATE_URL +
+        "/api/v4/spot/currency_pairs"
     )
 
     rows = []
 
     for item in data:
 
-        quote = str(
-            item.get("quote", "")
-        ).upper()
-
-        status = str(
-            item.get("trade_status", "")
-        ).lower()
-
-        if quote != "USDT":
+        if str(
+            item.get(
+                "quote",
+                ""
+            )
+        ).upper() != "USDT":
             continue
 
-        if status not in {
-            "",
+        status = str(
+            item.get(
+                "trade_status",
+                ""
+            )
+        ).lower()
+
+        if status and status not in {
             "tradable",
             "buyable",
             "sellable"
         }:
             continue
 
-        symbol = item.get("id")
+        symbol = item.get(
+            "id"
+        )
 
         if not symbol:
             continue
@@ -244,8 +296,11 @@ def get_gate_symbols():
         rows.append(
             {
                 "symbol": symbol,
-                "base": item.get("base", ""),
-                "quote": quote
+                "base": item.get(
+                    "base",
+                    ""
+                ),
+                "quote": "USDT"
             }
         )
 
@@ -253,43 +308,46 @@ def get_gate_symbols():
 
 
 # ============================================================
-# GATE TICKERS
+# GATE VOLUME
 # ============================================================
 
 @st.cache_data(ttl=120)
-def get_gate_tickers():
+def get_gate_volume():
 
     data = get_json(
-        GATE_URL + "/api/v4/spot/tickers"
+        GATE_URL +
+        "/api/v4/spot/tickers"
     )
 
     rows = []
 
     for item in data:
 
-        pair = item.get(
+        symbol = item.get(
             "currency_pair",
             ""
         )
 
-        if not pair.endswith("_USDT"):
+        if not symbol.endswith(
+            "_USDT"
+        ):
             continue
 
-        last = float(
-            item.get("last", 0)
-            or 0
-        )
-
-        quote_volume = float(
-            item.get("quote_volume", 0)
-            or 0
-        )
+        try:
+            volume = float(
+                item.get(
+                    "quote_volume",
+                    0
+                )
+                or 0
+            )
+        except Exception:
+            volume = 0.0
 
         rows.append(
             {
-                "symbol": pair,
-                "last": last,
-                "quote_volume": quote_volume
+                "symbol": symbol,
+                "volume": volume
             }
         )
 
@@ -297,12 +355,73 @@ def get_gate_tickers():
 
 
 # ============================================================
-# SELECT 1000+ SYMBOLS
+# GATE CANDLES
+# ============================================================
+
+def get_gate_candles(
+    symbol,
+    limit=960
+):
+
+    data = get_json(
+        GATE_URL +
+        "/api/v4/spot/candlesticks",
+        params={
+            "currency_pair": symbol,
+            "interval": "15m",
+            "limit": min(
+                int(limit),
+                1000
+            )
+        }
+    )
+
+    rows = []
+
+    for item in data:
+
+        if len(item) < 6:
+            continue
+
+        rows.append(
+            {
+                "timestamp": pd.to_datetime(
+                    int(item[0]),
+                    unit="s",
+                    utc=True
+                ),
+                "volume": float(item[1]),
+                "close": float(item[2]),
+                "high": float(item[3]),
+                "low": float(item[4]),
+                "open": float(item[5])
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+
+    return (
+        pd.DataFrame(rows)
+        .drop_duplicates(
+            "timestamp"
+        )
+        .sort_values(
+            "timestamp"
+        )
+        .set_index(
+            "timestamp"
+        )
+    )
+
+
+# ============================================================
+# SELECT SYMBOLS
 # ============================================================
 
 def select_symbols(
     provider,
-    requested_count
+    count
 ):
 
     if provider == "Binance":
@@ -314,40 +433,10 @@ def select_symbols(
 
         try:
 
-            ticker = get_json(
-                BINANCE_URL + "/api/v3/ticker/24hr"
-            )
-
-            volume_rows = []
-
-            for item in ticker:
-
-                if not item["symbol"].endswith("USDT"):
-                    continue
-
-                try:
-                    volume = float(
-                        item.get(
-                            "quoteVolume",
-                            0
-                        )
-                    )
-                except Exception:
-                    volume = 0
-
-                volume_rows.append(
-                    {
-                        "symbol": item["symbol"],
-                        "volume": volume
-                    }
-                )
-
-            volume_df = pd.DataFrame(
-                volume_rows
-            )
+            volume = get_binance_volume()
 
             symbols = symbols.merge(
-                volume_df,
+                volume,
                 on="symbol",
                 how="left"
             )
@@ -363,13 +452,12 @@ def select_symbols(
             )
 
         except Exception:
-
             pass
 
         return symbols.head(
             max(
-                MIN_SYMBOLS,
-                requested_count
+                MIN_COINS,
+                count
             )
         )
 
@@ -382,37 +470,31 @@ def select_symbols(
 
         try:
 
-            tickers = get_gate_tickers()
+            volume = get_gate_volume()
 
             symbols = symbols.merge(
-                tickers[
-                    [
-                        "symbol",
-                        "quote_volume"
-                    ]
-                ],
+                volume,
                 on="symbol",
                 how="left"
             )
 
-            symbols["quote_volume"] = (
-                symbols["quote_volume"]
+            symbols["volume"] = (
+                symbols["volume"]
                 .fillna(0)
             )
 
             symbols = symbols.sort_values(
-                "quote_volume",
+                "volume",
                 ascending=False
             )
 
         except Exception:
-
             pass
 
         return symbols.head(
             max(
-                MIN_SYMBOLS,
-                requested_count
+                MIN_COINS,
+                count
             )
         )
 
@@ -420,114 +502,53 @@ def select_symbols(
 
 
 # ============================================================
-# GATE 15M DATA
+# DATA LOADER
 # ============================================================
 
-def get_gate_klines(
-    symbol,
-    limit=960
-):
-
-    limit = min(
-        int(limit),
-        1000
-    )
-
-    data = get_json(
-        GATE_URL + "/api/v4/spot/candlesticks",
-        params={
-            "currency_pair": symbol,
-            "interval": "15m",
-            "limit": limit
-        }
-    )
-
-    if not data:
-        return pd.DataFrame()
-
-    rows = []
-
-    for x in data:
-
-        if len(x) < 6:
-            continue
-
-        # Gate format:
-        # timestamp
-        # volume quote
-        # close
-        # high
-        # low
-        # open
-
-        rows.append(
-            {
-                "timestamp": pd.to_datetime(
-                    int(x[0]),
-                    unit="s",
-                    utc=True
-                ),
-                "open": float(x[5]),
-                "high": float(x[3]),
-                "low": float(x[4]),
-                "close": float(x[2]),
-                "volume": float(x[1])
-            }
-        )
-
-    df = pd.DataFrame(rows)
-
-    if df.empty:
-        return df
-
-    return (
-        df
-        .drop_duplicates(
-            "timestamp"
-        )
-        .sort_values(
-            "timestamp"
-        )
-        .set_index(
-            "timestamp"
-        )
-    )
-
-
-# ============================================================
-# LOAD DATA
-# ============================================================
-
-def load_data(
+def load_candles(
     provider,
-    symbol,
-    candles
+    symbol
 ):
 
     if provider == "Binance":
 
-        return get_binance_klines(
+        return get_binance_candles(
             symbol,
-            min(candles, 1000)
+            CRASH_BARS
         )
 
     if provider == "Gate.io":
 
-        return get_gate_klines(
+        return get_gate_candles(
             symbol,
-            min(candles, 1000)
+            CRASH_BARS
         )
 
     return pd.DataFrame()
+
+
+# ============================================================
+# EMA
+# ============================================================
+
+def ema(
+    series,
+    period
+):
+
+    return series.ewm(
+        span=period,
+        adjust=False
+    ).mean()
 
 
 # ============================================================
 # RSI
 # ============================================================
 
-def calc_rsi(
+def rsi(
     close,
-    period=14
+    period
 ):
 
     delta = close.diff()
@@ -558,20 +579,22 @@ def calc_rsi(
         )
     )
 
-    return (
+    result = (
         100 -
         (
             100 /
             (1 + rs)
         )
-    ).fillna(50)
+    )
+
+    return result.fillna(50)
 
 
 # ============================================================
 # ATR
 # ============================================================
 
-def calc_atr(
+def atr(
     df,
     period=14
 ):
@@ -582,12 +605,23 @@ def calc_atr(
 
     tr = pd.concat(
         [
-            df["high"] - df["low"],
-            (df["high"] - previous).abs(),
-            (df["low"] - previous).abs()
+            df["high"] -
+            df["low"],
+
+            (
+                df["high"] -
+                previous
+            ).abs(),
+
+            (
+                df["low"] -
+                previous
+            ).abs()
         ],
         axis=1
-    ).max(axis=1)
+    ).max(
+        axis=1
+    )
 
     return tr.ewm(
         alpha=1 / period,
@@ -599,7 +633,7 @@ def calc_atr(
 # ADX
 # ============================================================
 
-def calc_adx(
+def adx(
     df,
     period=14
 ):
@@ -614,25 +648,35 @@ def calc_adx(
 
     plus_dm = pd.Series(
         np.where(
-            (up > down) &
-            (up > 0),
+            (
+                up > down
+            )
+            &
+            (
+                up > 0
+            ),
             up,
-            0
+            0.0
         ),
         index=df.index
     )
 
     minus_dm = pd.Series(
         np.where(
-            (down > up) &
-            (down > 0),
+            (
+                down > up
+            )
+            &
+            (
+                down > 0
+            ),
             down,
-            0
+            0.0
         ),
         index=df.index
     )
 
-    atr_value = calc_atr(
+    atr_value = atr(
         df,
         period
     ).replace(
@@ -670,7 +714,10 @@ def calc_adx(
 
     dx = (
         100 *
-        (plus_di - minus_di).abs()
+        (
+            plus_di -
+            minus_di
+        ).abs()
         /
         denominator
     )
@@ -689,80 +736,138 @@ def build_features(df):
 
     x = df.copy()
 
-    close = x["close"]
-    high = x["high"]
-    low = x["low"]
-    volume = x["volume"]
+    close = x[
+        "close"
+    ]
 
-    x["ret1"] = close.pct_change(1)
-    x["ret3"] = close.pct_change(3)
-    x["ret6"] = close.pct_change(6)
-    x["ret12"] = close.pct_change(12)
-    x["ret24"] = close.pct_change(24)
+    high = x[
+        "high"
+    ]
 
-    e5 = close.ewm(
-        span=5,
-        adjust=False
-    ).mean()
+    low = x[
+        "low"
+    ]
 
-    e20 = close.ewm(
-        span=20,
-        adjust=False
-    ).mean()
+    volume = x[
+        "volume"
+    ]
 
-    e50 = close.ewm(
-        span=50,
-        adjust=False
-    ).mean()
+    x[
+        "ret1"
+    ] = close.pct_change(1)
 
-    e200 = close.ewm(
-        span=200,
-        adjust=False
-    ).mean()
+    x[
+        "ret3"
+    ] = close.pct_change(3)
 
-    x["ema5_20"] = e5 / e20 - 1
-    x["ema20_50"] = e20 / e50 - 1
-    x["ema50_200"] = e50 / e200 - 1
+    x[
+        "ret6"
+    ] = close.pct_change(6)
 
-    x["dist20"] = close / e20 - 1
-    x["dist50"] = close / e50 - 1
-    x["dist200"] = close / e200 - 1
+    x[
+        "ret12"
+    ] = close.pct_change(12)
 
-    x["rsi7"] = calc_rsi(
+    x[
+        "ret24"
+    ] = close.pct_change(24)
+
+    e5 = ema(
+        close,
+        5
+    )
+
+    e20 = ema(
+        close,
+        20
+    )
+
+    e50 = ema(
+        close,
+        50
+    )
+
+    e200 = ema(
+        close,
+        200
+    )
+
+    x[
+        "ema5_20"
+    ] = e5 / e20 - 1
+
+    x[
+        "ema20_50"
+    ] = e20 / e50 - 1
+
+    x[
+        "ema50_200"
+    ] = e50 / e200 - 1
+
+    x[
+        "dist20"
+    ] = close / e20 - 1
+
+    x[
+        "dist50"
+    ] = close / e50 - 1
+
+    x[
+        "dist200"
+    ] = close / e200 - 1
+
+    x[
+        "rsi7"
+    ] = rsi(
         close,
         7
     )
 
-    x["rsi14"] = calc_rsi(
+    x[
+        "rsi14"
+    ] = rsi(
         close,
         14
     )
 
-    x["rsi21"] = calc_rsi(
+    x[
+        "rsi21"
+    ] = rsi(
         close,
         21
     )
 
-    macd = (
-        close.ewm(
-            span=12,
-            adjust=False
-        ).mean()
+    macd_line = (
+        ema(
+            close,
+            12
+        )
         -
-        close.ewm(
-            span=26,
-            adjust=False
-        ).mean()
+        ema(
+            close,
+            26
+        )
     )
 
-    signal = macd.ewm(
-        span=9,
-        adjust=False
-    ).mean()
+    macd_signal = ema(
+        macd_line,
+        9
+    )
 
-    x["macd"] = macd
-    x["macd_signal"] = signal
-    x["macd_hist"] = macd - signal
+    x[
+        "macd"
+    ] = macd_line
+
+    x[
+        "macd_signal"
+    ] = macd_signal
+
+    x[
+        "macd_hist"
+    ] = (
+        macd_line -
+        macd_signal
+    )
 
     middle = close.rolling(
         20
@@ -772,21 +877,34 @@ def build_features(df):
         20
     ).std()
 
-    upper = middle + 2 * std
-    lower = middle - 2 * std
+    upper = (
+        middle +
+        2 * std
+    )
+
+    lower = (
+        middle -
+        2 * std
+    )
 
     width = (
-        upper - lower
+        upper -
+        lower
     ).replace(
         0,
         np.nan
     )
 
-    x["bb_position"] = (
-        close - lower
+    x[
+        "bb_position"
+    ] = (
+        close -
+        lower
     ) / width
 
-    x["bb_width"] = (
+    x[
+        "bb_width"
+    ] = (
         width /
         middle.replace(
             0,
@@ -794,12 +912,14 @@ def build_features(df):
         )
     )
 
-    atr_value = calc_atr(
+    atr_value = atr(
         x,
         14
     )
 
-    x["atr_pct"] = (
+    x[
+        "atr_pct"
+    ] = (
         atr_value /
         close.replace(
             0,
@@ -807,22 +927,24 @@ def build_features(df):
         )
     )
 
-    x["adx"] = calc_adx(
+    x[
+        "adx"
+    ] = adx(
         x,
         14
     )
 
-    lowest = low.rolling(
+    low14 = low.rolling(
         14
     ).min()
 
-    highest = high.rolling(
+    high14 = high.rolling(
         14
     ).max()
 
     denominator = (
-        highest -
-        lowest
+        high14 -
+        low14
     ).replace(
         0,
         np.nan
@@ -830,7 +952,10 @@ def build_features(df):
 
     k = (
         100 *
-        (close - lowest)
+        (
+            close -
+            low14
+        )
         /
         denominator
     )
@@ -839,21 +964,30 @@ def build_features(df):
         3
     ).mean()
 
-    x["stoch_k"] = k.fillna(50)
-    x["stoch_d"] = d.fillna(50)
+    x[
+        "stoch_k"
+    ] = k.fillna(50)
+
+    x[
+        "stoch_d"
+    ] = d.fillna(50)
 
     candle_range = (
-        high - low
+        high -
+        low
     ).replace(
         0,
         np.nan
     )
 
     body = (
-        close - x["open"]
+        close -
+        x["open"]
     ).abs()
 
-    x["body_pct"] = (
+    x[
+        "body_pct"
+    ] = (
         body /
         close.replace(
             0,
@@ -861,7 +995,9 @@ def build_features(df):
         )
     )
 
-    x["range_pct"] = (
+    x[
+        "range_pct"
+    ] = (
         candle_range /
         close.replace(
             0,
@@ -869,7 +1005,9 @@ def build_features(df):
         )
     )
 
-    x["upper_wick"] = (
+    x[
+        "upper_wick"
+    ] = (
         high -
         np.maximum(
             x["open"],
@@ -877,7 +1015,9 @@ def build_features(df):
         )
     ) / candle_range
 
-    x["lower_wick"] = (
+    x[
+        "lower_wick"
+    ] = (
         np.minimum(
             x["open"],
             close
@@ -885,43 +1025,53 @@ def build_features(df):
         low
     ) / candle_range
 
-    vol_mean = volume.rolling(
+    volume_mean = volume.rolling(
         20
     ).mean()
 
-    vol_std = volume.rolling(
+    volume_std = volume.rolling(
         20
     ).std()
 
-    x["volume_ratio"] = (
+    x[
+        "volume_ratio"
+    ] = (
         volume /
-        vol_mean.replace(
+        volume_mean.replace(
             0,
             np.nan
         )
     )
 
-    x["volume_z"] = (
+    x[
+        "volume_z"
+    ] = (
         volume -
-        vol_mean
-    ) / vol_std.replace(
+        volume_mean
+    ) / volume_std.replace(
         0,
         np.nan
     )
 
-    x["volatility12"] = (
+    x[
+        "volatility12"
+    ] = (
         x["ret1"]
         .rolling(12)
         .std()
     )
 
-    x["volatility24"] = (
+    x[
+        "volatility24"
+    ] = (
         x["ret1"]
         .rolling(24)
         .std()
     )
 
-    x["volatility48"] = (
+    x[
+        "volatility48"
+    ] = (
         x["ret1"]
         .rolling(48)
         .std()
@@ -935,7 +1085,9 @@ def build_features(df):
         48
     ).std()
 
-    x["price_z"] = (
+    x[
+        "price_z"
+    ] = (
         close -
         price_mean
     ) / price_std.replace(
@@ -943,13 +1095,17 @@ def build_features(df):
         np.nan
     )
 
-    x["high_distance"] = (
+    x[
+        "high_distance"
+    ] = (
         high /
         close -
         1
     )
 
-    x["low_distance"] = (
+    x[
+        "low_distance"
+    ] = (
         low /
         close -
         1
@@ -959,7 +1115,7 @@ def build_features(df):
 
 
 # ============================================================
-# 10-DAY CRASH
+# CRASH CALCULATION
 # ============================================================
 
 def calculate_crash(
@@ -968,32 +1124,36 @@ def calculate_crash(
 ):
 
     result = {
-        "peak_10d": np.nan,
-        "current_price": np.nan,
-        "drop_10d": np.nan,
-        "crash_80": False,
-        "peak_index": None
+        "peak": np.nan,
+        "price": np.nan,
+        "drop": np.nan,
+        "is_crash": False
     }
 
-    if len(df) < 50:
+    if len(df) < 20:
         return result
 
-    # Current candle ignored.
-    completed = df.iloc[:-1].copy()
-
-    if len(completed) < 10:
-        return result
+    completed = df.iloc[
+        :-1
+    ]
 
     window = completed.tail(
-        CRASH_LOOKBACK_BARS
+        CRASH_BARS
     )
+
+    if window.empty:
+        return result
 
     peak = float(
-        window["high"].max()
+        window[
+            "high"
+        ].max()
     )
 
-    current = float(
-        completed["close"].iloc[-1]
+    price = float(
+        completed[
+            "close"
+        ].iloc[-1]
     )
 
     if peak <= 0:
@@ -1001,62 +1161,76 @@ def calculate_crash(
 
     drop = (
         1 -
-        current / peak
+        price / peak
     ) * 100
 
-    result["peak_10d"] = peak
-    result["current_price"] = current
-    result["drop_10d"] = drop
+    result[
+        "peak"
+    ] = peak
 
-    result["crash_80"] = (
+    result[
+        "price"
+    ] = price
+
+    result[
+        "drop"
+    ] = drop
+
+    result[
+        "is_crash"
+    ] = (
         drop >= threshold
     )
-
-    peak_index = window[
-        "high"
-    ].idxmax()
-
-    result["peak_index"] = peak_index
 
     return result
 
 
 # ============================================================
-# WEEKLY LOW / THREE RISING
+# WEEKLY PATTERN
 # ============================================================
 
 def weekly_pattern(df):
 
     result = {
         "weekly_low": np.nan,
-        "near_weekly_low": False,
+        "pattern": False,
         "three_rising": False,
-        "green_last": False,
-        "dip_before_rise": False,
-        "pattern": False
+        "green": False,
+        "near_low": False,
+        "dip_before": False
     }
 
-    if len(df) < 700:
+    if len(df) < (
+        WEEKLY_BARS + 3
+    ):
         return result
 
-    completed = df.iloc[:-1]
+    completed = df.iloc[
+        :-1
+    ]
 
     weekly = completed.tail(
         WEEKLY_BARS
     )
 
-    last3 = completed.tail(3)
-
-    if len(last3) < 3:
-        return result
+    last3 = completed.tail(
+        3
+    )
 
     weekly_low = float(
-        weekly["low"].min()
+        weekly[
+            "low"
+        ].min()
     )
 
     recent_low = float(
-        last3["low"].min()
+        last3[
+            "low"
+        ].min()
     )
+
+    if weekly_low <= 0:
+        return result
 
     distance = (
         recent_low /
@@ -1065,57 +1239,92 @@ def weekly_pattern(df):
     )
 
     rising = (
-        last3["close"].iloc[0]
+        last3[
+            "close"
+        ].iloc[0]
         <
-        last3["close"].iloc[1]
+        last3[
+            "close"
+        ].iloc[1]
         <
-        last3["close"].iloc[2]
+        last3[
+            "close"
+        ].iloc[2]
     )
 
     green = (
-        last3["close"].iloc[2]
+        last3[
+            "close"
+        ].iloc[2]
         >
-        last3["open"].iloc[2]
+        last3[
+            "open"
+        ].iloc[2]
     )
 
     weekly_low_index = weekly[
         "low"
     ].idxmin()
 
-    first_rise_index = last3.index[0]
+    first_index = last3.index[
+        0
+    ]
 
     dip_before = (
         weekly_low_index
         <
-        first_rise_index
+        first_index
     )
 
-    near = (
-        distance <= WEEKLY_DISTANCE
+    near_low = (
+        distance <= 0.015
     )
 
-    pattern = (
+    result[
+        "weekly_low"
+    ] = weekly_low
+
+    result[
+        "three_rising"
+    ] = bool(
+        rising
+    )
+
+    result[
+        "green"
+    ] = bool(
+        green
+    )
+
+    result[
+        "near_low"
+    ] = bool(
+        near_low
+    )
+
+    result[
+        "dip_before"
+    ] = bool(
+        dip_before
+    )
+
+    result[
+        "pattern"
+    ] = bool(
         rising
         and
         green
         and
-        near
+        near_low
         and
         dip_before
     )
-
-    result["weekly_low"] = weekly_low
-    result["near_weekly_low"] = near
-    result["three_rising"] = rising
-    result["green_last"] = green
-    result["dip_before_rise"] = dip_before
-    result["pattern"] = pattern
 
     return result
 
 
 # ============================================================
-# TARGET
+# AI TARGET
 # ============================================================
 
 def make_target(df):
@@ -1125,12 +1334,21 @@ def make_target(df):
         np.nan
     )
 
-    close = df["close"].values
-    high = df["high"].values
-    low = df["low"].values
+    close = df[
+        "close"
+    ].values
+
+    high = df[
+        "high"
+    ].values
+
+    low = df[
+        "low"
+    ].values
 
     for i in range(
-        len(df) - PREDICTION_BARS
+        len(df) -
+        PREDICTION_BARS
     ):
 
         entry = close[i]
@@ -1170,9 +1388,11 @@ def make_target(df):
         )
 
         if buy_hit and not sell_hit:
+
             target[i] = 1
 
         elif sell_hit and not buy_hit:
+
             target[i] = 0
 
         elif buy_hit and sell_hit:
@@ -1195,83 +1415,97 @@ def make_target(df):
 
 
 # ============================================================
-# BALANCE
+# TECHNICAL SCORE
 # ============================================================
 
-def balance_data(
-    X,
-    y
-):
+def technical_score(df):
 
-    classes, counts = np.unique(
-        y,
-        return_counts=True
+    features = build_features(
+        df
     )
 
-    if len(classes) < 2:
-        return X, y
+    row = features.iloc[
+        -2
+    ]
 
-    target_count = int(
-        counts.max()
-    )
+    buy = 0.0
+    sell = 0.0
 
-    rng = np.random.default_rng(
-        42
-    )
+    if row[
+        "ema5_20"
+    ] > 0:
+        buy += 10
+    else:
+        sell += 10
 
-    xs = []
-    ys = []
+    if row[
+        "ema20_50"
+    ] > 0:
+        buy += 10
+    else:
+        sell += 10
 
-    for cls, count in zip(
-        classes,
-        counts
-    ):
+    if row[
+        "ema50_200"
+    ] > 0:
+        buy += 8
+    else:
+        sell += 8
 
-        idx = np.where(
-            y == cls
-        )[0]
+    if row[
+        "rsi14"
+    ] < 35:
+        buy += 10
 
-        if count < target_count:
+    elif row[
+        "rsi14"
+    ] > 65:
+        sell += 10
 
-            extra = rng.choice(
-                idx,
-                size=(
-                    target_count -
-                    count
-                ),
-                replace=True
-            )
+    if row[
+        "macd_hist"
+    ] > 0:
+        buy += 8
+    else:
+        sell += 8
 
-            idx = np.concatenate(
-                [
-                    idx,
-                    extra
-                ]
-            )
+    if row[
+        "bb_position"
+    ] < 0.25:
+        buy += 10
 
-        xs.append(
-            X[idx]
-        )
+    elif row[
+        "bb_position"
+    ] > 0.75:
+        sell += 10
 
-        ys.append(
-            y[idx]
-        )
+    if row[
+        "stoch_k"
+    ] < 25:
+        buy += 8
 
-    X2 = np.vstack(xs)
-    y2 = np.concatenate(ys)
+    elif row[
+        "stoch_k"
+    ] > 75:
+        sell += 8
 
-    order = rng.permutation(
-        len(y2)
-    )
+    if row[
+        "close"
+    ] > row[
+        "open"
+    ]:
+        buy += 8
+    else:
+        sell += 8
 
     return (
-        X2[order],
-        y2[order]
+        buy,
+        sell
     )
 
 
 # ============================================================
-# MODEL
+# AI MODEL
 # ============================================================
 
 def create_model():
@@ -1283,7 +1517,7 @@ def create_model():
                 StandardScaler()
             ),
             (
-                "mlp",
+                "model",
                 MLPClassifier(
                     hidden_layer_sizes=(
                         48,
@@ -1306,7 +1540,7 @@ def create_model():
 
 
 # ============================================================
-# AI
+# AI PREDICTION
 # ============================================================
 
 def ai_predict(
@@ -1341,9 +1575,14 @@ def ai_predict(
     )
 
     valid = (
-        feature_df.notna().all(axis=1)
+        feature_df
+        .notna()
+        .all(
+            axis=1
+        )
         &
-        target_series.notna()
+        target_series
+        .notna()
     )
 
     X = feature_df.loc[
@@ -1352,196 +1591,108 @@ def ai_predict(
 
     y = target_series.loc[
         valid
-    ].astype(int).values
+    ].astype(
+        int
+    ).values
 
-    if len(X) < MIN_TRAIN_ROWS:
+    if len(X) < 300:
         raise ValueError(
-            "Not enough AI training rows"
+            "Not enough AI rows"
         )
 
     if len(X) > training_rows:
 
-        X = X[-training_rows:]
-        y = y[-training_rows:]
+        X = X[
+            -training_rows:
+        ]
+
+        y = y[
+            -training_rows:
+        ]
 
     if len(
         np.unique(y)
     ) < 2:
 
         raise ValueError(
-            "Only one target class"
+            "Only one AI class"
         )
 
     split = int(
         len(X) * 0.80
     )
 
-    X_fit = X[:split]
-    y_fit = y[:split]
+    X_train = X[
+        :split
+    ]
 
-    X_test = X[split:]
-    y_test = y[split:]
+    y_train = y[
+        :split
+    ]
 
-    X_fit, y_fit = balance_data(
-        X_fit,
-        y_fit
-    )
+    X_test = X[
+        split:
+    ]
+
+    y_test = y[
+        split:
+    ]
 
     model = create_model()
 
     model.fit(
-        X_fit,
-        y_fit
+        X_train,
+        y_train
     )
 
-    predictions = model.predict(
+    prediction = model.predict(
         X_test
     )
 
     accuracy = float(
         np.mean(
-            predictions == y_test
+            prediction ==
+            y_test
         )
     )
 
-    recalls = []
+    latest = feature_df.iloc[
+        -2:-1
+    ]
 
-    for cls in [0, 1]:
+    probability = model.predict_proba(
+        latest.values
+    )[0]
 
-        mask = (
-            y_test == cls
-        )
-
-        if mask.sum() > 0:
-
-            recalls.append(
-                float(
-                    np.mean(
-                        predictions[mask]
-                        ==
-                        cls
-                    )
-                )
-            )
-
-    balanced_accuracy = (
-        float(
-            np.mean(recalls)
-        )
-        if recalls
-        else np.nan
-    )
-
-    latest = (
-        feature_df
-        .iloc[-2:-1]
-    )
-
-    if latest.isna().any().any():
-
-        raise ValueError(
-            "Latest features contain NaN"
-        )
-
-    probabilities = (
-        model
-        .predict_proba(
-            latest.values
-        )[0]
-    )
-
-    p_sell = 0.0
     p_buy = 0.0
+    p_sell = 0.0
 
-    for cls, probability in zip(
+    for cls, prob in zip(
         model.classes_,
-        probabilities
+        probability
     ):
 
         if int(cls) == 1:
             p_buy = float(
-                probability
+                prob
             )
         else:
             p_sell = float(
-                probability
+                prob
             )
 
     return {
         "p_buy": p_buy,
         "p_sell": p_sell,
-        "accuracy": accuracy,
-        "balanced_accuracy":
-            balanced_accuracy
+        "accuracy": accuracy
     }
 
 
 # ============================================================
-# TECHNICAL SCORE
+# ANALYSIS
 # ============================================================
 
-def technical_score(df):
-
-    f = build_features(
-        df
-    )
-
-    row = f.iloc[-2]
-
-    buy = 0.0
-    sell = 0.0
-
-    if row["ema5_20"] > 0:
-        buy += 10
-    else:
-        sell += 10
-
-    if row["ema20_50"] > 0:
-        buy += 10
-    else:
-        sell += 10
-
-    if row["ema50_200"] > 0:
-        buy += 8
-    else:
-        sell += 8
-
-    if row["rsi14"] < 35:
-        buy += 10
-
-    elif row["rsi14"] > 65:
-        sell += 10
-
-    if row["macd_hist"] > 0:
-        buy += 8
-    else:
-        sell += 8
-
-    if row["bb_position"] < 0.25:
-        buy += 10
-
-    elif row["bb_position"] > 0.75:
-        sell += 10
-
-    if row["stoch_k"] < 25:
-        buy += 8
-
-    elif row["stoch_k"] > 75:
-        sell += 8
-
-    if row["close"] > row["open"]:
-        buy += 8
-    else:
-        sell += 8
-
-    return buy, sell
-
-
-# ============================================================
-# ANALYZE
-# ============================================================
-
-def analyze(
+def analyze_symbol(
     symbol,
     df,
     crash_threshold,
@@ -1551,13 +1702,13 @@ def analyze(
     if df.empty:
 
         raise ValueError(
-            "No data"
+            "No candle data"
         )
 
-    if len(df) < 300:
+    if len(df) < MIN_DATA:
 
         raise ValueError(
-            f"Only {len(df)} candles"
+            "Not enough candles"
         )
 
     crash = calculate_crash(
@@ -1565,12 +1716,14 @@ def analyze(
         crash_threshold
     )
 
-    pattern = weekly_pattern(
+    weekly = weekly_pattern(
         df
     )
 
     tech_buy, tech_sell = (
-        technical_score(df)
+        technical_score(
+            df
+        )
     )
 
     try:
@@ -1580,8 +1733,17 @@ def analyze(
             training_rows
         )
 
-        p_buy = ai["p_buy"]
-        p_sell = ai["p_sell"]
+        p_buy = ai[
+            "p_buy"
+        ]
+
+        p_sell = ai[
+            "p_sell"
+        ]
+
+        accuracy = ai[
+            "accuracy"
+        ]
 
         buy_score = (
             p_buy * 100
@@ -1595,14 +1757,6 @@ def analyze(
             tech_sell * 0.35
         )
 
-        accuracy = ai[
-            "accuracy"
-        ]
-
-        balanced = ai[
-            "balanced_accuracy"
-        ]
-
     except Exception:
 
         total = (
@@ -1610,12 +1764,7 @@ def analyze(
             tech_sell
         )
 
-        if total <= 0:
-
-            p_buy = 0.5
-            p_sell = 0.5
-
-        else:
+        if total > 0:
 
             p_buy = (
                 tech_buy /
@@ -1627,64 +1776,60 @@ def analyze(
                 total
             )
 
+        else:
+
+            p_buy = 0.5
+            p_sell = 0.5
+
         buy_score = tech_buy
         sell_score = tech_sell
 
         accuracy = np.nan
-        balanced = np.nan
-
-    # ========================================================
-    # CRASH BONUS
-    # ========================================================
 
     crash_bonus = 0
 
-    if crash["crash_80"]:
+    if crash[
+        "is_crash"
+    ]:
 
-        # Strong crash candidate.
         crash_bonus = 20
 
-        buy_score += crash_bonus
+        buy_score += 20
 
         p_buy = min(
             1.0,
             p_buy + 0.10
         )
-
-    # ========================================================
-    # WEEKLY PATTERN BONUS
-    # ========================================================
 
     pattern_bonus = 0
 
-    if pattern["pattern"]:
+    if weekly[
+        "pattern"
+    ]:
 
         pattern_bonus = 20
 
-        buy_score += pattern_bonus
+        buy_score += 20
 
         p_buy = min(
             1.0,
             p_buy + 0.10
         )
 
-    # ========================================================
-    # FINAL
-    # ========================================================
+    if buy_score >= sell_score:
 
-    signal = (
-        "BUY"
-        if buy_score >= sell_score
-        else
-        "SELL"
-    )
+        signal = "BUY"
 
-    completed = df.iloc[:-1]
+    else:
+
+        signal = "SELL"
 
     price = float(
-        completed[
+        df.iloc[
+            -2
+        ][
             "close"
-        ].iloc[-1]
+        ]
     )
 
     return {
@@ -1712,55 +1857,65 @@ def analyze(
             2
         ),
 
-        "peak_10d": round(
-            crash["peak_10d"],
+        "10d_peak": round(
+            crash[
+                "peak"
+            ],
             10
         ),
 
-        "drop_10d": round(
-            crash["drop_10d"],
+        "10d_drop": round(
+            crash[
+                "drop"
+            ],
             2
         ),
 
-        "crash_80": crash[
-            "crash_80"
-        ],
+        "crash_80": bool(
+            crash[
+                "is_crash"
+            ]
+        ),
 
         "crash_bonus": crash_bonus,
 
         "weekly_low": round(
-            pattern["weekly_low"],
+            weekly[
+                "weekly_low"
+            ],
             10
         ),
 
-        "weekly_pattern":
-            pattern["pattern"],
+        "weekly_pattern": bool(
+            weekly[
+                "pattern"
+            ]
+        ),
 
-        "three_rising":
-            pattern["three_rising"],
+        "three_rising": bool(
+            weekly[
+                "three_rising"
+            ]
+        ),
 
-        "green_last":
-            pattern["green_last"],
+        "green_last": bool(
+            weekly[
+                "green"
+            ]
+        ),
 
-        "ai_accuracy":
+        "ai_accuracy": (
             round(
                 accuracy * 100,
                 2
             )
-            if not pd.isna(accuracy)
-            else np.nan,
-
-        "balanced_accuracy":
-            round(
-                balanced * 100,
-                2
+            if not pd.isna(
+                accuracy
             )
-            if not pd.isna(balanced)
-            else np.nan,
+            else np.nan
+        ),
 
-        "candles": len(df),
-
-        "error": ""
+        "candles": len(df)
     }
 
 
@@ -1771,7 +1926,6 @@ def analyze(
 def run_scan(
     provider,
     symbols,
-    candles,
     crash_threshold,
     training_rows
 ):
@@ -1779,32 +1933,37 @@ def run_scan(
     results = []
     errors = []
 
-    total = len(symbols)
+    total = len(
+        symbols
+    )
 
-    progress = st.progress(0)
+    progress = st.progress(
+        0
+    )
 
     status = st.empty()
 
-    for i, row in enumerate(
+    for i, item in enumerate(
         symbols,
         start=1
     ):
 
-        symbol = row["symbol"]
+        symbol = item[
+            "symbol"
+        ]
 
         status.write(
-            f"📊 {i:,}/{total:,} → {symbol}"
+            f"{i:,}/{total:,}  {symbol}"
         )
 
         try:
 
-            df = load_data(
+            df = load_candles(
                 provider,
-                symbol,
-                candles
+                symbol
             )
 
-            result = analyze(
+            result = analyze_symbol(
                 symbol,
                 df,
                 crash_threshold,
@@ -1828,12 +1987,20 @@ def run_scan(
             i / total
         )
 
+        time.sleep(
+            0.02
+        )
+
     progress.empty()
     status.empty()
 
     return (
-        pd.DataFrame(results),
-        pd.DataFrame(errors)
+        pd.DataFrame(
+            results
+        ),
+        pd.DataFrame(
+            errors
+        )
     )
 
 
@@ -1850,9 +2017,8 @@ st.caption(
 )
 
 st.warning(
-    "Bu uygulama emir göndermez. "
-    "Sadece piyasa verisini analiz eder. "
-    "AI tahminleri garanti değildir."
+    "Bu uygulama yalnızca analiz yapar. "
+    "Otomatik emir göndermez."
 )
 
 
@@ -1863,10 +2029,10 @@ st.warning(
 with st.sidebar:
 
     st.header(
-        "⚙️ Scanner Settings"
+        "Scanner Settings"
     )
 
-    provider = st.selectbox(
+    provider_mode = st.selectbox(
         "Data Provider",
         [
             "AUTO",
@@ -1876,7 +2042,7 @@ with st.sidebar:
     )
 
     coin_count = st.number_input(
-        "Minimum Coin Count",
+        "Coin Count",
         min_value=1000,
         max_value=3000,
         value=1000,
@@ -1884,17 +2050,17 @@ with st.sidebar:
     )
 
     crash_threshold = st.slider(
-        "10-Day Crash Threshold (%)",
+        "10-Day Crash %",
         min_value=50.0,
         max_value=95.0,
-        value=CRASH_THRESHOLD_DEFAULT,
+        value=80.0,
         step=1.0
     )
 
     training_rows = st.number_input(
         "AI Training Candles",
-        min_value=400,
-        max_value=1000,
+        min_value=300,
+        max_value=900,
         value=700,
         step=100
     )
@@ -1902,114 +2068,78 @@ with st.sidebar:
     st.divider()
 
     st.write(
-        "TIMEFRAME"
-    )
-
-    st.write(
-        "15 minutes"
+        "15M timeframe"
     )
 
     st.write(
         "10 days = 960 candles"
     )
 
-    st.divider()
-
     st.write(
-        "TARGET"
+        "BUY = +10% / 30 min"
     )
 
     st.write(
-        "BUY = +10% / next 2 candles"
+        "SELL = -10% / 30 min"
     )
 
     st.write(
-        "SELL = -10% / next 2 candles"
+        "HOLD disabled"
     )
 
     st.write(
-        "HOLD = disabled"
-    )
-
-    st.divider()
-
-    st.write(
-        "CRASH"
+        "Crash bonus = +20"
     )
 
     st.write(
-        f"Peak → current >= {crash_threshold:.0f}%"
-    )
-
-    st.write(
-        "Crash BUY bonus = +20"
-    )
-
-    st.divider()
-
-    st.write(
-        "WEEKLY PATTERN"
-    )
-
-    st.write(
-        "672 × 15M candles"
-    )
-
-    st.write(
-        "3 rising candles"
-    )
-
-    st.write(
-        "Last candle green"
-    )
-
-    st.write(
-        "Near weekly low"
-    )
-
-    st.write(
-        "Pattern BUY bonus = +20"
+        "Weekly pattern bonus = +20"
     )
 
 
 # ============================================================
-# AUTO PROVIDER
+# PROVIDER
 # ============================================================
 
-active_provider = provider
-
-if provider == "AUTO":
+if provider_mode == "AUTO":
 
     try:
 
-        binance_test = get_binance_symbols()
+        test_symbols = (
+            get_binance_symbols()
+        )
 
-        if len(binance_test) >= MIN_SYMBOLS:
+        if len(
+            test_symbols
+        ) >= MIN_COINS:
 
-            active_provider = "Binance"
+            provider = "Binance"
 
         else:
 
-            active_provider = "Gate.io"
+            provider = "Gate.io"
 
     except Exception:
 
-        active_provider = "Gate.io"
+        provider = "Gate.io"
+
+else:
+
+    provider = provider_mode
 
 
 st.info(
-    f"Active provider: **{active_provider}**"
+    f"Active provider: {provider}"
 )
 
 
 # ============================================================
-# SYMBOLS
+# SYMBOL LIST
 # ============================================================
 
 try:
 
     symbols_df = select_symbols(
-        active_provider,
+        provider,
         int(coin_count)
     )
 
@@ -2018,7 +2148,7 @@ except Exception as e:
     symbols_df = pd.DataFrame()
 
     st.error(
-        f"Symbol list error: {e}"
+        f"Symbol API error: {e}"
     )
 
 
@@ -2031,50 +2161,45 @@ if symbols_df.empty:
     st.stop()
 
 
-# ============================================================
-# SYMBOL COUNT CHECK
-# ============================================================
-
-available_count = len(
+available = len(
     symbols_df
 )
 
-if available_count < MIN_SYMBOLS:
+if available >= MIN_COINS:
 
-    st.warning(
-        f"Bu provider yalnızca "
-        f"{available_count:,} uygun USDT Spot çift döndürdü. "
-        f"Hedef minimum {MIN_SYMBOLS:,}."
+    st.success(
+        f"{available:,} coin loaded."
     )
 
 else:
 
-    st.success(
-        f"✅ {available_count:,} coin hazır."
+    st.warning(
+        f"Only {available:,} coins available. "
+        f"Target is {MIN_COINS:,}."
     )
 
 
 # ============================================================
-# COIN SELECTION
+# SCOPE
 # ============================================================
 
 scope = st.radio(
-    "Scan Scope",
+    "Scan",
     [
-        "ALL SELECTED COINS",
+        "ALL",
         "MANUAL"
     ],
     horizontal=True
 )
 
-if scope == "ALL SELECTED COINS":
+if scope == "ALL":
 
     selected = symbols_df.copy()
 
 else:
 
-    selected_names = st.multiselect(
-        "Select coins",
+    names = st.multiselect(
+        "Coins",
         symbols_df[
             "symbol"
         ].tolist(),
@@ -2086,14 +2211,12 @@ else:
     selected = symbols_df[
         symbols_df[
             "symbol"
-        ].isin(
-            selected_names
-        )
+        ].isin(names)
     ].copy()
 
 
 st.write(
-    f"### Tarama: {len(selected):,} coin"
+    f"Selected coins: {len(selected):,}"
 )
 
 
@@ -2101,41 +2224,41 @@ st.write(
 # START
 # ============================================================
 
-start = st.button(
-    "🚀 START 1000+ COIN SCAN",
+start_scan = st.button(
+    "🚀 START SCAN",
     type="primary",
     use_container_width=True
 )
 
 
 # ============================================================
-# RUN
+# EXECUTE
 # ============================================================
 
-if start:
+if start_scan:
 
-    started = time.time()
+    start_time = time.time()
 
     with st.spinner(
-        "1000+ coin taranıyor..."
+        "Scanning coins..."
     ):
 
         results, errors = run_scan(
-            provider=active_provider,
-            symbols=selected.to_dict(
+            provider,
+            selected.to_dict(
                 "records"
             ),
-            candles=960,
-            crash_threshold=crash_threshold,
-            training_rows=int(
+            float(
+                crash_threshold
+            ),
+            int(
                 training_rows
             )
         )
 
     elapsed = (
-        time.time()
-        -
-        started
+        time.time() -
+        start_time
     )
 
     st.session_state[
@@ -2179,27 +2302,21 @@ if "results" in st.session_state:
 
     st.divider()
 
-    # ========================================================
-    # METRICS
-    # ========================================================
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-
-    c1.metric(
-        "Scanned",
-        f"{len(results):,}"
+    col1, col2, col3, col4, col5 = st.columns(
+        5
     )
 
-    c2.metric(
-        "Errors",
-        f"{len(errors):,}"
-    )
+    buy_count = 0
+    sell_count = 0
+    crash_count = 0
 
     if not results.empty:
 
         buy_count = int(
             (
-                results["signal"]
+                results[
+                    "signal"
+                ]
                 ==
                 "BUY"
             ).sum()
@@ -2207,125 +2324,118 @@ if "results" in st.session_state:
 
         sell_count = int(
             (
-                results["signal"]
+                results[
+                    "signal"
+                ]
                 ==
                 "SELL"
             ).sum()
         )
 
         crash_count = int(
-            results["crash_80"]
-            .sum()
+            results[
+                "crash_80"
+            ].sum()
         )
 
-    else:
+    col1.metric(
+        "Scanned",
+        f"{len(results):,}"
+    )
 
-        buy_count = 0
-        sell_count = 0
-        crash_count = 0
+    col2.metric(
+        "Errors",
+        f"{len(errors):,}"
+    )
 
-    c3.metric(
+    col3.metric(
         "BUY",
         f"{buy_count:,}"
     )
 
-    c4.metric(
+    col4.metric(
         "SELL",
         f"{sell_count:,}"
     )
 
-    c5.metric(
-        "CRASH 80%+",
+    col5.metric(
+        "CRASH",
         f"{crash_count:,}"
     )
 
     st.caption(
-        f"Scan time: {elapsed:.1f} seconds"
+        f"Scan duration: {elapsed:.1f} seconds"
     )
 
 
+    # ========================================================
+    # CRASH
+    # ========================================================
+
+    st.subheader(
+        f"🔥 SON 10 GÜNDE %{crash_threshold:.0f}+ DÜŞENLER"
+    )
+
     if not results.empty:
 
-        # ====================================================
-        # CRASH LIST
-        # ====================================================
-
-        st.subheader(
-            f"🔥 SON 10 GÜNDE %{crash_threshold:.0f}+ ÇAKILANLAR"
-        )
-
         crash_df = results[
-            results["crash_80"]
-            ==
-            True
+            results[
+                "10d_drop"
+            ]
+            >=
+            crash_threshold
         ].copy()
+
+        crash_df = crash_df.sort_values(
+            [
+                "10d_drop",
+                "buy_score"
+            ],
+            ascending=False
+        )
 
         if crash_df.empty:
 
             st.info(
-                f"Son 10 günde %{crash_threshold:.0f}+ "
-                "düşen coin bulunamadı."
+                "Crash filtresine uyan coin yok."
             )
 
         else:
 
-            crash_df = crash_df.sort_values(
-                [
-                    "drop_10d",
-                    "buy_score"
-                ],
-                ascending=False
-            )
-
-            crash_display = crash_df[
-                [
-                    "symbol",
-                    "signal",
-                    "price",
-                    "peak_10d",
-                    "drop_10d",
-                    "p_buy",
-                    "buy_score",
-                    "sell_score",
-                    "weekly_pattern",
-                    "ai_accuracy"
-                ]
-            ].copy()
-
-            crash_display = (
-                crash_display.rename(
-                    columns={
-                        "symbol": "COIN",
-                        "signal": "SIGNAL",
-                        "price": "PRICE",
-                        "peak_10d": "10D PEAK",
-                        "drop_10d": "DROP %",
-                        "p_buy": "AI BUY %",
-                        "buy_score": "BUY SCORE",
-                        "sell_score": "SELL SCORE",
-                        "weekly_pattern": "WEEKLY PATTERN",
-                        "ai_accuracy": "AI ACCURACY %"
-                    }
-                )
-            )
-
             st.dataframe(
-                crash_display,
+                crash_df[
+                    [
+                        "symbol",
+                        "signal",
+                        "price",
+                        "10d_peak",
+                        "10d_drop",
+                        "p_buy",
+                        "buy_score",
+                        "sell_score",
+                        "weekly_pattern",
+                        "ai_accuracy"
+                    ]
+                ],
                 use_container_width=True,
                 hide_index=True
             )
 
 
-        # ====================================================
-        # TOP BUY
-        # ====================================================
+    # ========================================================
+    # TOP BUY
+    # ========================================================
 
-        st.subheader(
-            "🟢 TOP BUY"
-        )
+    st.subheader(
+        "🟢 TOP BUY"
+    )
+
+    if not results.empty:
 
         buy_df = results[
-            results["signal"]
+            results[
+                "signal"
+            ]
             ==
             "BUY"
         ].copy()
@@ -2334,10 +2444,12 @@ if "results" in st.session_state:
             [
                 "buy_score",
                 "p_buy",
-                "drop_10d"
+                "10d_drop"
             ],
             ascending=False
-        ).head(100)
+        ).head(
+            100
+        )
 
         st.dataframe(
             buy_df[
@@ -2347,7 +2459,7 @@ if "results" in st.session_state:
                     "buy_score",
                     "sell_score",
                     "p_buy",
-                    "drop_10d",
+                    "10d_drop",
                     "crash_80",
                     "weekly_pattern",
                     "three_rising",
@@ -2360,16 +2472,20 @@ if "results" in st.session_state:
         )
 
 
-        # ====================================================
-        # TOP SELL
-        # ====================================================
+    # ========================================================
+    # TOP SELL
+    # ========================================================
 
-        st.subheader(
-            "🔴 TOP SELL"
-        )
+    st.subheader(
+        "🔴 TOP SELL"
+    )
+
+    if not results.empty:
 
         sell_df = results[
-            results["signal"]
+            results[
+                "signal"
+            ]
             ==
             "SELL"
         ].copy()
@@ -2380,7 +2496,9 @@ if "results" in st.session_state:
                 "p_sell"
             ],
             ascending=False
-        ).head(100)
+        ).head(
+            100
+        )
 
         st.dataframe(
             sell_df[
@@ -2390,7 +2508,7 @@ if "results" in st.session_state:
                     "buy_score",
                     "sell_score",
                     "p_sell",
-                    "drop_10d",
+                    "10d_drop",
                     "crash_80",
                     "weekly_pattern",
                     "ai_accuracy"
@@ -2401,42 +2519,48 @@ if "results" in st.session_state:
         )
 
 
-        # ====================================================
-        # WEEKLY PATTERN
-        # ====================================================
+    # ========================================================
+    # WEEKLY PATTERN
+    # ========================================================
 
-        st.subheader(
-            "🔥 WEEKLY LOW + 3 RISING"
-        )
+    st.subheader(
+        "🔥 WEEKLY LOW + 3 RISING"
+    )
 
-        weekly_df = results[
-            results["weekly_pattern"]
+    if not results.empty:
+
+        pattern_df = results[
+            results[
+                "weekly_pattern"
+            ]
             ==
             True
         ].copy()
 
-        weekly_df = weekly_df.sort_values(
+        pattern_df = pattern_df.sort_values(
             "buy_score",
             ascending=False
-        ).head(100)
+        ).head(
+            100
+        )
 
-        if weekly_df.empty:
+        if pattern_df.empty:
 
             st.info(
-                "Pattern bulunamadı."
+                "Weekly pattern bulunamadı."
             )
 
         else:
 
             st.dataframe(
-                weekly_df[
+                pattern_df[
                     [
                         "symbol",
                         "price",
                         "weekly_low",
                         "buy_score",
                         "p_buy",
-                        "drop_10d",
+                        "10d_drop",
                         "crash_80",
                         "three_rising",
                         "green_last"
@@ -2447,16 +2571,21 @@ if "results" in st.session_state:
             )
 
 
-        # ====================================================
-        # ALL RESULTS
-        # ====================================================
+    # ========================================================
+    # ALL
+    # ========================================================
 
-        st.subheader(
-            "📊 ALL RESULTS"
-        )
+    st.subheader(
+        "📊 ALL RESULTS"
+    )
+
+    if not results.empty:
 
         all_results = results.sort_values(
-            "buy_score",
+            [
+                "buy_score",
+                "sell_score"
+            ],
             ascending=False
         )
 
@@ -2466,11 +2595,6 @@ if "results" in st.session_state:
             hide_index=True
         )
 
-
-        # ====================================================
-        # CSV
-        # ====================================================
-
         csv = results.to_csv(
             index=False
         ).encode(
@@ -2478,11 +2602,9 @@ if "results" in st.session_state:
         )
 
         st.download_button(
-            "⬇️ DOWNLOAD ALL RESULTS CSV",
+            "⬇️ DOWNLOAD CSV",
             data=csv,
-            file_name=(
-                "1000_crypto_ai_scan.csv"
-            ),
+            file_name="crypto_1000_ai_scan.csv",
             mime="text/csv",
             use_container_width=True
         )
@@ -2495,7 +2617,7 @@ if "results" in st.session_state:
     if not errors.empty:
 
         with st.expander(
-            f"⚠️ API / DATA ERRORS ({len(errors):,})"
+            f"⚠️ ERRORS ({len(errors):,})"
         ):
 
             st.dataframe(
@@ -2504,68 +2626,8 @@ if "results" in st.session_state:
                 hide_index=True
             )
 
-
 else:
 
     st.info(
-        "START 1000+ COIN SCAN butonuna bas."
+        "START SCAN butonuna basarak taramayı başlat."
     )
-
-    st.markdown(
-        """
-### Tarama mantığı
-
-**1.000+ Spot USDT coin**
-
-**15 dakika**
-
-**Son 10 gün = 960 mum**
-
-**10 günlük peak → mevcut fiyat**
-
-`Düşüş % = (Peak - Current) / Peak × 100`
-
-Varsayılan:
-
-`%80+ = CRASH`
-
-### BUY
-
-AI + teknik analiz + crash filtresi + haftalık dip patterni.
-
-### SELL
-
-AI + teknik analiz.
-
-### HOLD
-
-Kullanılmıyor.
-
-### Haftalık pattern
-
-Son 672 tamamlanmış 15M mum içerisinde:
-
-- haftalık minimum
-- minimumun son 3 mumdan önce olması
-- son 3 mumda yükselen kapanış
-- son mum yeşil
-- son 3 mumun dibi haftalık dibe %1.5 yakın
-
-Bu koşullar oluşursa BUY skoruna ekstra puan eklenir.
-"""
-    )
-```
-
-`requirements.txt` aynı kalabilir:
-
-```text
-streamlit==1.50.0
-requests==2.32.5
-pandas==2.2.3
-numpy==1.26.4
-scikit-learn==1.5.2
-```
-
-**Not:** Gate.io'nun resmi API'sinde `/spot/currency_pairs` tüm desteklenen Spot çiftlerini, `/spot/candlesticks` ise 15m dahil çeşitli aralıkları sağlıyor; candlestick endpoint'i sorgu başına maksimum 1.000 nokta döndürüyor.
-
-Bu nedenle bu sürümde **Binance 451 alırsan uygulama tamamen çökmek yerine Gate.io'ya geçebilir**. Ayrıca `CRASH_THRESHOLD` artık arayüzden örneğin **%70 / %75 / %80 / %85 / %90** yapılabilir.
