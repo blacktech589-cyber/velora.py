@@ -1,6 +1,6 @@
 import io
-import time
 import math
+import time
 from datetime import datetime, timezone
 
 import numpy as np
@@ -8,48 +8,35 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from sklearn.neural_network import MLPClassifier
 from sklearn.linear_model import Ridge
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
 from sklearn.metrics import accuracy_score
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-APP_NAME = "Spot AI Scanner"
+APP_TITLE = "Spot AI Scanner"
 
 TIMEFRAME = "15m"
 
-DEFAULT_TARGET = 500_000
-
-DEFAULT_SYMBOL_LIMIT = 10
-
-DEFAULT_FUTURE_BARS = 12
-
-DEFAULT_TRAIN_LIMIT = 10_000
+KRAKEN_URL = "https://api.kraken.com"
+BINANCE_URL = "https://api.binance.com"
 
 REQUEST_TIMEOUT = 30
 
-KRAKEN_BASE_URL = "https://api.kraken.com"
-
-KRAKEN_ASSET_PAIRS = "/0/public/AssetPairs"
-
-KRAKEN_OHLC = "/0/public/OHLC"
-
-BINANCE_BASE_URL = "https://api.binance.com"
-
-BINANCE_EXCHANGE_INFO = "/api/v3/exchangeInfo"
-
-BINANCE_KLINES = "/api/v3/klines"
+# Kraken public OHLC yaklaşık 721 candle döndürebilir.
+# Bu yüzden artık 1000 istemiyoruz.
+MIN_CANDLES = 300
 
 SUPPORTED_QUOTES = [
-    "USDT",
-    "USDC",
     "USD",
-    "EUR"
+    "USDT",
+    "EUR",
+    "USDC",
 ]
 
 
@@ -58,40 +45,15 @@ SUPPORTED_QUOTES = [
 # ============================================================
 
 st.set_page_config(
-    page_title="Spot AI Scanner",
+    page_title=APP_TITLE,
     page_icon="📊",
-    layout="wide"
+    layout="wide",
 )
 
+st.title("📊 Spot AI Scanner")
 
-st.markdown(
-    """
-    <style>
-    .scanner-title {
-        font-size: 32px;
-        font-weight: 800;
-    }
-
-    .scanner-subtitle {
-        color: #888;
-        margin-bottom: 20px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
-
-
-st.markdown(
-    '<div class="scanner-title">📊 Spot AI Scanner</div>',
-    unsafe_allow_html=True
-)
-
-st.markdown(
-    '<div class="scanner-subtitle">'
-    '15m | 500K Target | MLP AI | No Order Execution'
-    '</div>',
-    unsafe_allow_html=True
+st.caption(
+    "15m | 500K Target | MLP AI | No Order Execution"
 )
 
 
@@ -100,29 +62,14 @@ st.markdown(
 # ============================================================
 
 defaults = {
-
-    "scan_results":
-        pd.DataFrame(),
-
-    "scan_errors":
-        [],
-
-    "candle_cache":
-        {},
-
-    "last_scan":
-        None,
-
-    "last_source":
-        None,
-
-    "last_status":
-        "READY",
-
-    "force_scan":
-        False
+    "results": pd.DataFrame(),
+    "errors": [],
+    "cache": {},
+    "last_scan": None,
+    "last_source": None,
+    "status": "READY",
+    "force_scan": False,
 }
-
 
 for key, value in defaults.items():
 
@@ -132,27 +79,23 @@ for key, value in defaults.items():
 
 
 # ============================================================
-# HTTP
+# HTTP SESSION
 # ============================================================
 
 @st.cache_resource
-def get_http():
+def get_http_session():
 
     session = requests.Session()
 
-    session.headers.update(
-        {
-            "User-Agent":
-                "Spot-AI-Scanner/3.0",
-            "Accept":
-                "application/json"
-        }
-    )
+    session.headers.update({
+        "User-Agent": "Spot-AI-Scanner/1.0",
+        "Accept": "application/json",
+    })
 
     return session
 
 
-HTTP = get_http()
+HTTP = get_http_session()
 
 
 # ============================================================
@@ -171,20 +114,14 @@ class BinanceRestrictedError(Exception):
 # HELPERS
 # ============================================================
 
-def utc_now():
+def now_utc():
 
-    return datetime.now(
-        timezone.utc
-    )
+    return datetime.now(timezone.utc)
 
 
-def safe_float(
-    value,
-    default=np.nan
-):
+def to_float(value, default=np.nan):
 
     try:
-
         return float(value)
 
     except Exception:
@@ -194,13 +131,9 @@ def safe_float(
 
 def clean_ohlcv(df):
 
-    if df is None:
+    if df is None or df.empty:
 
         return pd.DataFrame()
-
-    if df.empty:
-
-        return df
 
     required = [
         "timestamp",
@@ -208,12 +141,13 @@ def clean_ohlcv(df):
         "high",
         "low",
         "close",
-        "volume"
+        "volume",
     ]
 
     missing = [
-        x for x in required
-        if x not in df.columns
+        col
+        for col in required
+        if col not in df.columns
     ]
 
     if missing:
@@ -223,81 +157,65 @@ def clean_ohlcv(df):
             + ", ".join(missing)
         )
 
-    result = df.copy()
+    x = df.copy()
 
-    result["timestamp"] = pd.to_datetime(
-        result["timestamp"],
+    x["timestamp"] = pd.to_datetime(
+        x["timestamp"],
         utc=True,
-        errors="coerce"
+        errors="coerce",
     )
 
-    for column in [
+    for col in [
         "open",
         "high",
         "low",
         "close",
-        "volume"
+        "volume",
     ]:
 
-        result[column] = pd.to_numeric(
-            result[column],
-            errors="coerce"
+        x[col] = pd.to_numeric(
+            x[col],
+            errors="coerce",
         )
 
-    result = result.dropna(
-        subset=[
-            "timestamp",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume"
-        ]
+    x = x.dropna(
+        subset=required
     )
 
-    result = (
-        result
+    x = (
+        x
         .sort_values("timestamp")
         .drop_duplicates("timestamp")
         .reset_index(drop=True)
     )
 
-    return result
+    return x
 
 
 # ============================================================
-# KRAKEN REQUEST
+# KRAKEN API
 # ============================================================
 
-def kraken_get(
-    endpoint,
-    params=None
-):
-
-    url = (
-        KRAKEN_BASE_URL
-        + endpoint
-    )
+def kraken_get(endpoint, params=None):
 
     try:
 
         response = HTTP.get(
-            url,
+            KRAKEN_URL + endpoint,
             params=params,
-            timeout=REQUEST_TIMEOUT
+            timeout=REQUEST_TIMEOUT,
         )
 
     except requests.RequestException as exc:
 
         raise DataProviderError(
-            f"Kraken network error: {exc}"
+            f"Kraken bağlantı hatası: {exc}"
         )
 
     if response.status_code >= 400:
 
         raise DataProviderError(
-            f"Kraken HTTP "
-            f"{response.status_code}: "
+            f"Kraken HTTP {response.status_code}: "
             f"{response.text[:500]}"
         )
 
@@ -311,158 +229,96 @@ def kraken_get(
             f"Kraken JSON hatası: {exc}"
         )
 
-    errors = data.get(
-        "error",
-        []
-    )
+    errors = data.get("error", [])
 
     if errors:
 
         raise DataProviderError(
-            "Kraken API: "
-            + str(errors)
+            "Kraken API: " + str(errors)
         )
 
-    return data.get(
-        "result",
-        {}
-    )
+    return data.get("result", {})
 
-
-# ============================================================
-# KRAKEN SYMBOLS
-# ============================================================
 
 @st.cache_data(
     ttl=900,
-    show_spinner=False
+    show_spinner=False,
 )
 def get_kraken_symbols():
 
     result = kraken_get(
-        KRAKEN_ASSET_PAIRS
+        "/0/public/AssetPairs"
     )
 
     symbols = []
 
     for key, item in result.items():
 
-        if not isinstance(
-            item,
-            dict
-        ):
-
+        if not isinstance(item, dict):
             continue
 
         status = item.get(
             "status",
-            "online"
+            "online",
         )
 
         if status != "online":
-
             continue
 
-        quote = item.get(
-            "quote",
-            ""
+        altname = str(
+            item.get("altname", key)
         )
 
-        wsname = item.get(
-            "wsname",
-            ""
+        wsname = str(
+            item.get("wsname", altname)
         )
 
-        altname = item.get(
-            "altname",
-            key
-        )
+        quote = str(
+            item.get("quote", "")
+        ).upper()
 
-        # Kraken quote formats:
-        # ZUSD / USD
-        # USDT
-        quote_clean = str(
+        quote_clean = (
             quote
-        ).replace(
-            "Z",
-            ""
-        ).replace(
-            "X",
-            ""
+            .replace("X", "")
+            .replace("Z", "")
         )
 
-        if (
-            quote_clean not in
-            SUPPORTED_QUOTES
-            and not str(
-                wsname
-            ).endswith(
-                "/USD"
-            )
-            and not str(
-                wsname
-            ).endswith(
-                "/USDT"
-            )
-        ):
+        ws_upper = wsname.upper()
 
-            continue
-
-        # Do not include obvious
-        # derivatives/futures.
-
-        if ".d" in str(
-            altname
-        ).lower():
-
-            continue
-
-        symbols.append(
-            {
-                "api_symbol":
-                    altname,
-
-                "display_symbol":
-                    wsname
-                    or altname
-            }
+        valid_quote = (
+            quote_clean in SUPPORTED_QUOTES
+            or ws_upper.endswith("/USD")
+            or ws_upper.endswith("/USDT")
+            or ws_upper.endswith("/EUR")
+            or ws_upper.endswith("/USDC")
         )
 
-    symbols = sorted(
-        symbols,
-        key=lambda x:
-            x["display_symbol"]
+        if not valid_quote:
+            continue
+
+        if ".D" in altname.upper():
+            continue
+
+        symbols.append({
+            "api": altname,
+            "display": wsname,
+        })
+
+    symbols.sort(
+        key=lambda x: x["display"]
     )
 
     return symbols
 
 
-# ============================================================
-# KRAKEN OHLC
-# ============================================================
-
-def get_kraken_ohlc(
-    symbol,
-    since=None
-):
-
-    params = {
-        "pair": symbol,
-
-        # Kraken OHLC uses interval
-        # in minutes.
-        "interval": 15
-    }
-
-    if since is not None:
-
-        params["since"] = int(
-            since
-        )
+def get_kraken_ohlc(symbol):
 
     result = kraken_get(
-        KRAKEN_OHLC,
-        params
+        "/0/public/OHLC",
+        {
+            "pair": symbol,
+            "interval": 15,
+        },
     )
 
     pair_key = None
@@ -472,216 +328,66 @@ def get_kraken_ohlc(
         if key != "last":
 
             pair_key = key
-
             break
 
     if pair_key is None:
 
         return pd.DataFrame()
 
-    rows = result[
-        pair_key
-    ]
+    rows = []
 
-    if not rows:
+    for row in result[pair_key]:
 
-        return pd.DataFrame()
-
-    output = []
-
-    for row in rows:
-
-        # Kraken:
-        # time, open, high, low, close,
-        # vwap, volume, count
-
-        output.append(
-            {
-                "timestamp":
-                    pd.to_datetime(
-                        int(
-                            row[0]
-                        ),
-                        unit="s",
-                        utc=True
-                    ),
-
-                "open":
-                    safe_float(
-                        row[1]
-                    ),
-
-                "high":
-                    safe_float(
-                        row[2]
-                    ),
-
-                "low":
-                    safe_float(
-                        row[3]
-                    ),
-
-                "close":
-                    safe_float(
-                        row[4]
-                    ),
-
-                "volume":
-                    safe_float(
-                        row[6]
-                    )
-            }
-        )
+        rows.append({
+            "timestamp": pd.to_datetime(
+                int(row[0]),
+                unit="s",
+                utc=True,
+            ),
+            "open": to_float(row[1]),
+            "high": to_float(row[2]),
+            "low": to_float(row[3]),
+            "close": to_float(row[4]),
+            "volume": to_float(row[6]),
+        })
 
     return clean_ohlcv(
-        pd.DataFrame(
-            output
-        )
+        pd.DataFrame(rows)
     )
 
 
 # ============================================================
-# KRAKEN HISTORY
+# BINANCE API
 # ============================================================
 
-def download_kraken_history(
-    symbol,
-    target
-):
-
-    # Kraken's public OHLC endpoint has
-    # a limited amount of historical data.
-    #
-    # Therefore we request what is
-    # actually available and use the
-    # maximum available history.
-
-    frames = []
-
-    since = None
-
-    previous_oldest = None
-
-    max_iterations = min(
-        math.ceil(
-            target / 720
-        ),
-        100
-    )
-
-    for _ in range(
-        max_iterations
-    ):
-
-        df = get_kraken_ohlc(
-            symbol,
-            since
-        )
-
-        if df.empty:
-
-            break
-
-        frames.append(
-            df
-        )
-
-        oldest = int(
-            df[
-                "timestamp"
-            ].min().timestamp()
-        )
-
-        if (
-            previous_oldest
-            is not None
-            and oldest >= previous_oldest
-        ):
-
-            break
-
-        previous_oldest = oldest
-
-        # Kraken OHLC endpoint normally
-        # returns recent candles. We stop
-        # if target has already been met.
-
-        combined = clean_ohlcv(
-            pd.concat(
-                frames,
-                ignore_index=True
-            )
-        )
-
-        if len(combined) >= target:
-
-            break
-
-        # Kraken public OHLC does not
-        # provide unlimited pagination in
-        # the same way as Binance.
-
-        break
-
-    if not frames:
-
-        return pd.DataFrame()
-
-    result = clean_ohlcv(
-        pd.concat(
-            frames,
-            ignore_index=True
-        )
-    )
-
-    return (
-        result
-        .tail(target)
-        .reset_index(drop=True)
-    )
-
-
-# ============================================================
-# BINANCE
-# ============================================================
-
-def binance_get(
-    endpoint,
-    params=None
-):
-
-    url = (
-        BINANCE_BASE_URL
-        + endpoint
-    )
+def binance_get(endpoint, params=None):
 
     try:
 
         response = HTTP.get(
-            url,
+            BINANCE_URL + endpoint,
             params=params,
-            timeout=REQUEST_TIMEOUT
+            timeout=REQUEST_TIMEOUT,
         )
 
     except requests.RequestException as exc:
 
         raise DataProviderError(
-            f"Binance network error: {exc}"
+            f"Binance bağlantı hatası: {exc}"
         )
 
     if response.status_code == 451:
 
         raise BinanceRestrictedError(
-            "HTTP 451: Binance API bu "
-            "çalışma ortamından erişime "
-            "izin vermiyor."
+            "Binance HTTP 451: "
+            "Bu çalışma ortamından Binance API "
+            "erişimi kısıtlanmış."
         )
 
     if response.status_code >= 400:
 
         raise DataProviderError(
-            f"Binance HTTP "
-            f"{response.status_code}: "
+            f"Binance HTTP {response.status_code}: "
             f"{response.text[:500]}"
         )
 
@@ -698,124 +404,48 @@ def binance_get(
 
 @st.cache_data(
     ttl=900,
-    show_spinner=False
+    show_spinner=False,
 )
 def get_binance_symbols():
 
-    result = binance_get(
-        BINANCE_EXCHANGE_INFO
+    data = binance_get(
+        "/api/v3/exchangeInfo"
     )
 
     symbols = []
 
-    for item in result.get(
+    for item in data.get(
         "symbols",
-        []
+        [],
     ):
 
-        if item.get(
-            "status"
-        ) != "TRADING":
-
+        if item.get("status") != "TRADING":
             continue
 
-        if item.get(
-            "isSpotTradingAllowed"
-        ) is False:
-
+        if (
+            item.get("isSpotTradingAllowed")
+            is False
+        ):
             continue
 
         if item.get(
             "quoteAsset"
         ) not in [
             "USDT",
-            "USDC"
+            "USDC",
         ]:
-
             continue
 
         symbols.append(
             item["symbol"]
         )
 
-    return sorted(
-        symbols
-    )
+    return sorted(symbols)
 
 
-def get_binance_klines(
+def get_binance_history(
     symbol,
-    limit=1000,
-    end_time=None
-):
-
-    params = {
-        "symbol":
-            symbol,
-
-        "interval":
-            "15m",
-
-        "limit":
-            min(
-                int(limit),
-                1000
-            )
-    }
-
-    if end_time is not None:
-
-        params[
-            "endTime"
-        ] = int(
-            end_time
-        )
-
-    data = binance_get(
-        BINANCE_KLINES,
-        params
-    )
-
-    rows = []
-
-    for row in data:
-
-        rows.append(
-            {
-                "timestamp":
-                    pd.to_datetime(
-                        int(
-                            row[0]
-                        ),
-                        unit="ms",
-                        utc=True
-                    ),
-
-                "open":
-                    safe_float(row[1]),
-
-                "high":
-                    safe_float(row[2]),
-
-                "low":
-                    safe_float(row[3]),
-
-                "close":
-                    safe_float(row[4]),
-
-                "volume":
-                    safe_float(row[5])
-            }
-        )
-
-    return clean_ohlcv(
-        pd.DataFrame(rows)
-    )
-
-
-def download_binance_history(
-    symbol,
-    target
+    target,
 ):
 
     frames = []
@@ -824,44 +454,73 @@ def download_binance_history(
 
     total = 0
 
-    loops = math.ceil(
+    max_requests = math.ceil(
         target / 1000
     )
 
-    for _ in range(
-        loops
-    ):
+    for _ in range(max_requests):
 
-        df = get_binance_klines(
-            symbol,
-            1000,
-            end_time
+        params = {
+            "symbol": symbol,
+            "interval": "15m",
+            "limit": 1000,
+        }
+
+        if end_time is not None:
+
+            params["endTime"] = int(
+                end_time
+            )
+
+        data = binance_get(
+            "/api/v3/klines",
+            params,
         )
 
-        if df.empty:
-
+        if not data:
             break
 
-        frames.append(
-            df
+        rows = []
+
+        for row in data:
+
+            rows.append({
+                "timestamp": pd.to_datetime(
+                    int(row[0]),
+                    unit="ms",
+                    utc=True,
+                ),
+                "open": to_float(row[1]),
+                "high": to_float(row[2]),
+                "low": to_float(row[3]),
+                "close": to_float(row[4]),
+                "volume": to_float(row[5]),
+            })
+
+        chunk = clean_ohlcv(
+            pd.DataFrame(rows)
         )
 
-        total += len(df)
+        if chunk.empty:
+            break
 
-        oldest = df[
+        frames.append(chunk)
+
+        total += len(chunk)
+
+        oldest = chunk[
             "timestamp"
         ].min()
 
         end_time = (
-            int(
-                oldest.timestamp()
-                * 1000
-            )
+            int(oldest.timestamp() * 1000)
             - 1
         )
 
-        if total >= target:
-
+        if (
+            len(chunk) < 1000
+            or total >= target
+        ):
             break
 
     if not frames:
@@ -871,7 +530,7 @@ def download_binance_history(
     result = clean_ohlcv(
         pd.concat(
             frames,
-            ignore_index=True
+            ignore_index=True,
         )
     )
 
@@ -886,11 +545,9 @@ def download_binance_history(
 # CSV
 # ============================================================
 
-def read_csv(
-    uploaded_file
-):
+def load_csv(upload):
 
-    raw = uploaded_file.read()
+    raw = upload.read()
 
     try:
 
@@ -904,23 +561,16 @@ def read_csv(
             f"CSV okunamadı: {exc}"
         )
 
-    mapping = {}
+    normalized = {}
 
-    for column in df.columns:
+    for col in df.columns:
 
-        normalized = (
-            str(column)
+        normalized[
+            str(col)
             .strip()
             .lower()
-            .replace(
-                " ",
-                "_"
-            )
-        )
-
-        mapping[
-            normalized
-        ] = column
+            .replace(" ", "_")
+        ] = col
 
     aliases = {
 
@@ -929,34 +579,34 @@ def read_csv(
             "time",
             "date",
             "datetime",
-            "open_time"
+            "open_time",
         ],
 
         "open": [
             "open",
-            "o"
+            "o",
         ],
 
         "high": [
             "high",
-            "h"
+            "h",
         ],
 
         "low": [
             "low",
-            "l"
+            "l",
         ],
 
         "close": [
             "close",
-            "c"
+            "c",
         ],
 
         "volume": [
             "volume",
             "vol",
-            "v"
-        ]
+            "v",
+        ],
     }
 
     rename = {}
@@ -965,10 +615,10 @@ def read_csv(
 
         for name in names:
 
-            if name in mapping:
+            if name in normalized:
 
                 rename[
-                    mapping[name]
+                    normalized[name]
                 ] = target
 
                 break
@@ -977,31 +627,23 @@ def read_csv(
         columns=rename
     )
 
-    return clean_ohlcv(
-        df
-    )
+    return clean_ohlcv(df)
 
 
 # ============================================================
-# INDICATORS
+# TECHNICAL INDICATORS
 # ============================================================
 
-def ema(
-    series,
-    period
-):
+def EMA(series, period):
 
     return series.ewm(
         span=period,
         adjust=False,
-        min_periods=period
+        min_periods=period,
     ).mean()
 
 
-def rsi(
-    series,
-    period=14
-):
+def RSI(series, period=14):
 
     delta = series.diff()
 
@@ -1016,87 +658,70 @@ def rsi(
     avg_gain = gain.ewm(
         alpha=1 / period,
         adjust=False,
-        min_periods=period
+        min_periods=period,
     ).mean()
 
     avg_loss = loss.ewm(
         alpha=1 / period,
         adjust=False,
-        min_periods=period
+        min_periods=period,
     ).mean()
 
-    rs = (
-        avg_gain
-        / (
-            avg_loss + 1e-12
-        )
+    rs = avg_gain / (
+        avg_loss + 1e-12
     )
 
     return (
         100
-        - 100
-        / (
-            1 + rs
-        )
+        - 100 / (1 + rs)
     )
 
 
-def atr(
-    df,
-    period=14
-):
+def ATR(df, period=14):
 
-    high = df["high"]
-
-    low = df["low"]
-
-    close = df["close"]
-
-    previous = close.shift(1)
+    previous_close = (
+        df["close"].shift(1)
+    )
 
     tr = pd.concat(
         [
-            high - low,
+            df["high"] - df["low"],
             (
-                high
-                - previous
+                df["high"]
+                - previous_close
             ).abs(),
             (
-                low
-                - previous
-            ).abs()
+                df["low"]
+                - previous_close
+            ).abs(),
         ],
-        axis=1
-    ).max(
-        axis=1
-    )
+        axis=1,
+    ).max(axis=1)
 
     return tr.ewm(
         alpha=1 / period,
         adjust=False,
-        min_periods=period
+        min_periods=period,
     ).mean()
 
 
-def macd(
-    series
-):
+def MACD(series):
 
-    fast = ema(
+    fast = EMA(
         series,
-        12
+        12,
     )
 
-    slow = ema(
+    slow = EMA(
         series,
-        26
+        26,
     )
 
     line = fast - slow
 
-    signal = ema(
+    signal = EMA(
         line,
-        9
+        9,
     )
 
     histogram = (
@@ -1106,49 +731,41 @@ def macd(
     return (
         line,
         signal,
-        histogram
+        histogram,
     )
 
 
-def bollinger(
+def Bollinger(
     series,
-    period=20
+    period=20,
 ):
 
-    middle = series.rolling(
-        period
-    ).mean()
-
-    std = series.rolling(
-        period
-    ).std()
-
-    upper = (
-        middle
-        + 2 * std
+    middle = (
+        series
+        .rolling(period)
+        .mean()
     )
 
-    lower = (
-        middle
-        - 2 * std
+    std = (
+        series
+        .rolling(period)
+        .std()
     )
+
+    upper = middle + 2 * std
+    lower = middle - 2 * std
 
     return (
         middle,
         upper,
-        lower
+        lower,
     )
 
 
-def adx(
-    df,
-    period=14
-):
+def ADX(df, period=14):
 
     high = df["high"]
-
     low = df["low"]
-
     close = df["close"]
 
     up = high.diff()
@@ -1156,25 +773,19 @@ def adx(
     down = -low.diff()
 
     plus_dm = np.where(
-        (
-            up > down
-        )
-        & (
-            up > 0
-        ),
+        (up > down) & (up > 0),
         up,
-        0
+        0,
     )
 
     minus_dm = np.where(
-        (
-            down > up
-        )
-        & (
-            down > 0
-        ),
+        (down > up) & (down > 0),
         down,
-        0
+        0,
+    )
+
+    previous_close = (
+        close.shift(1)
     )
 
     tr = pd.concat(
@@ -1182,55 +793,48 @@ def adx(
             high - low,
             (
                 high
-                - close.shift(1)
+                - previous_close
             ).abs(),
             (
                 low
-                - close.shift(1)
-            ).abs()
+                - previous_close
+            ).abs(),
         ],
-        axis=1
-    ).max(
-        axis=1
-    )
+        axis=1,
+    ).max(axis=1)
 
-    atr_value = tr.rolling(
-        period
-    ).mean()
+    atr_value = (
+        tr
+        .rolling(period)
+        .mean()
+    )
 
     plus_di = (
         100
         * pd.Series(
             plus_dm,
-            index=df.index
-        ).rolling(
-            period
-        ).mean()
-        / (
-            atr_value
-            + 1e-12
+            index=df.index,
         )
+        .rolling(period)
+        .mean()
+        / (atr_value + 1e-12)
     )
 
     minus_di = (
         100
         * pd.Series(
             minus_dm,
-            index=df.index
-        ).rolling(
-            period
-        ).mean()
-        / (
-            atr_value
-            + 1e-12
+            index=df.index,
         )
+        .rolling(period)
+        .mean()
+        / (atr_value + 1e-12)
     )
 
     dx = (
         100
         * (
-            plus_di
-            - minus_di
+            plus_di - minus_di
         ).abs()
         / (
             plus_di
@@ -1239,226 +843,198 @@ def adx(
         )
     )
 
-    return dx.rolling(
-        period
-    ).mean()
+    return (
+        dx
+        .rolling(period)
+        .mean()
+    )
 
 
 # ============================================================
-# FEATURES
+# FEATURE ENGINEERING
 # ============================================================
 
-def build_features(
-    df
-):
+def build_features(df):
 
-    data = df.copy()
+    x = df.copy()
 
-    close = data["close"]
+    close = x["close"]
+    high = x["high"]
+    low = x["low"]
+    volume = x["volume"]
 
-    high = data["high"]
+    # --------------------------------------------------------
+    # Returns
+    # --------------------------------------------------------
 
-    low = data["low"]
-
-    volume = data["volume"]
-
-    # RETURNS
-
-    for period in [
+    for n in [
         1,
         3,
         6,
         12,
         24,
         48,
-        96
+        96,
     ]:
 
-        data[
-            f"ret_{period}"
-        ] = close.pct_change(
-            period
+        x[f"ret_{n}"] = (
+            close.pct_change(n)
         )
 
+    # --------------------------------------------------------
     # EMA
+    # --------------------------------------------------------
 
-    for period in [
+    for n in [
         5,
         20,
         50,
         100,
         200,
-        500,
-        800
     ]:
 
-        value = ema(
+        e = EMA(
             close,
-            period
+            n,
         )
 
-        data[
-            f"ema_dist_{period}"
-        ] = (
-            close
-            / (
-                value
-                + 1e-12
+        x[f"ema_dist_{n}"] = (
+            close / (
+                e + 1e-12
             )
             - 1
         )
 
-    data[
-        "ema_5_20"
-    ] = (
-        ema(close, 5)
-        / (
-            ema(close, 20)
-            + 1e-12
+    e5 = EMA(
+        close,
+        5,
+    )
+
+    e20 = EMA(
+        close,
+        20,
+    )
+
+    e50 = EMA(
+        close,
+        50,
+    )
+
+    e200 = EMA(
+        close,
+        200,
+    )
+
+    x["ema_5_20"] = (
+        e5 / (
+            e20 + 1e-12
         )
         - 1
     )
 
-    data[
-        "ema_20_50"
-    ] = (
-        ema(close, 20)
-        / (
-            ema(close, 50)
-            + 1e-12
+    x["ema_20_50"] = (
+        e20 / (
+            e50 + 1e-12
         )
         - 1
     )
 
-    data[
-        "ema_50_200"
-    ] = (
-        ema(close, 50)
-        / (
-            ema(close, 200)
-            + 1e-12
+    x["ema_50_200"] = (
+        e50 / (
+            e200 + 1e-12
         )
         - 1
     )
 
-    data[
-        "ema_200_800"
-    ] = (
-        ema(close, 200)
-        / (
-            ema(close, 800)
-            + 1e-12
-        )
-        - 1
-    )
-
+    # --------------------------------------------------------
     # RSI
+    # --------------------------------------------------------
 
-    for period in [
+    for n in [
         7,
         14,
-        21
+        21,
     ]:
 
-        data[
-            f"rsi_{period}"
-        ] = rsi(
+        x[f"rsi_{n}"] = RSI(
             close,
-            period
+            n,
         )
 
+    # --------------------------------------------------------
     # MACD
+    # --------------------------------------------------------
 
-    (
-        macd_line,
-        macd_signal,
-        macd_hist
-    ) = macd(
+    macd_line, macd_signal, macd_hist = MACD(
         close
     )
 
-    data[
-        "macd_norm"
-    ] = (
+    x["macd_norm"] = (
         macd_line
-        / (
-            close
-            + 1e-12
-        )
+        / (close + 1e-12)
     )
 
-    data[
-        "macd_signal"
-    ] = macd_signal
+    x["macd_signal"] = (
+        macd_signal
+    )
 
-    data[
-        "macd_hist"
-    ] = macd_hist
+    x["macd_hist"] = (
+        macd_hist
+    )
 
-    # BOLLINGER
+    # --------------------------------------------------------
+    # Bollinger
+    # --------------------------------------------------------
 
-    (
-        middle,
-        upper,
-        lower
-    ) = bollinger(
+    middle, upper, lower = Bollinger(
         close,
-        20
+        20,
     )
 
-    data[
-        "bb_width"
-    ] = (
+    x["bb_width"] = (
         upper - lower
     ) / (
-        middle
-        + 1e-12
+        middle + 1e-12
     )
 
-    data[
-        "bb_position"
-    ] = (
+    x["bb_position"] = (
         close - lower
     ) / (
         upper - lower
         + 1e-12
     )
 
-    # ATR
+    # --------------------------------------------------------
+    # ATR / ADX
+    # --------------------------------------------------------
 
-    data[
-        "atr_pct"
-    ] = (
-        atr(data)
-        / (
-            close
-            + 1e-12
-        )
+    x["atr_pct"] = (
+        ATR(x)
+        / (close + 1e-12)
     )
 
-    # ADX
+    x["adx"] = ADX(x)
 
-    data[
-        "adx"
-    ] = adx(data)
+    # --------------------------------------------------------
+    # Stochastic
+    # --------------------------------------------------------
 
-    # STOCHASTIC
+    lowest = (
+        low
+        .rolling(14)
+        .min()
+    )
 
-    lowest = low.rolling(
-        14
-    ).min()
+    highest = (
+        high
+        .rolling(14)
+        .max()
+    )
 
-    highest = high.rolling(
-        14
-    ).max()
-
-    data[
-        "stoch_k"
-    ] = (
+    x["stoch_k"] = (
         100
         * (
-            close
-            - lowest
+            close - lowest
         )
         / (
             highest
@@ -1467,70 +1043,51 @@ def build_features(
         )
     )
 
-    data[
-        "stoch_d"
-    ] = (
-        data[
-            "stoch_k"
-        ]
+    x["stoch_d"] = (
+        x["stoch_k"]
         .rolling(3)
         .mean()
     )
 
-    # CANDLE
+    # --------------------------------------------------------
+    # Candle structure
+    # --------------------------------------------------------
 
     candle_range = (
         high - low
     )
 
     body = (
-        close
-        - data["open"]
+        close - x["open"]
     )
 
-    data[
-        "body_pct"
-    ] = (
+    x["body_pct"] = (
         body
-        / (
-            close
-            + 1e-12
-        )
+        / (close + 1e-12)
     )
 
-    data[
-        "range_pct"
-    ] = (
+    x["range_pct"] = (
         candle_range
-        / (
-            close
-            + 1e-12
-        )
+        / (close + 1e-12)
     )
 
-    data[
-        "upper_wick"
-    ] = (
+    x["upper_wick"] = (
         high
         - np.maximum(
-            data["open"],
-            close
+            x["open"],
+            close,
         )
     )
 
-    data[
-        "lower_wick"
-    ] = (
+    x["lower_wick"] = (
         np.minimum(
-            data["open"],
-            close
+            x["open"],
+            close,
         )
         - low
     )
 
-    data[
-        "body_to_range"
-    ] = (
+    x["body_to_range"] = (
         body.abs()
         / (
             candle_range
@@ -1538,7 +1095,9 @@ def build_features(
         )
     )
 
-    # VOLUME
+    # --------------------------------------------------------
+    # Volume
+    # --------------------------------------------------------
 
     volume_mean = (
         volume
@@ -1552,9 +1111,7 @@ def build_features(
         .std()
     )
 
-    data[
-        "volume_ratio"
-    ] = (
+    x["volume_ratio"] = (
         volume
         / (
             volume_mean
@@ -1562,9 +1119,7 @@ def build_features(
         )
     )
 
-    data[
-        "volume_z"
-    ] = (
+    x["volume_z"] = (
         volume
         - volume_mean
     ) / (
@@ -1572,48 +1127,50 @@ def build_features(
         + 1e-12
     )
 
-    data[
-        "volume_change"
-    ] = volume.pct_change()
+    x["volume_change"] = (
+        volume.pct_change()
+    )
 
-    # VOLATILITY
+    # --------------------------------------------------------
+    # Volatility
+    # --------------------------------------------------------
 
-    for period in [
+    for n in [
         12,
         24,
         48,
-        96
+        96,
     ]:
 
-        data[
-            f"volatility_{period}"
-        ] = (
-            data["ret_1"]
-            .rolling(period)
+        x[f"volatility_{n}"] = (
+            x["ret_1"]
+            .rolling(n)
             .std()
         )
 
-    # HIGH / LOW
+    # --------------------------------------------------------
+    # High / Low distances
+    # --------------------------------------------------------
 
-    for period in [
+    for n in [
         48,
-        200
+        200,
     ]:
 
         rolling_high = (
             high
-            .rolling(period)
+            .rolling(n)
             .max()
         )
 
         rolling_low = (
             low
-            .rolling(period)
+            .rolling(n)
             .min()
         )
 
-        data[
-            f"distance_high_{period}"
+        x[
+            f"distance_high_{n}"
         ] = (
             close
             / (
@@ -1623,8 +1180,8 @@ def build_features(
             - 1
         )
 
-        data[
-            f"distance_low_{period}"
+        x[
+            f"distance_low_{n}"
         ] = (
             close
             / (
@@ -1634,15 +1191,15 @@ def build_features(
             - 1
         )
 
-    # DRAWDOWN
+    # --------------------------------------------------------
+    # Drawdown
+    # --------------------------------------------------------
 
     running_high = (
         close.cummax()
     )
 
-    data[
-        "drawdown"
-    ] = (
+    x["drawdown"] = (
         close
         / (
             running_high
@@ -1651,45 +1208,46 @@ def build_features(
         - 1
     )
 
-    # Z SCORE
+    # --------------------------------------------------------
+    # Price Z score
+    # --------------------------------------------------------
 
-    for period in [
+    for n in [
         50,
-        200
+        200,
     ]:
 
         mean = (
             close
-            .rolling(period)
+            .rolling(n)
             .mean()
         )
 
         std = (
             close
-            .rolling(period)
+            .rolling(n)
             .std()
         )
 
-        data[
-            f"price_z_{period}"
+        x[
+            f"price_z_{n}"
         ] = (
             close - mean
         ) / (
-            std
-            + 1e-12
+            std + 1e-12
         )
 
-    return data.replace(
+    return x.replace(
         [
             np.inf,
-            -np.inf
+            -np.inf,
         ],
-        np.nan
+        np.nan,
     )
 
 
 # ============================================================
-# FEATURE COLUMNS
+# FEATURE LIST
 # ============================================================
 
 def feature_columns():
@@ -1709,13 +1267,10 @@ def feature_columns():
         "ema_dist_50",
         "ema_dist_100",
         "ema_dist_200",
-        "ema_dist_500",
-        "ema_dist_800",
 
         "ema_5_20",
         "ema_20_50",
         "ema_50_200",
-        "ema_200_800",
 
         "rsi_7",
         "rsi_14",
@@ -1758,7 +1313,7 @@ def feature_columns():
         "drawdown",
 
         "price_z_50",
-        "price_z_200"
+        "price_z_200",
     ]
 
 
@@ -1767,132 +1322,119 @@ def feature_columns():
 # ============================================================
 
 def create_target(
-    data,
-    future_bars
+    df,
+    future_bars,
 ):
 
-    result = data.copy()
+    x = df.copy()
 
     future_return = (
-        result["close"]
-        .shift(
-            -future_bars
-        )
-        / result["close"]
+        x["close"]
+        .shift(-future_bars)
+        / x["close"]
         - 1
     )
 
-    result[
-        "future_return"
-    ] = future_return
+    x["future_return"] = (
+        future_return
+    )
 
     volatility = (
-        result[
-            "volatility_24"
-        ]
+        x["volatility_24"]
         .fillna(
-            result[
-                "ret_1"
-            ].std()
+            x["ret_1"].std()
         )
     )
 
     threshold = (
         volatility
-        * math.sqrt(
-            future_bars
-        )
-    )
-
-    threshold = threshold.clip(
+        * np.sqrt(future_bars)
+    ).clip(
         lower=0.002
     )
 
-    # 0 SELL
-    # 1 HOLD
-    # 2 BUY
+    x["target"] = 1
 
-    result[
-        "target"
-    ] = 1
-
-    result.loc[
-        future_return
-        > threshold,
-        "target"
+    x.loc[
+        future_return > threshold,
+        "target",
     ] = 2
 
-    result.loc[
-        future_return
-        < -threshold,
-        "target"
+    x.loc[
+        future_return < -threshold,
+        "target",
     ] = 0
 
-    return result
+    return x
 
 
 # ============================================================
-# MODELS
+# AI MODELS
 # ============================================================
 
-def classifier_model():
+def create_classifier():
 
-    return Pipeline(
-        [
-            (
-                "scaler",
-                StandardScaler()
+    return Pipeline([
+        (
+            "scaler",
+            StandardScaler(),
+        ),
+
+        (
+            "mlp",
+            MLPClassifier(
+
+                hidden_layer_sizes=(
+                    96,
+                    48,
+                    24,
+                ),
+
+                activation="relu",
+
+                solver="adam",
+
+                batch_size=128,
+
+                learning_rate_init=0.001,
+
+                max_iter=120,
+
+                early_stopping=True,
+
+                validation_fraction=0.15,
+
+                random_state=42,
             ),
-
-            (
-                "mlp",
-                MLPClassifier(
-                    hidden_layer_sizes=(
-                        128,
-                        64,
-                        32
-                    ),
-                    activation="relu",
-                    solver="adam",
-                    batch_size=256,
-                    learning_rate_init=0.001,
-                    max_iter=100,
-                    early_stopping=True,
-                    validation_fraction=0.15,
-                    random_state=42
-                )
-            )
-        ]
-    )
+        ),
+    ])
 
 
-def regression_model():
+def create_regressor():
 
-    return Pipeline(
-        [
-            (
-                "scaler",
-                StandardScaler()
+    return Pipeline([
+        (
+            "scaler",
+            StandardScaler(),
+        ),
+
+        (
+            "ridge",
+            Ridge(
+                alpha=1.0
             ),
-
-            (
-                "ridge",
-                Ridge(
-                    alpha=1.0
-                )
-            )
-        ]
-    )
+        ),
+    ])
 
 
 # ============================================================
-# TRAIN
+# TRAIN / PREDICT
 # ============================================================
 
-def train(
+def train_and_predict(
     df,
     future_bars,
-    train_limit
+    train_limit,
 ):
 
     features = build_features(
@@ -1901,39 +1443,39 @@ def train(
 
     features = create_target(
         features,
-        future_bars
+        future_bars,
     )
 
-    columns = feature_columns()
+    cols = feature_columns()
 
     usable = (
         features
         .dropna(
-            subset=columns
+            subset=cols
             + [
                 "target",
-                "future_return"
+                "future_return",
             ]
         )
         .copy()
     )
 
-    if len(usable) < 500:
+    if len(usable) < MIN_CANDLES:
 
         raise DataProviderError(
-            f"AI için yeterli veri yok. "
-            f"Temiz veri: {len(usable)}"
+            f"Model için yeterli temiz "
+            f"veri yok: {len(usable)}"
         )
 
     usable = usable.tail(
         min(
             train_limit,
-            len(usable)
+            len(usable),
         )
     )
 
     X = usable[
-        columns
+        cols
     ].astype(float)
 
     y = usable[
@@ -1947,86 +1489,58 @@ def train(
     if y.nunique() < 2:
 
         raise DataProviderError(
-            "AI target tek sınıf içeriyor."
+            "AI target yalnızca "
+            "tek sınıf içeriyor."
         )
 
     classifier = (
-        classifier_model()
+        create_classifier()
     )
 
     regressor = (
-        regression_model()
+        create_regressor()
     )
 
     classifier.fit(
         X,
-        y
+        y,
     )
 
     regressor.fit(
         X,
-        future_y
+        future_y,
     )
 
-    predictions = (
-        classifier.predict(
-            X
-        )
+    train_prediction = (
+        classifier.predict(X)
     )
 
-    accuracy = (
+    training_accuracy = (
         accuracy_score(
             y,
-            predictions
+            train_prediction,
         )
     )
 
-    return (
-        classifier,
-        regressor,
-        features,
-        columns,
-        accuracy
-    )
-
-
-# ============================================================
-# PREDICTION
-# ============================================================
-
-def predict(
-    classifier,
-    regressor,
-    features,
-    columns
-):
-
-    valid = (
+    latest = (
         features
         .dropna(
-            subset=columns
+            subset=cols
         )
+        .iloc[-1]
     )
 
-    if valid.empty:
-
-        raise DataProviderError(
-            "Latest candle için feature yok."
-        )
-
-    latest = valid.iloc[-1]
-
-    X = pd.DataFrame(
-        [
-            latest[
-                columns
-            ].astype(float)
-        ]
-    )
+    X_latest = pd.DataFrame([
+        latest[
+            cols
+        ].astype(float)
+    ])
 
     probabilities = (
         classifier
-        .predict_proba(X)[0]
+        .predict_proba(
+            X_latest
+        )[0]
     )
 
     classes = (
@@ -2034,117 +1548,127 @@ def predict(
     )
 
     probability_map = {
-        int(c):
-            float(p)
-
+        int(c): float(p)
         for c, p in zip(
             classes,
-            probabilities
+            probabilities,
         )
     }
 
-    p_sell = probability_map.get(
-        0,
-        0.0
-    )
-
-    p_hold = probability_map.get(
-        1,
-        0.0
-    )
-
-    p_buy = probability_map.get(
-        2,
-        0.0
-    )
-
     prediction = int(
         classifier.predict(
-            X
+            X_latest
         )[0]
     )
 
-    expected_return = float(
-        regressor.predict(
-            X
-        )[0]
+    buy_probability = (
+        probability_map.get(
+            2,
+            0.0,
+        )
+    )
+
+    hold_probability = (
+        probability_map.get(
+            1,
+            0.0,
+        )
+    )
+
+    sell_probability = (
+        probability_map.get(
+            0,
+            0.0,
+        )
     )
 
     if prediction == 2:
 
         signal = "BUY"
 
-        confidence = p_buy
+        confidence = (
+            buy_probability
+        )
 
     elif prediction == 0:
 
         signal = "SELL"
 
-        confidence = p_sell
+        confidence = (
+            sell_probability
+        )
 
     else:
 
         signal = "HOLD"
 
-        confidence = p_hold
+        confidence = (
+            hold_probability
+        )
 
-    price = float(
-        latest["close"]
+    expected_return = float(
+        regressor.predict(
+            X_latest
+        )[0]
     )
 
-    rsi14 = safe_float(
-        latest["rsi_14"]
+    momentum = to_float(
+        latest.get("ret_24")
     )
 
-    bb_position = safe_float(
-        latest["bb_position"]
+    trend = to_float(
+        latest.get("ema_20_50")
     )
 
-    atr_pct = safe_float(
-        latest["atr_pct"]
+    volume_ratio = to_float(
+        latest.get(
+            "volume_ratio"
+        )
     )
 
-    adx_value = safe_float(
-        latest["adx"]
+    volatility = to_float(
+        latest.get(
+            "volatility_24"
+        )
     )
-
-    volume_ratio = safe_float(
-        latest["volume_ratio"]
-    )
-
-    momentum = safe_float(
-        latest["ret_24"]
-    )
-
-    trend = safe_float(
-        latest["ema_20_50"]
-    )
-
-    volatility = safe_float(
-        latest["volatility_24"]
-    )
-
-    # SCORE
 
     direction = (
-        p_buy
-        - p_sell
+        buy_probability
+        - sell_probability
     )
 
-    momentum_score = np.tanh(
-        momentum * 20
-    )
+    if np.isnan(momentum):
 
-    trend_score = np.tanh(
-        trend * 20
-    )
+        momentum_score = 0
 
-    volume_score = np.tanh(
-        (
-            volume_ratio
-            - 1
-        ) / 2
-    )
+    else:
+
+        momentum_score = np.tanh(
+            momentum * 20
+        )
+
+    if np.isnan(trend):
+
+        trend_score = 0
+
+    else:
+
+        trend_score = np.tanh(
+            trend * 20
+        )
+
+    if np.isnan(
+        volume_ratio
+    ):
+
+        volume_score = 0
+
+    else:
+
+        volume_score = np.tanh(
+            (volume_ratio - 1)
+            / 2
+        )
 
     if np.isnan(
         volatility
@@ -2159,61 +1683,73 @@ def predict(
             - np.clip(
                 volatility * 30,
                 0,
-                1
+                1,
             )
         )
 
-    score = (
-        50
-        + direction * 25
-        + momentum_score * 10
-        + trend_score * 7
-        + volume_score * 4
-        + risk_score * 4
-    )
-
     score = float(
         np.clip(
-            score,
+            50
+            + direction * 25
+            + momentum_score * 10
+            + trend_score * 7
+            + volume_score * 4
+            + risk_score * 4,
             0,
-            100
+            100,
         )
     )
 
     return {
 
-        "signal":
-            signal,
+        "signal": signal,
 
-        "confidence":
-            confidence,
+        "confidence": confidence,
 
-        "p_buy":
-            p_buy,
+        "p_buy": buy_probability,
 
-        "p_hold":
-            p_hold,
+        "p_hold": hold_probability,
 
-        "p_sell":
-            p_sell,
+        "p_sell": sell_probability,
 
         "expected_return":
             expected_return,
 
         "price":
-            price,
+            float(
+                latest["close"]
+            ),
+
+        "score":
+            score,
 
         "rsi14":
-            rsi14,
+            to_float(
+                latest.get(
+                    "rsi_14"
+                )
+            ),
 
         "bb_position":
-            bb_position,
+            to_float(
+                latest.get(
+                    "bb_position"
+                )
+            ),
 
         "atr_pct":
-            atr_pct,
+            to_float(
+                latest.get(
+                    "atr_pct"
+                )
+            ),
 
         "adx":
-            adx_value,
+            to_float(
+                latest.get(
+                    "adx"
+                )
+            ),
 
         "volume_ratio":
             volume_ratio,
@@ -2227,116 +1763,8 @@ def predict(
         "volatility":
             volatility,
 
-        "score":
-            score
-    }
-
-
-# ============================================================
-# ANALYZE
-# ============================================================
-
-def analyze(
-    symbol,
-    df,
-    future_bars,
-    train_limit
-):
-
-    started = time.time()
-
-    (
-        classifier,
-        regressor,
-        features,
-        columns,
-        accuracy
-    ) = train(
-        df,
-        future_bars,
-        train_limit
-    )
-
-    prediction = predict(
-        classifier,
-        regressor,
-        features,
-        columns
-    )
-
-    return {
-
-        "symbol":
-            symbol,
-
-        "signal":
-            prediction["signal"],
-
-        "score":
-            prediction["score"],
-
-        "confidence":
-            prediction["confidence"],
-
-        "expected_return":
-            prediction[
-                "expected_return"
-            ],
-
-        "price":
-            prediction["price"],
-
-        "p_buy":
-            prediction["p_buy"],
-
-        "p_hold":
-            prediction["p_hold"],
-
-        "p_sell":
-            prediction["p_sell"],
-
-        "rsi14":
-            prediction["rsi14"],
-
-        "bb_position":
-            prediction[
-                "bb_position"
-            ],
-
-        "atr_pct":
-            prediction["atr_pct"],
-
-        "adx":
-            prediction["adx"],
-
-        "volume_ratio":
-            prediction[
-                "volume_ratio"
-            ],
-
-        "momentum":
-            prediction["momentum"],
-
-        "trend":
-            prediction["trend"],
-
-        "volatility":
-            prediction["volatility"],
-
         "training_accuracy":
-            accuracy,
-
-        "candles":
-            len(df),
-
-        "last_candle":
-            df[
-                "timestamp"
-            ].iloc[-1],
-
-        "processing_seconds":
-            time.time()
-            - started
+            training_accuracy,
     }
 
 
@@ -2348,228 +1776,216 @@ st.sidebar.header(
     "⚙️ Scanner Settings"
 )
 
-data_source = st.sidebar.selectbox(
+
+source = st.sidebar.selectbox(
+
     "Data Source",
+
     [
         "Kraken REST",
         "CSV / Uploaded Data",
-        "Binance REST"
-    ]
+        "Binance REST",
+    ],
 )
 
 
 uploaded_file = None
 
-if data_source == (
-    "CSV / Uploaded Data"
-):
+if source == "CSV / Uploaded Data":
 
     uploaded_file = (
         st.sidebar.file_uploader(
             "OHLCV CSV",
-            type=["csv"]
+            type=["csv"],
         )
     )
 
+    st.sidebar.caption(
+        "Kolonlar: timestamp, "
+        "open, high, low, close, volume"
+    )
 
-candle_target = st.sidebar.selectbox(
+
+target = st.sidebar.selectbox(
+
     "Candle Target",
+
     [
         10_000,
         50_000,
         100_000,
         250_000,
-        500_000
+        500_000,
     ],
-    index=4
+
+    index=4,
 )
 
 
 symbol_limit = st.sidebar.slider(
+
     "Maximum Symbols",
-    1,
-    100,
-    10
+
+    min_value=1,
+
+    max_value=100,
+
+    value=10,
 )
 
 
 future_bars = st.sidebar.slider(
+
     "Future Bars",
-    3,
-    48,
-    12
+
+    min_value=3,
+
+    max_value=48,
+
+    value=12,
 )
 
 
 train_limit = st.sidebar.slider(
+
     "Training Rows",
-    2_000,
-    30_000,
-    10_000,
-    step=1_000
+
+    min_value=500,
+
+    max_value=30_000,
+
+    value=5_000,
+
+    step=500,
 )
 
 
-min_confidence = st.sidebar.slider(
-    "Minimum AI Confidence",
-    0.30,
-    0.95,
-    0.55,
-    step=0.01
+minimum_confidence = (
+    st.sidebar.slider(
+
+        "Minimum AI Confidence",
+
+        min_value=0.30,
+
+        max_value=0.95,
+
+        value=0.55,
+
+        step=0.01,
+    )
 )
 
 
 auto_refresh = st.sidebar.checkbox(
+
     "15 Dakikada Otomatik Tarama",
-    True
+
+    value=True,
 )
 
 
 if st.sidebar.button(
     "🔄 Şimdi Tara",
-    use_container_width=True
+    use_container_width=True,
 ):
 
     st.session_state.force_scan = True
 
 
-st.sidebar.info(
-    "No Order Execution: "
-    "Bu uygulama hiçbir alım/satım emri göndermez."
-)
-
-
 # ============================================================
-# DISCOVER
+# DISCOVER SYMBOLS
 # ============================================================
 
-def discover():
+def discover_symbols():
 
-    if data_source == "Kraken REST":
+    if source == "Kraken REST":
 
-        pairs = get_kraken_symbols()
+        symbols = (
+            get_kraken_symbols()
+        )
 
-        if not pairs:
+        if not symbols:
 
             raise DataProviderError(
                 "Kraken Spot sembol bulunamadı."
             )
 
-        return pairs[
+        return symbols[
             :symbol_limit
         ]
 
-    if data_source == (
-        "CSV / Uploaded Data"
-    ):
+    if source == "Binance REST":
 
-        if uploaded_file is None:
+        symbols = (
+            get_binance_symbols()
+        )
 
-            raise DataProviderError(
-                "CSV yüklenmedi."
-            )
-
-        return [
-            {
-                "api_symbol":
-                    "UPLOADED_DATA",
-
-                "display_symbol":
-                    "UPLOADED_DATA"
-            }
-        ]
-
-    if data_source == "Binance REST":
-
-        return get_binance_symbols()[
+        return symbols[
             :symbol_limit
         ]
 
-    raise DataProviderError(
-        "Bilinmeyen data source."
-    )
+    if uploaded_file is None:
+
+        raise DataProviderError(
+            "CSV dosyası yüklenmedi."
+        )
+
+    return [
+        {
+            "api": "CSV",
+            "display":
+                "UPLOADED_DATA",
+        }
+    ]
 
 
 # ============================================================
-# LOAD
+# LOAD DATA
 # ============================================================
 
-def load_symbol(
-    pair
-):
+def load_symbol(pair):
 
-    if data_source == (
-        "Kraken REST"
-    ):
+    if source == "Kraken REST":
 
-        api_symbol = pair[
-            "api_symbol"
-        ]
+        api_symbol = pair["api"]
 
-        display_symbol = pair[
-            "display_symbol"
-        ]
+        display_symbol = (
+            pair["display"]
+        )
 
         cache_key = (
             "KRAKEN|"
             + api_symbol
         )
 
-        cached = (
-            st.session_state
-            .candle_cache
-            .get(cache_key)
-        )
-
         if (
-            cached is not None
-            and len(cached)
-            >= candle_target
+            cache_key
+            in st.session_state.cache
         ):
 
             return (
                 display_symbol,
-                cached.tail(
-                    candle_target
-                )
+                st.session_state.cache[
+                    cache_key
+                ].tail(target),
             )
 
-        df = download_kraken_history(
-            api_symbol,
-            candle_target
+        df = get_kraken_ohlc(
+            api_symbol
         )
 
         if not df.empty:
 
-            st.session_state[
-                "candle_cache"
-            ][
+            st.session_state.cache[
                 cache_key
-            ] = df
+            ] = df.tail(target)
 
         return (
             display_symbol,
-            df
+            df,
         )
 
-    if data_source == (
-        "CSV / Uploaded Data"
-    ):
-
-        df = read_csv(
-            uploaded_file
-        )
-
-        return (
-            "UPLOADED_DATA",
-            df.tail(
-                candle_target
-            )
-        )
-
-    if data_source == (
-        "Binance REST"
-    ):
+    if source == "Binance REST":
 
         symbol = pair
 
@@ -2578,45 +1994,41 @@ def load_symbol(
             + symbol
         )
 
-        cached = (
-            st.session_state
-            .candle_cache
-            .get(cache_key)
-        )
-
         if (
-            cached is not None
-            and len(cached)
-            >= candle_target
+            cache_key
+            in st.session_state.cache
         ):
 
             return (
                 symbol,
-                cached.tail(
-                    candle_target
-                )
+                st.session_state.cache[
+                    cache_key
+                ].tail(target),
             )
 
-        df = download_binance_history(
+        df = get_binance_history(
             symbol,
-            candle_target
+            target,
         )
 
         if not df.empty:
 
-            st.session_state[
-                "candle_cache"
-            ][
+            st.session_state.cache[
                 cache_key
             ] = df
 
         return (
             symbol,
-            df
+            df,
         )
 
-    raise DataProviderError(
-        "Data source bulunamadı."
+    df = load_csv(
+        uploaded_file
+    )
+
+    return (
+        "UPLOADED_DATA",
+        df.tail(target),
     )
 
 
@@ -2626,110 +2038,115 @@ def load_symbol(
 
 def run_scan():
 
-    st.session_state.scan_errors = []
+    st.session_state.errors = []
 
-    st.session_state.last_status = (
+    st.session_state.status = (
         "SCANNING"
     )
 
     results = []
 
-    progress = st.progress(
-        0
-    )
+    progress = st.progress(0)
 
-    status = st.empty()
+    status_box = st.empty()
 
     try:
 
-        status.info(
+        status_box.info(
             "Spot sembolleri alınıyor..."
         )
 
-        pairs = discover()
-
-        total = len(
-            pairs
+        symbols = (
+            discover_symbols()
         )
 
-        if total == 0:
-
-            raise DataProviderError(
-                "Sembol bulunamadı."
-            )
+        total = len(symbols)
 
         for index, pair in enumerate(
-            pairs
+            symbols
         ):
 
             if isinstance(
                 pair,
-                dict
+                dict,
             ):
 
                 label = pair[
-                    "display_symbol"
+                    "display"
                 ]
 
             else:
 
-                label = str(
-                    pair
-                )
+                label = str(pair)
 
-            status.info(
+            status_box.info(
                 f"Tarama: {label} "
                 f"({index + 1}/{total})"
             )
 
             try:
 
-                symbol, df = load_symbol(
-                    pair
+                symbol, df = (
+                    load_symbol(pair)
                 )
 
-                if df.empty:
+                # ------------------------------------------------
+                # IMPORTANT FIX
+                # ------------------------------------------------
 
-                    raise DataProviderError(
-                        "OHLCV veri seti boş."
-                    )
-
-                if len(df) < 1_000:
+                if len(df) < MIN_CANDLES:
 
                     raise DataProviderError(
                         f"Yetersiz candle: "
                         f"{len(df)}. "
-                        "En az 1,000 candle gerekli."
+                        f"En az "
+                        f"{MIN_CANDLES} "
+                        f"candle gerekli."
                     )
 
-                result = analyze(
-                    symbol,
-                    df,
-                    future_bars,
-                    train_limit
+                start = time.time()
+
+                prediction = (
+                    train_and_predict(
+                        df,
+                        future_bars,
+                        train_limit,
+                    )
                 )
 
-                results.append(
-                    result
-                )
+                results.append({
+
+                    "symbol":
+                        symbol,
+
+                    **prediction,
+
+                    "candles":
+                        len(df),
+
+                    "last_candle":
+                        df[
+                            "timestamp"
+                        ].iloc[-1],
+
+                    "processing_seconds":
+                        time.time()
+                        - start,
+                })
 
             except Exception as exc:
 
-                st.session_state[
-                    "scan_errors"
-                ].append(
-                    {
-                        "symbol":
-                            label,
+                st.session_state.errors.append({
 
-                        "error":
-                            (
-                                type(exc).__name__
-                                + ": "
-                                + str(exc)
-                            )
-                    }
-                )
+                    "symbol":
+                        label,
+
+                    "error":
+                        (
+                            f"{type(exc).__name__}: "
+                            f"{exc}"
+                        ),
+                })
 
             progress.progress(
                 int(
@@ -2741,8 +2158,8 @@ def run_scan():
                 )
             )
 
-        result_df = pd.DataFrame(
-            results
+        result_df = (
+            pd.DataFrame(results)
         )
 
         if not result_df.empty:
@@ -2751,119 +2168,105 @@ def run_scan():
                 result_df
                 .sort_values(
                     "score",
-                    ascending=False
+                    ascending=False,
                 )
                 .reset_index(
                     drop=True
                 )
             )
 
-        st.session_state[
-            "scan_results"
-        ] = result_df
-
-        st.session_state[
-            "last_scan"
-        ] = utc_now()
-
-        st.session_state[
-            "last_source"
-        ] = data_source
-
-        st.session_state[
-            "last_status"
-        ] = (
-            "SUCCESS"
-            if not result_df.empty
-            else "NO_RESULTS"
+        st.session_state.results = (
+            result_df
         )
+
+        st.session_state.last_scan = (
+            now_utc()
+        )
+
+        st.session_state.last_source = (
+            source
+        )
+
+        if result_df.empty:
+
+            st.session_state.status = (
+                "NO_RESULTS"
+            )
+
+        else:
+
+            st.session_state.status = (
+                "SUCCESS"
+            )
 
     except BinanceRestrictedError as exc:
 
-        message = (
-            "HTTP 451: Binance API bu "
-            "çalışma ortamından erişime "
-            "izin vermiyor."
+        st.session_state.errors.append({
+
+            "symbol":
+                "BINANCE",
+
+            "error":
+                str(exc),
+        })
+
+        st.session_state.status = (
+            "BINANCE_451"
         )
-
-        st.session_state[
-            "scan_errors"
-        ].append(
-            {
-                "symbol":
-                    "BINANCE",
-
-                "error":
-                    message
-            }
-        )
-
-        st.session_state[
-            "last_status"
-        ] = "BINANCE_451"
 
         st.error(
-            message
+            str(exc)
         )
 
         st.info(
-            "Binance yerine sol menüden "
-            "'Kraken REST' seçebilirsiniz."
+            "Binance erişimi bu "
+            "ortamda kısıtlı. "
+            "Kraken REST veya CSV "
+            "kullanabilirsiniz."
         )
 
     except Exception as exc:
 
-        message = (
-            type(exc).__name__
-            + ": "
-            + str(exc)
+        st.session_state.errors.append({
+
+            "symbol":
+                "SYSTEM",
+
+            "error":
+                (
+                    f"{type(exc).__name__}: "
+                    f"{exc}"
+                ),
+        })
+
+        st.session_state.status = (
+            "ERROR"
         )
-
-        st.session_state[
-            "scan_errors"
-        ].append(
-            {
-                "symbol":
-                    "SYSTEM",
-
-                "error":
-                    message
-            }
-        )
-
-        st.session_state[
-            "last_status"
-        ] = "ERROR"
 
         st.error(
-            "Tarama hatası: "
-            + message
+            f"Tarama hatası: "
+            f"{type(exc).__name__}: "
+            f"{exc}"
         )
 
     finally:
 
         progress.empty()
 
-        status.empty()
+        status_box.empty()
 
-        st.session_state[
-            "force_scan"
-        ] = False
+        st.session_state.force_scan = (
+            False
+        )
 
 
 # ============================================================
-# RUN
+# AUTO SCANNER
 # ============================================================
-
-should_run = (
-    st.session_state.force_scan
-    or auto_refresh
-)
-
 
 if hasattr(
     st,
-    "fragment"
+    "fragment",
 ):
 
     @st.fragment(
@@ -2873,17 +2276,24 @@ if hasattr(
             else None
         )
     )
-    def scanner():
+    def scanner_fragment():
 
-        if should_run:
+        if (
+            st.session_state.force_scan
+            or auto_refresh
+        ):
 
             run_scan()
 
-    scanner()
+
+    scanner_fragment()
 
 else:
 
-    if should_run:
+    if (
+        st.session_state.force_scan
+        or auto_refresh
+    ):
 
         run_scan()
 
@@ -2894,44 +2304,53 @@ else:
 
 st.divider()
 
-c1, c2, c3, c4 = st.columns(
-    4
+col1, col2, col3, col4 = (
+    st.columns(4)
 )
 
-with c1:
+
+with col1:
 
     st.metric(
         "Status",
-        st.session_state.last_status
+        st.session_state.status,
     )
 
-with c2:
+
+with col2:
 
     st.metric(
         "Source",
-        st.session_state.last_source
-        or data_source
+        (
+            st.session_state.last_source
+            or source
+        ),
     )
 
-with c3:
+
+with col3:
 
     st.metric(
-        "Candle Target",
-        f"{candle_target:,}"
+        "Target",
+        f"{target:,}",
     )
 
-with c4:
+
+with col4:
+
+    last_scan = (
+        st.session_state.last_scan
+    )
 
     st.metric(
         "Last Scan",
         (
-            st.session_state.last_scan
-            .strftime(
+            last_scan.strftime(
                 "%H:%M:%S"
             )
-            if st.session_state.last_scan
+            if last_scan
             else "-"
-        )
+        ),
     )
 
 
@@ -2940,7 +2359,7 @@ with c4:
 # ============================================================
 
 results = (
-    st.session_state.scan_results
+    st.session_state.results
 )
 
 
@@ -2950,43 +2369,90 @@ if results.empty:
         "Henüz sonuç yok."
     )
 
-else:
-
-    # --------------------------------------------------------
-    # BUY
-    # --------------------------------------------------------
-
-    buy = results[
-        results["signal"]
-        == "BUY"
-    ].copy()
-
-    buy = buy[
-        buy["confidence"]
-        >= min_confidence
-    ]
-
-    buy = buy.sort_values(
-        [
-            "score",
-            "confidence"
-        ],
-        ascending=False
-    ).head(10)
-
-    st.subheader(
-        "🟢 TOP 10 BUY"
-    )
-
-    if buy.empty:
+    if source == "Kraken REST":
 
         st.info(
-            "BUY sinyali yok."
+            "Kraken public OHLC "
+            "yaklaşık 721 adet "
+            "15m candle sağlayabilir. "
+            "Bu sürüm 721 candle "
+            "ile çalışabilir."
         )
 
-    else:
+else:
 
-        view = buy.copy()
+    buy = (
+        results[
+            (
+                results["signal"]
+                == "BUY"
+            )
+            & (
+                results[
+                    "confidence"
+                ]
+                >= minimum_confidence
+            )
+        ]
+        .sort_values(
+            [
+                "score",
+                "confidence",
+            ],
+            ascending=False,
+        )
+        .head(10)
+    )
+
+    sell = (
+        results[
+            (
+                results["signal"]
+                == "SELL"
+            )
+            & (
+                results[
+                    "confidence"
+                ]
+                >= minimum_confidence
+            )
+        ]
+        .sort_values(
+            [
+                "score",
+                "confidence",
+            ],
+            ascending=[
+                True,
+                False,
+            ],
+        )
+        .head(10)
+    )
+
+    hold = (
+        results[
+            results["signal"]
+            == "HOLD"
+        ]
+        .sort_values(
+            "score",
+            ascending=False,
+        )
+        .head(10)
+    )
+
+    def show_table(df):
+
+        if df.empty:
+
+            st.info(
+                "Sonuç yok."
+            )
+
+            return
+
+        view = df.copy()
 
         view[
             "confidence"
@@ -3000,262 +2466,302 @@ else:
             "p_buy"
         ] *= 100
 
-        view = view.round(
-            {
-                "confidence": 2,
-                "expected_return": 3,
-                "p_buy": 2,
-                "score": 2,
-                "rsi14": 2,
-                "adx": 2,
-                "volume_ratio": 2,
-                "price": 8
-            }
-        )
-
-        st.dataframe(
-            view[
-                [
-                    "symbol",
-                    "score",
-                    "confidence",
-                    "expected_return",
-                    "p_buy",
-                    "rsi14",
-                    "adx",
-                    "volume_ratio",
-                    "price",
-                    "candles"
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True
-        )
-
-    # --------------------------------------------------------
-    # SELL
-    # --------------------------------------------------------
-
-    sell = results[
-        results["signal"]
-        == "SELL"
-    ].copy()
-
-    sell = sell[
-        sell["confidence"]
-        >= min_confidence
-    ]
-
-    sell = sell.sort_values(
-        [
-            "score",
-            "confidence"
-        ],
-        ascending=[
-            True,
-            False
-        ]
-    ).head(10)
-
-    st.subheader(
-        "🔴 TOP 10 SELL"
-    )
-
-    if sell.empty:
-
-        st.info(
-            "SELL sinyali yok."
-        )
-
-    else:
-
-        view = sell.copy()
-
         view[
-            "confidence"
-        ] *= 100
-
-        view[
-            "expected_return"
+            "p_hold"
         ] *= 100
 
         view[
             "p_sell"
         ] *= 100
 
-        view = view.round(
-            {
-                "confidence": 2,
-                "expected_return": 3,
-                "p_sell": 2,
-                "score": 2,
-                "rsi14": 2,
-                "adx": 2,
-                "volume_ratio": 2,
-                "price": 8
-            }
-        )
+        columns = [
+
+            "symbol",
+
+            "signal",
+
+            "score",
+
+            "confidence",
+
+            "expected_return",
+
+            "p_buy",
+
+            "p_hold",
+
+            "p_sell",
+
+            "rsi14",
+
+            "adx",
+
+            "volume_ratio",
+
+            "price",
+
+            "candles",
+        ]
 
         st.dataframe(
+
             view[
-                [
-                    "symbol",
-                    "score",
-                    "confidence",
-                    "expected_return",
-                    "p_sell",
-                    "rsi14",
-                    "adx",
-                    "volume_ratio",
-                    "price",
-                    "candles"
-                ]
-            ],
+                columns
+            ].round(4),
+
             use_container_width=True,
-            hide_index=True
+
+            hide_index=True,
         )
 
-    # --------------------------------------------------------
-    # HOLD
-    # --------------------------------------------------------
-
-    hold = results[
-        results["signal"]
-        == "HOLD"
-    ].copy()
 
     st.subheader(
-        "🟡 HOLD"
+        "🟢 TOP 10 BUY"
     )
 
-    if hold.empty:
+    show_table(
+        buy
+    )
 
-        st.info(
-            "HOLD yok."
-        )
 
-    else:
+    st.subheader(
+        "🔴 TOP 10 SELL"
+    )
 
-        view = hold.copy()
+    show_table(
+        sell
+    )
 
-        view[
-            "confidence"
-        ] *= 100
 
-        view[
-            "expected_return"
-        ] *= 100
+    st.subheader(
+        "🟡 TOP 10 HOLD"
+    )
 
-        view = view.round(
-            3
-        )
+    show_table(
+        hold
+    )
 
-        st.dataframe(
-            view[
-                [
-                    "symbol",
-                    "score",
-                    "confidence",
-                    "expected_return",
-                    "rsi14",
-                    "adx",
-                    "volume_ratio",
-                    "price",
-                    "candles"
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True
-        )
-
-    # --------------------------------------------------------
-    # ALL
-    # --------------------------------------------------------
 
     with st.expander(
-        "📋 Tüm AI Sonuçları"
+        "📋 Tüm Sonuçlar"
     ):
 
         st.dataframe(
             results,
             use_container_width=True,
-            hide_index=True
+            hide_index=True,
         )
 
-    # --------------------------------------------------------
+
+    # ========================================================
     # DETAIL
-    # --------------------------------------------------------
+    # ========================================================
 
     st.subheader(
         "🔎 Symbol Detail"
     )
 
-    selected_symbol = st.selectbox(
-        "Symbol",
+    selected_symbol = (
+        st.selectbox(
+            "Symbol",
+            results[
+                "symbol"
+            ].tolist(),
+        )
+    )
+
+    row = (
         results[
-            "symbol"
-        ].tolist()
+            results[
+                "symbol"
+            ]
+            == selected_symbol
+        ]
+        .iloc[0]
     )
 
-    row = results[
-        results["symbol"]
-        == selected_symbol
-    ].iloc[0]
 
-    a, b, c, d = st.columns(
-        4
+    a, b, c, d = (
+        st.columns(4)
     )
+
 
     with a:
 
         st.metric(
             "Signal",
-            row["signal"]
+            row["signal"],
         )
+
 
     with b:
 
         st.metric(
             "Confidence",
-            f"{row['confidence'] * 100:.2f}%"
+            (
+                f"{row['confidence'] * 100:.2f}%"
+            ),
         )
+
 
     with c:
 
         st.metric(
             "Expected Return",
-            f"{row['expected_return'] * 100:.3f}%"
+            (
+                f"{row['expected_return'] * 100:.3f}%"
+            ),
         )
+
 
     with d:
 
         st.metric(
-            "Score",
-            f"{row['score']:.2f}"
+            "AI Score",
+            (
+                f"{row['score']:.2f}/100"
+            ),
         )
 
 
-# ============================================================
-# EXPORT
-# ============================================================
+    detail = pd.DataFrame({
 
-if not results.empty:
+        "Metric": [
 
-    st.divider()
+            "Price",
+
+            "BUY Probability",
+
+            "HOLD Probability",
+
+            "SELL Probability",
+
+            "RSI 14",
+
+            "Bollinger Position",
+
+            "ATR %",
+
+            "ADX",
+
+            "Volume Ratio",
+
+            "Training Accuracy",
+
+            "Candles",
+
+            "Last Candle",
+
+            "Processing Seconds",
+        ],
+
+        "Value": [
+
+            row["price"],
+
+            f(
+                row["p_buy"] * 100,
+                ".2f"
+            )
+            + "%",
+
+            f(
+                row["p_hold"] * 100,
+                ".2f"
+            )
+            + "%",
+
+            f(
+                row["p_sell"] * 100,
+                ".2f"
+            )
+            + "%",
+
+            row["rsi14"],
+
+            row["bb_position"],
+
+            row["atr_pct"],
+
+            row["adx"],
+
+            row["volume_ratio"],
+
+            f(
+                row[
+                    "training_accuracy"
+                ]
+                * 100,
+                ".2f"
+            )
+            + "%",
+
+            row["candles"],
+
+            row["last_candle"],
+
+            f(
+                row[
+                    "processing_seconds"
+                ],
+                ".2f"
+            ),
+        ],
+    })
+
+
+    st.dataframe(
+
+        detail,
+
+        use_container_width=True,
+
+        hide_index=True,
+    )
+
 
     st.download_button(
+
         "⬇️ Download AI Results CSV",
-        data=results.to_csv(
-            index=False
-        ).encode(
-            "utf-8"
+
+        data=(
+            results
+            .to_csv(
+                index=False
+            )
+            .encode("utf-8")
         ),
+
         file_name=(
             "spot_ai_results.csv"
         ),
+
         mime="text/csv",
-        use_container_width=True
+
+        use_container_width=True,
     )
+
+
+# ============================================================
+# ERRORS
+# ============================================================
+
+if st.session_state.errors:
+
+    st.divider()
+
+    st.subheader(
+        "⚠️ Hata Detayları"
+    )
+
+    for item in (
+        st.session_state.errors
+    ):
+
+        st.error(
+            f"{item.get('symbol', 'SYSTEM')}: "
+            f"{item.get('error', 'Bilinmeyen hata')}"
+        )
 
 
 # ============================================================
@@ -3266,91 +2772,63 @@ with st.expander(
     "🗄️ Candle Cache"
 ):
 
-    if not st.session_state.candle_cache:
+    if not st.session_state.cache:
 
         st.info(
-            "Candle Cache boş."
+            "Candle cache boş."
         )
 
     else:
 
-        cache_data = []
+        cache_rows = []
 
         for key, df in (
-            st.session_state
-            .candle_cache
-            .items()
+            st.session_state.cache.items()
         ):
 
             if df.empty:
-
                 continue
 
-            cache_data.append(
-                {
-                    "source":
-                        key,
+            cache_rows.append({
 
-                    "candles":
-                        len(df),
+                "source":
+                    key,
 
-                    "first":
-                        str(
-                            df[
-                                "timestamp"
-                            ].iloc[0]
-                        ),
+                "candles":
+                    len(df),
 
-                    "last":
-                        str(
-                            df[
-                                "timestamp"
-                            ].iloc[-1]
-                        )
-                }
-            )
+                "first":
+                    str(
+                        df[
+                            "timestamp"
+                        ].iloc[0]
+                    ),
 
-        if cache_data:
+                "last":
+                    str(
+                        df[
+                            "timestamp"
+                        ].iloc[-1]
+                    ),
+            })
+
+        if cache_rows:
 
             st.dataframe(
+
                 pd.DataFrame(
-                    cache_data
+                    cache_rows
                 ),
+
                 use_container_width=True,
-                hide_index=True
-            )
 
-
-# ============================================================
-# ERRORS
-# ============================================================
-
-if st.session_state.scan_errors:
-
-    st.divider()
-
-    st.subheader(
-        "⚠️ Hata Detayları"
-    )
-
-    for item in (
-        st.session_state.scan_errors
-    ):
-
-        if isinstance(
-            item,
-            dict
-        ):
-
-            st.error(
-                f"{item.get('symbol', 'SYSTEM')}: "
-                f"{item.get('error', 'Bilinmeyen hata')}"
+                hide_index=True,
             )
 
         else:
 
-            st.error(
-                str(item)
+            st.info(
+                "Cache boş."
             )
 
 
@@ -3361,12 +2839,17 @@ if st.session_state.scan_errors:
 st.divider()
 
 st.caption(
-    "Spot AI Scanner | 15m | 500K Target | "
-    "MLP AI | No Order Execution"
+    "Spot AI Scanner | "
+    "15m | "
+    "500K Target | "
+    "MLP AI | "
+    "No Order Execution"
 )
 
 st.caption(
-    "Bu sistem yalnızca teknik verilerden "
-    "istatistiksel BUY / HOLD / SELL tahmini üretir. "
-    "Yatırım tavsiyesi değildir."
+    "Bu uygulama yalnızca OHLCV "
+    "verilerinden istatistiksel "
+    "BUY/HOLD/SELL sinyali üretir. "
+    "Emir göndermez ve yatırım "
+    "tavsiyesi değildir."
 )
