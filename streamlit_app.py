@@ -6,1636 +6,431 @@ import pandas as pd
 import requests
 import streamlit as st
 
-import torch
-import torch.nn as nn
-
-
-# ============================================================
-# AYARLAR
-# ============================================================
+# PyTorch is optional at import time so the dashboard can show a useful error
+# instead of crashing if Streamlit Cloud has not installed it yet.
+try:
+    import torch
+    import torch.nn as nn
+    TORCH_AVAILABLE = True
+except ImportError:
+    torch = None
+    nn = None
+    TORCH_AVAILABLE = False
 
 BINANCE_URL = "https://api.binance.com"
-
 INTERVAL = "15m"
-
 TARGET_CANDLES = 500_000
-
 LOOKAHEAD = 12
-
 SEQ_LEN = 96
-
-
-# ============================================================
-# STREAMLIT AYARLARI
-# ============================================================
 
 st.set_page_config(
     page_title="Binance Spot AI Scanner",
-    page_icon="📈",
-    layout="wide"
+    page_icon="📊",
+    layout="wide",
 )
 
+st.title("📊 Binance Spot Deep Learning Scanner")
+st.caption("15m • Rolling 500,000 candles • Top 10 BUY / SELL • No order execution")
 
-st.markdown("""
-<style>
-
-.block-container {
-    max-width: 1450px;
-    padding-top: 25px;
-}
-
-.buy {
-    color: #00d084;
-    font-weight: 800;
-}
-
-.sell {
-    color: #ff4d67;
-    font-weight: 800;
-}
-
-</style>
-""", unsafe_allow_html=True)
-
-
-# ============================================================
-# BINANCE API
-# ============================================================
+if not TORCH_AVAILABLE:
+    st.error(
+        "PyTorch (torch) kurulu değil. Streamlit Cloud'da requirements.txt "
+        "ve Python sürümünü kontrol edip uygulamayı yeniden deploy edin."
+    )
+    st.info(
+        "Gerekli bağımlılıklar: streamlit, requests, pandas, numpy, torch. "
+        "Bu uygulama emir göndermez; yalnızca analiz/öneri üretir."
+    )
 
 @st.cache_data(ttl=300)
 def get_exchange_info():
-
-    response = requests.get(
-        BINANCE_URL + "/api/v3/exchangeInfo",
-        timeout=30,
-        headers={
-            "User-Agent": "Binance-Spot-AI"
-        }
-    )
-
-    response.raise_for_status()
-
-    return response.json()
-
+    r = requests.get(f"{BINANCE_URL}/api/v3/exchangeInfo", timeout=30)
+    r.raise_for_status()
+    return r.json()
 
 def get_spot_symbols():
-
-    data = get_exchange_info()
-
-    result = []
-
-    for item in data["symbols"]:
-
-        if item["status"] != "TRADING":
+    info = get_exchange_info()
+    symbols = []
+    for s in info.get("symbols", []):
+        if s.get("status") != "TRADING":
             continue
-
-        if item["quoteAsset"] != "USDT":
+        if s.get("quoteAsset") != "USDT":
             continue
-
-        if not item.get(
-            "isSpotTradingAllowed",
-            True
-        ):
+        permissions = s.get("permissions", [])
+        if permissions and "SPOT" not in permissions:
             continue
+        symbols.append(s["symbol"])
+    return sorted(set(symbols))
 
-        result.append(
-            item["symbol"]
-        )
+def convert_klines(rows):
+    if not rows:
+        return pd.DataFrame()
+    cols = [
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "trades",
+        "taker_base", "taker_quote", "ignore"
+    ]
+    df = pd.DataFrame(rows, columns=cols)
+    numeric = ["open", "high", "low", "close", "volume", "quote_volume"]
+    for c in numeric:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+    df = df.drop_duplicates("open_time").sort_values("open_time").reset_index(drop=True)
+    return df
 
-    return result
+@st.cache_data(show_spinner=False)
+def download_initial_500k(symbol, candle_count):
+    rows = []
+    end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
-
-# ============================================================
-# MUM VERİSİ
-# ============================================================
-
-def download_initial_500k(
-    symbol,
-    candle_count
-):
-
-    all_rows = []
-
-    end_time = None
-
-    while len(all_rows) < candle_count:
-
-        limit = min(
-            1000,
-            candle_count - len(all_rows)
-        )
-
+    while len(rows) < candle_count:
+        limit = min(1000, candle_count - len(rows))
         params = {
             "symbol": symbol,
             "interval": INTERVAL,
-            "limit": limit
+            "limit": limit,
+            "endTime": end_ms,
         }
-
-        if end_time is not None:
-
-            params["endTime"] = end_time
-
-        response = requests.get(
-            BINANCE_URL + "/api/v3/klines",
-            params=params,
-            timeout=30,
-            headers={
-                "User-Agent": "Binance-Spot-AI"
-            }
-        )
-
-        response.raise_for_status()
-
-        batch = response.json()
-
+        r = requests.get(f"{BINANCE_URL}/api/v3/klines", params=params, timeout=30)
+        r.raise_for_status()
+        batch = r.json()
         if not batch:
             break
 
-        all_rows = batch + all_rows
-
-        end_time = batch[0][0] - 1
+        rows = batch + rows
+        oldest = batch[0][0]
+        end_ms = oldest - 1
 
         if len(batch) < limit:
             break
-
         time.sleep(0.04)
 
+    df = convert_klines(rows)
+    if len(df) > candle_count:
+        df = df.tail(candle_count).reset_index(drop=True)
+    return df
 
-    return convert_klines(
-        all_rows[-candle_count:]
-    )
+def download_new_candles(symbol, last_open_ms):
+    rows = []
+    start_ms = int(last_open_ms) + 1
 
-
-def download_new_candles(
-    symbol,
-    last_open_time
-):
-
-    params = {
-        "symbol": symbol,
-        "interval": INTERVAL,
-        "startTime": int(last_open_time) + 1,
-        "limit": 1000
-    }
-
-    response = requests.get(
-        BINANCE_URL + "/api/v3/klines",
-        params=params,
-        timeout=30,
-        headers={
-            "User-Agent": "Binance-Spot-AI"
+    for _ in range(5):
+        params = {
+            "symbol": symbol,
+            "interval": INTERVAL,
+            "limit": 1000,
+            "startTime": start_ms,
         }
-    )
-
-    response.raise_for_status()
-
-    rows = response.json()
-
-    if not rows:
-
-        return pd.DataFrame()
+        r = requests.get(f"{BINANCE_URL}/api/v3/klines", params=params, timeout=30)
+        r.raise_for_status()
+        batch = r.json()
+        if not batch:
+            break
+        rows.extend(batch)
+        if len(batch) < 1000:
+            break
+        start_ms = batch[-1][0] + 1
+        time.sleep(0.04)
 
     return convert_klines(rows)
 
+def update_symbol_cache(symbol, candle_count):
+    cache = st.session_state.setdefault("candle_cache", {})
 
-def convert_klines(rows):
+    if symbol not in cache or cache[symbol].empty:
+        df = download_initial_500k(symbol, candle_count)
+    else:
+        old = cache[symbol]
+        last_ms = int(old["open_time"].iloc[-1].timestamp() * 1000)
+        new = download_new_candles(symbol, last_ms)
+        if new.empty:
+            df = old
+        else:
+            df = pd.concat([old, new], ignore_index=True)
+            df = df.drop_duplicates("open_time").sort_values("open_time")
+            df = df.tail(candle_count).reset_index(drop=True)
 
-    columns = [
-
-        "open_time",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "close_time",
-        "quote_volume",
-        "trades",
-        "taker_base",
-        "taker_quote",
-        "ignore"
-
-    ]
-
-    df = pd.DataFrame(
-        rows,
-        columns=columns
-    )
-
-
-    numeric = [
-
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "quote_volume"
-
-    ]
-
-
-    for column in numeric:
-
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce"
-        )
-
-
-    df = df.dropna()
-
-    df = df.drop_duplicates(
-        "open_time"
-    )
-
-    df = df.sort_values(
-        "open_time"
-    )
-
-    df = df.reset_index(
-        drop=True
-    )
-
+    cache[symbol] = df
     return df
 
+def make_features(df):
+    x = df.copy()
+    close = x["close"]
+    high = x["high"]
+    low = x["low"]
+    volume = x["volume"]
 
-# ============================================================
-# 500K CACHE
-# ============================================================
+    for p in [5, 12, 20, 50, 100, 200, 500, 800]:
+        x[f"ema{p}"] = close.ewm(span=p, adjust=False).mean() / close - 1
 
-def update_symbol_cache(
-    symbol,
-    candle_count
-):
+    delta = close.diff()
+    for p in [7, 14, 21]:
+        gain = delta.clip(lower=0).rolling(p).mean()
+        loss = (-delta.clip(upper=0)).rolling(p).mean()
+        rs = gain / (loss + 1e-12)
+        x[f"rsi{p}"] = 100 - (100 / (1 + rs))
 
-    if "candle_cache" not in st.session_state:
+    mid = close.rolling(20).mean()
+    std = close.rolling(20).std()
+    x["bb_upper"] = (mid + 2 * std) / close - 1
+    x["bb_lower"] = (mid - 2 * std) / close - 1
 
-        st.session_state.candle_cache = {}
+    x["vol20"] = close.pct_change().rolling(20).std()
+    x["vol50"] = close.pct_change().rolling(50).std()
+    x["volume_ratio"] = volume / (volume.rolling(50).mean() + 1e-12)
 
+    x["candle_range"] = (high - low) / close
+    x["candle_body"] = (x["close"] - x["open"]).abs() / close
+    x["upper_wick"] = (high - x[["open", "close"]].max(axis=1)) / close
+    x["lower_wick"] = (x[["open", "close"]].min(axis=1) - low) / close
 
-    cache = st.session_state.candle_cache
+    x["momentum12"] = close.pct_change(12)
+    x["momentum48"] = close.pct_change(48)
+    x["future_return"] = close.shift(-LOOKAHEAD) / close - 1
 
-
-    # İlk kez
-    if symbol not in cache:
-
-        df = download_initial_500k(
-            symbol,
-            candle_count
-        )
-
-        cache[symbol] = df
-
-        return df, True
-
-
-    # Daha önce var
-    old = cache[symbol]
-
-
-    if old.empty:
-
-        df = download_initial_500k(
-            symbol,
-            candle_count
-        )
-
-        cache[symbol] = df
-
-        return df, True
-
-
-    last_time = int(
-        old["open_time"].iloc[-1]
-    )
-
-
-    new = download_new_candles(
-        symbol,
-        last_time
-    )
-
-
-    if not new.empty:
-
-        df = pd.concat(
-            [
-                old,
-                new
-            ],
-            ignore_index=True
-        )
-
-
-        df = (
-            df
-            .drop_duplicates("open_time")
-            .sort_values("open_time")
-            .tail(candle_count)
-            .reset_index(drop=True)
-        )
-
-
-        cache[symbol] = df
-
-        return df, True
-
-
-    return old, False
-
-
-# ============================================================
-# FEATURES
-# ============================================================
+    return x.replace([np.inf, -np.inf], np.nan)
 
 FEATURES = [
-
-    "ema5",
-    "ema12",
-    "ema20",
-    "ema50",
-    "ema100",
-    "ema200",
-    "ema500",
-    "ema800",
-
-    "rsi7",
-    "rsi14",
-    "rsi21",
-
-    "bb_upper",
-    "bb_lower",
-
-    "vol20",
-    "vol50",
-
-    "volume_ratio",
-
-    "candle_range",
-    "body",
-
-    "upper_wick",
-    "lower_wick",
-
-    "momentum12",
-    "momentum48"
-
+    "ema5", "ema12", "ema20", "ema50", "ema100", "ema200", "ema500", "ema800",
+    "rsi7", "rsi14", "rsi21",
+    "bb_upper", "bb_lower",
+    "vol20", "vol50", "volume_ratio",
+    "candle_range", "candle_body", "upper_wick", "lower_wick",
+    "momentum12", "momentum48",
 ]
 
-
-def create_features(df):
-
-    data = df.copy()
-
-    close = data["close"]
-
-    returns = close.pct_change()
-
-
-    # EMA
-
-    for period in [
-        5,
-        12,
-        20,
-        50,
-        100,
-        200,
-        500,
-        800
-    ]:
-
-        data[f"ema{period}"] = (
-
-            close
-            .ewm(
-                span=period,
-                adjust=False
-            )
-            .mean()
-            /
-            close
-            - 1
-
-        )
-
-
-    # RSI
-
-    for period in [
-        7,
-        14,
-        21
-    ]:
-
-        delta = close.diff()
-
-        gain = (
-            delta
-            .clip(lower=0)
-            .rolling(period)
-            .mean()
-        )
-
-        loss = (
-            -delta
-            .clip(upper=0)
-            .rolling(period)
-            .mean()
-        )
-
-        rs = (
-            gain /
-            (loss + 1e-12)
-        )
-
-        data[f"rsi{period}"] = (
-
-            100 -
-            (
-                100 /
-                (1 + rs)
-            )
-
-        )
-
-
-    # Bollinger
-
-    middle = (
-        close
-        .rolling(20)
-        .mean()
-    )
-
-    std = (
-        close
-        .rolling(20)
-        .std()
-    )
-
-
-    data["bb_upper"] = (
-
-        (middle + 2 * std)
-        /
-        close
-        - 1
-
-    )
-
-
-    data["bb_lower"] = (
-
-        (middle - 2 * std)
-        /
-        close
-        - 1
-
-    )
-
-
-    # Volatility
-
-    data["vol20"] = (
-        returns
-        .rolling(20)
-        .std()
-    )
-
-    data["vol50"] = (
-        returns
-        .rolling(50)
-        .std()
-    )
-
-
-    # Volume
-
-    data["volume_ratio"] = (
-
-        data["volume"]
-        /
-        (
-            data["volume"]
-            .rolling(50)
-            .mean()
-            + 1e-12
-        )
-
-    )
-
-
-    # Candle
-
-    data["candle_range"] = (
-
-        data["high"]
-        -
-        data["low"]
-
-    ) / close
-
-
-    data["body"] = (
-
-        data["close"]
-        -
-        data["open"]
-
-    ) / data["open"]
-
-
-    data["upper_wick"] = (
-
-        data["high"]
-        -
-        data[
-            ["open", "close"]
-        ].max(axis=1)
-
-    ) / close
-
-
-    data["lower_wick"] = (
-
-        data[
-            ["open", "close"]
-        ].min(axis=1)
-        -
-        data["low"]
-
-    ) / close
-
-
-    # Momentum
-
-    data["momentum12"] = (
-        close.pct_change(12)
-    )
-
-    data["momentum48"] = (
-        close.pct_change(48)
-    )
-
-
-    # Target
-
-    data["future_return"] = (
-
-        close.shift(
-            -LOOKAHEAD
-        )
-        /
-        close
-        - 1
-
-    )
-
-
-    data = data.replace(
-        [np.inf, -np.inf],
-        np.nan
-    )
-
-
-    data = data.dropna()
-
-    return data.reset_index(
-        drop=True
-    )
-
-
-# ============================================================
-# TRANSFORMER
-# ============================================================
-
-class TransformerModel(
-    nn.Module
-):
-
-    def __init__(
-        self,
-        feature_count
-    ):
-
-        super().__init__()
-
-
-        self.input = nn.Linear(
-            feature_count,
-            96
-        )
-
-
-        layer = (
-            nn.TransformerEncoderLayer(
-                d_model=96,
+if TORCH_AVAILABLE:
+    class TransformerAI(nn.Module):
+        def __init__(self, n_features):
+            super().__init__()
+            d = 96
+            self.proj = nn.Linear(n_features, d)
+            layer = nn.TransformerEncoderLayer(
+                d_model=d,
                 nhead=8,
                 batch_first=True,
-                dropout=0.10
+                dropout=0.10,
             )
-        )
+            self.encoder = nn.TransformerEncoder(layer, num_layers=3)
+            self.cls = nn.Linear(d, 2)
+            self.reg = nn.Linear(d, 1)
 
+        def forward(self, x):
+            z = self.proj(x)
+            z = self.encoder(z)
+            z = z[:, -1, :]
+            return self.cls(z), self.reg(z)
 
-        self.encoder = (
-            nn.TransformerEncoder(
-                layer,
-                num_layers=3
-            )
-        )
+def predict_ai(df):
+    if not TORCH_AVAILABLE:
+        return "N/A", 0.0, 0.0
 
+    f = make_features(df).dropna(subset=FEATURES + ["future_return"]).copy()
+    if len(f) < SEQ_LEN + 100:
+        return "N/A", 0.0, 0.0
 
-        self.classifier = nn.Linear(
-            96,
-            2
-        )
+    vals = f[FEATURES].astype(np.float32).values
+    mu = vals[:-LOOKAHEAD].mean(axis=0)
+    sd = vals[:-LOOKAHEAD].std(axis=0) + 1e-6
+    vals = (vals - mu) / sd
 
-
-        self.regression = nn.Linear(
-            96,
-            1
-        )
-
-
-    def forward(self, x):
-
-        x = self.input(x)
-
-        x = self.encoder(x)
-
-        x = x[:, -1]
-
-        return (
-            self.classifier(x),
-            self.regression(x)
-        )
-
-
-# ============================================================
-# AI PREDICTION
-# ============================================================
-
-def predict_ai(data):
-
-    if len(data) < SEQ_LEN + 300:
-
-        return None
-
-
-    values = (
-        data[FEATURES]
-        .values
-        .astype(np.float32)
+    yret = f["future_return"].values.astype(np.float32)
+    max_samples = min(2500, len(f) - SEQ_LEN)
+    starts = np.linspace(
+        0, len(f) - SEQ_LEN - 1, max_samples, dtype=int
     )
 
+    X = np.stack([vals[i:i+SEQ_LEN] for i in starts])
+    y = (yret[starts + SEQ_LEN - 1] > 0).astype(np.int64)
+    yr = yret[starts + SEQ_LEN - 1]
 
-    future = (
-        data["future_return"]
-        .values
-        .astype(np.float32)
-    )
-
-
-    usable = (
-        len(values)
-        -
-        LOOKAHEAD
-    )
-
-
-    mean = (
-        values[:usable]
-        .mean(axis=0)
-    )
-
-
-    std = (
-        values[:usable]
-        .std(axis=0)
-        +
-        1e-6
-    )
-
-
-    normalized = (
-        values - mean
-    ) / std
-
-
-    sample_count = min(
-        2500,
-        usable - SEQ_LEN
-    )
-
-
-    indexes = np.linspace(
-
-        SEQ_LEN,
-
-        usable - 1,
-
-        sample_count,
-
-        dtype=int
-
-    )
-
-
-    X = np.stack([
-
-        normalized[
-            i-SEQ_LEN:i
-        ]
-
-        for i in indexes
-
-    ])
-
-
-    returns = future[
-        indexes
-    ]
-
-
-    labels = (
-        returns > 0
-    ).astype(
-        np.int64
-    )
-
-
-    if len(
-        np.unique(labels)
-    ) < 2:
-
-        return None
-
-
-    device = (
-        "cuda"
-        if torch.cuda.is_available()
-        else
-        "cpu"
-    )
-
-
-    model = TransformerModel(
-        len(FEATURES)
-    ).to(device)
-
-
-    optimizer = (
-        torch.optim.AdamW(
-            model.parameters(),
-            lr=0.0002,
-            weight_decay=0.0001
-        )
-    )
-
-
-    loss_class = (
-        nn.CrossEntropyLoss()
-    )
-
-
-    loss_reg = (
-        nn.SmoothL1Loss()
-    )
-
-
-    X_tensor = torch.tensor(
-        X,
-        dtype=torch.float32,
-        device=device
-    )
-
-
-    y_tensor = torch.tensor(
-        labels,
-        dtype=torch.long,
-        device=device
-    )
-
-
-    return_tensor = torch.tensor(
-        returns,
-        dtype=torch.float32,
-        device=device
-    )
-
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = TransformerAI(len(FEATURES)).to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=2e-4)
+    ce = nn.CrossEntropyLoss()
+    mse = nn.MSELoss()
 
     model.train()
+    batch_size = 64
+    Xt = torch.tensor(X, dtype=torch.float32, device=device)
+    yt = torch.tensor(y, dtype=torch.long, device=device)
+    yrt = torch.tensor(yr, dtype=torch.float32, device=device).unsqueeze(1)
 
-
-    for epoch in range(3):
-
-        permutation = (
-            torch.randperm(
-                len(X_tensor),
-                device=device
-            )
-        )
-
-
-        for start in range(
-            0,
-            len(X_tensor),
-            64
-        ):
-
-            batch = permutation[
-                start:start + 64
-            ]
-
-
-            logits, regression = (
-                model(
-                    X_tensor[batch]
-                )
-            )
-
-
-            loss = (
-
-                loss_class(
-                    logits,
-                    y_tensor[batch]
-                )
-
-                +
-
-                0.35
-                *
-                loss_reg(
-                    regression.squeeze(),
-                    return_tensor[batch]
-                )
-
-            )
-
-
-            optimizer.zero_grad()
-
+    for _ in range(3):
+        idx = torch.randperm(len(Xt), device=device)
+        for start in range(0, len(Xt), batch_size):
+            ii = idx[start:start+batch_size]
+            logits, pred_r = model(Xt[ii])
+            loss = ce(logits, yt[ii]) + 0.5 * mse(pred_r, yrt[ii])
+            opt.zero_grad()
             loss.backward()
-
-            optimizer.step()
-
-
-    # Güncel tahmin
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
 
     model.eval()
-
-
-    current = torch.tensor(
-
-        normalized[
-            -SEQ_LEN:
-        ][None],
-
-        dtype=torch.float32,
-
-        device=device
-
-    )
-
+    latest = torch.tensor(
+        vals[-SEQ_LEN:], dtype=torch.float32, device=device
+    ).unsqueeze(0)
 
     with torch.no_grad():
+        logits, pred_r = model(latest)
+        prob = torch.softmax(logits, dim=1)[0]
+        buy_prob = float(prob[1].item())
+        sell_prob = float(prob[0].item())
+        expected = float(pred_r.item())
 
-        logits, regression = (
-            model(current)
-        )
+    if buy_prob >= sell_prob:
+        return "BUY", buy_prob * 100, expected * 100
+    return "SELL", sell_prob * 100, expected * 100
 
+def calculate_score(df, signal, confidence, expected):
+    f = make_features(df)
+    last = f.iloc[-1]
 
-        probabilities = (
-            torch.softmax(
-                logits,
-                dim=1
-            )[0]
-            .cpu()
-            .numpy()
-        )
+    momentum = float(np.nan_to_num(last.get("momentum48", 0.0)))
+    trend = float(np.nan_to_num(last.get("ema200", 0.0) - last.get("ema800", 0.0)))
+    volatility = float(np.nan_to_num(last.get("vol50", 0.0)))
+    quote_volume = float(np.nan_to_num(df["quote_volume"].tail(96).mean()))
 
+    liquidity = min(np.log10(max(quote_volume, 1.0)) / 10.0, 1.0)
+    risk_penalty = min(volatility * 10.0, 1.0)
 
-        predicted_return = (
-            float(
-                regression
-                .squeeze()
-                .cpu()
-            )
-            * 100
-        )
-
-
-    confidence = (
-        max(probabilities)
-        * 100
-    )
-
-
-    signal = (
-
-        "BUY"
-        if probabilities[1] >= 0.5
-        else
-        "SELL"
-
-    )
-
-
-    return (
-        signal,
-        confidence,
-        predicted_return
-    )
-
-
-# ============================================================
-# SKOR
-# ============================================================
-
-def calculate_scores(
-    data,
-    prediction
-):
-
-    signal, confidence, expected = (
-        prediction
-    )
-
-
-    volatility = (
-        float(
-            data[
-                "vol50"
-            ].iloc[-1]
-        )
-        * 100
-    )
-
-
-    momentum = float(
-
-        np.clip(
-
-            (
-                data[
-                    "momentum48"
-                ].iloc[-1]
-                + 0.10
-            )
-            * 500,
-
-            0,
-            100
-
-        )
-
-    )
-
-
-    trend = float(
-
-        np.clip(
-
-            50
-            +
-            (
-                data[
-                    "ema200"
-                ].iloc[-1]
-                -
-                data[
-                    "ema800"
-                ].iloc[-1]
-            )
-            * 500,
-
-            0,
-            100
-
-        )
-
-    )
-
-
-    risk = float(
-
-        np.clip(
-
-            35
-            +
-            volatility * 250,
-
-            0,
-            100
-
-        )
-
-    )
-
-
-    quote_volume = float(
-
-        data[
-            "quote_volume"
-        ]
-        .tail(96)
-        .mean()
-
-    )
-
-
-    liquidity = float(
-
-        np.clip(
-
-            np.log10(
-                quote_volume + 1
-            ) * 10,
-
-            0,
-            100
-
-        )
-
-    )
-
-
+    direction = 1 if signal == "BUY" else -1
     score = (
-
         expected * 0.45
-
-        +
-
-        confidence * 0.25
-
-        +
-
-        momentum * 0.12
-
-        +
-
-        trend * 0.10
-
-        +
-
-        liquidity * 0.08
-
-        -
-
-        risk * 0.20
-
+        + (confidence / 100) * 0.25
+        + direction * momentum * 0.12
+        + direction * trend * 0.10
+        + liquidity * 0.08
+        - risk_penalty * 0.20
     )
+    return float(score)
 
+def scan_pair(symbol, candle_count):
+    df = update_symbol_cache(symbol, candle_count)
+    if df.empty or len(df) < SEQ_LEN + LOOKAHEAD + 100:
+        return None
 
+    avg_quote = float(df["quote_volume"].tail(96).mean())
+    if avg_quote < 1_000_000:
+        return None
+
+    signal, confidence, expected = predict_ai(df)
+    if signal not in ("BUY", "SELL"):
+        return None
+
+    score = calculate_score(df, signal, confidence, expected)
     return {
-
-        "signal": signal,
-
-        "expected": expected,
-
-        "confidence": confidence,
-
-        "risk": risk,
-
-        "momentum": momentum,
-
-        "trend": trend,
-
-        "liquidity": liquidity,
-
-        "score": score
-
-    }
-
-
-# ============================================================
-# TEK PARİTE
-# ============================================================
-
-def scan_pair(
-    symbol,
-    candle_count
-):
-
-    df, updated = (
-        update_symbol_cache(
-            symbol,
-            candle_count
-        )
-    )
-
-
-    if len(df) < 5000:
-
-        return None
-
-
-    quote_volume = float(
-
-        df[
-            "quote_volume"
-        ]
-        .tail(96)
-        .mean()
-
-    )
-
-
-    if quote_volume < 1_000_000:
-
-        return None
-
-
-    features = create_features(
-        df
-    )
-
-
-    prediction = predict_ai(
-        features
-    )
-
-
-    if prediction is None:
-
-        return None
-
-
-    scores = calculate_scores(
-        features,
-        prediction
-    )
-
-
-    return {
-
         "symbol": symbol,
-
-        **scores,
-
-        "price": float(
-            df[
-                "close"
-            ].iloc[-1]
-        ),
-
+        "signal": signal,
+        "confidence": round(confidence, 2),
+        "expected_return_%": round(expected, 4),
+        "score": round(score, 4),
         "candles": len(df),
-
-        "new_candles": updated
-
+        "updated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
     }
 
-
-# ============================================================
-# SIDEBAR
-# ============================================================
-
-with st.sidebar:
-
-    st.header(
-        "⚙️ Ayarlar"
-    )
-
-
-    candle_count = st.number_input(
-
-        "Geçmiş mum",
-
-        min_value=5_000,
-
-        max_value=500_000,
-
-        value=500_000,
-
-        step=5_000
-
-    )
-
-
-    pair_count = st.number_input(
-
-        "Taranacak coin",
-
-        min_value=10,
-
-        max_value=100,
-
-        value=10,
-
-        step=5
-
-    )
-
-
-    auto_refresh = st.checkbox(
-
-        "15 dakikada otomatik tara",
-
-        value=True
-
-    )
-
-
-    force_scan = st.button(
-
-        "🚀 Şimdi Tara",
-
-        use_container_width=True
-
-    )
-
-
-    st.divider()
-
-    st.write(
-        "Timeframe: **15 dakika**"
-    )
-
-    st.write(
-        "Model: **Transformer**"
-    )
-
-    st.write(
-        "Horizon: **12 mum / 3 saat**"
-    )
-
-
-# ============================================================
-# SESSION STATE
-# ============================================================
-
-if "results" not in st.session_state:
-
-    st.session_state.results = []
-
-
-if "last_scan" not in st.session_state:
-
-    st.session_state.last_scan = None
-
-
-if "scan_number" not in st.session_state:
-
-    st.session_state.scan_number = 0
-
-
-# ============================================================
-# TARAMA FONKSİYONU
-# ============================================================
-
-def run_scan():
-
-    symbols = (
-        get_spot_symbols()
-    )
-
-
-    priority = [
-
-        "BTCUSDT",
-        "ETHUSDT",
-        "BNBUSDT",
-        "SOLUSDT",
-        "XRPUSDT",
-        "DOGEUSDT",
-        "ADAUSDT",
-        "AVAXUSDT",
-        "LINKUSDT",
-        "DOTUSDT",
-        "TRXUSDT",
-        "LTCUSDT",
-        "BCHUSDT",
-        "ATOMUSDT",
-        "UNIUSDT"
-
-    ]
-
-
-    ordered = (
-
-        [
-            x
-            for x in priority
-            if x in symbols
-        ]
-
-        +
-
-        [
-            x
-            for x in symbols
-            if x not in priority
-        ]
-
-    )
-
-
-    selected = ordered[
-        :int(pair_count)
-    ]
-
-
+def run_scan(symbols, candle_count):
     results = []
-
-
-    progress = st.progress(
-        0
-    )
-
-
-    status = st.empty()
-
-
-    for i, symbol in enumerate(
-        selected,
-        1
-    ):
-
-        status.write(
-
-            f"🔎 {symbol} "
-            f"taranıyor "
-            f"({i}/{len(selected)})"
-
-        )
-
-
+    for symbol in symbols:
         try:
-
-            result = scan_pair(
-
-                symbol,
-
-                int(candle_count)
-
-            )
-
-
+            result = scan_pair(symbol, candle_count)
             if result:
-
-                results.append(
-                    result
-                )
-
-
-        except Exception as error:
-
-            st.warning(
-                f"{symbol}: "
-                f"{str(error)[:100]}"
-            )
-
-
-        progress.progress(
-            i / len(selected)
-        )
-
-
-    results.sort(
-
-        key=lambda x:
-        x["score"],
-
-        reverse=True
-
-    )
-
-
-    st.session_state.results = (
-        results[:10]
-    )
-
-
-    st.session_state.last_scan = (
-        datetime.now(
-            timezone.utc
-        )
-    )
-
-
-    st.session_state.scan_number += 1
-
-
-    progress.empty()
-
-    status.empty()
-
-
-# ============================================================
-# 15 DAKİKALIK STREAMLIT FRAGMENT
-# ============================================================
-
-run_every = (
-    "15m"
-    if auto_refresh
-    else None
-)
-
-
-@st.fragment(
-    run_every=run_every,
-    key="ai_scanner"
-)
-def scanner_fragment():
-
-    # İlk açılış veya manuel tarama
-    if (
-        not st.session_state.results
-        or
-        force_scan
-    ):
-
-        run_scan()
-
-
-    # --------------------------------------------------------
-    # BAŞLIK
-    # --------------------------------------------------------
-
-    st.title(
-        "📈 Binance Spot AI Scanner"
-    )
-
-
-    st.caption(
-
-        "500.000 mum · 15 dakika · "
-        "Deep Learning · BUY / SELL"
-
-    )
-
-
-    # --------------------------------------------------------
-    # ÜST BİLGİ
-    # --------------------------------------------------------
-
-    col1, col2, col3, col4 = (
-        st.columns(4)
-    )
-
-
-    with col1:
-
-        st.metric(
-            "Piyasa",
-            "BINANCE SPOT"
-        )
-
-
-    with col2:
-
-        st.metric(
-            "Öneri",
-            len(
-                st.session_state.results
-            )
-        )
-
-
-    with col3:
-
-        st.metric(
-            "Tarama",
-            st.session_state.scan_number
-        )
-
-
-    with col4:
-
-        st.metric(
-            "Aralık",
-            "15 dk"
-        )
-
-
-    if st.session_state.last_scan:
-
-        local_time = (
-            st.session_state
-            .last_scan
-            .astimezone()
-        )
-
-
-        st.caption(
-
-            "Son tarama: "
-            +
-            local_time.strftime(
-                "%d.%m.%Y %H:%M:%S"
-            )
-
-        )
-
-
-    # --------------------------------------------------------
-    # TABLO
-    # --------------------------------------------------------
-
-    results = (
-        st.session_state.results
-    )
-
+                results.append(result)
+        except Exception as e:
+            st.session_state.setdefault("scan_errors", {})[symbol] = str(e)
 
     if not results:
+        return pd.DataFrame()
 
-        st.warning(
-            "Henüz sinyal oluşmadı."
+    out = pd.DataFrame(results)
+    out = out.sort_values("score", ascending=False).reset_index(drop=True)
+    return out
+
+# Sidebar
+with st.sidebar:
+    st.header("⚙️ Ayarlar")
+    candle_count = st.number_input(
+        "Mum sayısı",
+        min_value=10_000,
+        max_value=500_000,
+        value=500_000,
+        step=10_000,
+    )
+    pair_limit = st.number_input(
+        "Taranacak maksimum parite",
+        min_value=1,
+        max_value=100,
+        value=15,
+        step=1,
+    )
+    auto_refresh = st.checkbox("15 dakikada otomatik yenile", value=True)
+    st.caption("İlk taramada her parite için geçmiş veri indirilir.")
+
+priority = [
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+    "DOGEUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT",
+    "TRXUSDT", "LTCUSDT", "BCHUSDT", "ATOMUSDT", "UNIUSDT"
+]
+
+@st.fragment(run_every="15m" if auto_refresh else None)
+def scanner_fragment():
+    c1, c2 = st.columns([1, 5])
+    with c1:
+        manual = st.button("🔄 Şimdi Tara", use_container_width=True)
+    with c2:
+        st.caption(
+            "Tarama 15 dakikada bir yenilenir. "
+            "Uygulama açık bir Streamlit oturumu sırasında çalışır."
         )
 
+    if manual or "results" not in st.session_state:
+        try:
+            all_symbols = get_spot_symbols()
+            ordered = [s for s in priority if s in all_symbols]
+            ordered += [s for s in all_symbols if s not in ordered]
+            symbols = ordered[:int(pair_limit)]
+
+            with st.spinner(f"{len(symbols)} parite taranıyor..."):
+                results = run_scan(symbols, int(candle_count))
+
+            st.session_state["results"] = results
+            st.session_state["last_scan"] = datetime.now(timezone.utc)
+        except Exception as e:
+            st.error(f"Tarama hatası: {e}")
+            return
+
+    results = st.session_state.get("results", pd.DataFrame())
+    if results.empty:
+        st.warning("Henüz uygun BUY/SELL sonucu oluşmadı.")
         return
 
+    buys = results[results["signal"] == "BUY"].sort_values(
+        ["score", "confidence"], ascending=False
+    ).head(10)
+    sells = results[results["signal"] == "SELL"].sort_values(
+        ["score", "confidence"], ascending=False
+    ).head(10)
 
-    table = []
+    a, b = st.columns(2)
+    with a:
+        st.subheader("🟢 TOP 10 BUY")
+        st.dataframe(buys, use_container_width=True, hide_index=True)
+    with b:
+        st.subheader("🔴 TOP 10 SELL")
+        st.dataframe(sells, use_container_width=True, hide_index=True)
 
+    st.subheader("Tüm sonuçlar")
+    st.dataframe(results, use_container_width=True, hide_index=True)
 
-    for rank, item in enumerate(
-        results,
-        1
-    ):
+    last_scan = st.session_state.get("last_scan")
+    if last_scan:
+        st.caption(f"Son tarama: {last_scan.strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
-        table.append({
-
-            "#": rank,
-
-            "PARİTE":
-            item["symbol"],
-
-            "SİNYAL":
-            item["signal"],
-
-            "BEKLENEN %":
-            round(
-                item["expected"],
-                3
-            ),
-
-            "CONFIDENCE %":
-            round(
-                item["confidence"],
-                1
-            ),
-
-            "RİSK":
-            round(
-                item["risk"],
-                1
-            ),
-
-            "MOMENTUM":
-            round(
-                item["momentum"],
-                1
-            ),
-
-            "TREND":
-            round(
-                item["trend"],
-                1
-            ),
-
-            "SKOR":
-            round(
-                item["score"],
-                2
-            ),
-
-            "FİYAT":
-            item["price"]
-
-        })
-
-
-    result_df = pd.DataFrame(
-        table
-    )
-
-
-    st.dataframe(
-
-        result_df,
-
-        use_container_width=True,
-
-        hide_index=True
-
-    )
-
-
-    st.info(
-
-        "Her 15 dakikada yeni mumlar alınır, "
-        "500K'lık geçmiş pencere güncellenir ve "
-        "Top 10 yeniden hesaplanır."
-
-    )
-
-
-# ============================================================
-# ÇALIŞTIR
-# ============================================================
+    errors = st.session_state.get("scan_errors", {})
+    if errors:
+        with st.expander("Parite hataları"):
+            st.json(errors)
 
 scanner_fragment()
