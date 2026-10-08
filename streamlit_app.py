@@ -1,8 +1,6 @@
-import os
 import io
 import time
 import math
-import traceback
 from datetime import datetime, timezone
 
 import numpy as np
@@ -18,14 +16,14 @@ from sklearn.metrics import accuracy_score
 
 
 # ============================================================
-# APPLICATION CONFIG
+# CONFIG
 # ============================================================
 
 APP_NAME = "Spot AI Scanner"
 
 TIMEFRAME = "15m"
 
-DEFAULT_CANDLE_TARGET = 500_000
+DEFAULT_TARGET = 500_000
 
 DEFAULT_SYMBOL_LIMIT = 10
 
@@ -35,10 +33,13 @@ DEFAULT_TRAIN_LIMIT = 10_000
 
 REQUEST_TIMEOUT = 30
 
-BINANCE_BASE_URL = os.getenv(
-    "BINANCE_BASE_URL",
-    "https://api.binance.com"
-)
+KRAKEN_BASE_URL = "https://api.kraken.com"
+
+KRAKEN_ASSET_PAIRS = "/0/public/AssetPairs"
+
+KRAKEN_OHLC = "/0/public/OHLC"
+
+BINANCE_BASE_URL = "https://api.binance.com"
 
 BINANCE_EXCHANGE_INFO = "/api/v3/exchangeInfo"
 
@@ -47,68 +48,39 @@ BINANCE_KLINES = "/api/v3/klines"
 SUPPORTED_QUOTES = [
     "USDT",
     "USDC",
-    "FDUSD",
-    "BTC",
-    "ETH",
-    "BNB"
+    "USD",
+    "EUR"
 ]
 
 
 # ============================================================
-# PAGE CONFIG
+# PAGE
 # ============================================================
 
 st.set_page_config(
     page_title="Spot AI Scanner",
     page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-
-# ============================================================
-# CSS
-# ============================================================
 
 st.markdown(
     """
     <style>
-
     .scanner-title {
         font-size: 32px;
         font-weight: 800;
-        margin-bottom: 2px;
     }
 
     .scanner-subtitle {
-        color: #888888;
-        font-size: 15px;
+        color: #888;
         margin-bottom: 20px;
     }
-
-    .buy-card {
-        padding: 15px;
-        border-radius: 12px;
-        border: 1px solid rgba(0, 180, 100, 0.35);
-        background: rgba(0, 180, 100, 0.08);
-    }
-
-    .sell-card {
-        padding: 15px;
-        border-radius: 12px;
-        border: 1px solid rgba(220, 60, 60, 0.35);
-        background: rgba(220, 60, 60, 0.08);
-    }
-
     </style>
     """,
     unsafe_allow_html=True
 )
 
-
-# ============================================================
-# HEADER
-# ============================================================
 
 st.markdown(
     '<div class="scanner-title">📊 Spot AI Scanner</div>',
@@ -127,56 +99,83 @@ st.markdown(
 # SESSION STATE
 # ============================================================
 
-if "candle_cache" not in st.session_state:
-    st.session_state.candle_cache = {}
+defaults = {
 
-if "scan_results" not in st.session_state:
-    st.session_state.scan_results = pd.DataFrame()
+    "scan_results":
+        pd.DataFrame(),
 
-if "scan_errors" not in st.session_state:
-    st.session_state.scan_errors = []
+    "scan_errors":
+        [],
 
-if "last_scan" not in st.session_state:
-    st.session_state.last_scan = None
+    "candle_cache":
+        {},
 
-if "last_source" not in st.session_state:
-    st.session_state.last_source = None
+    "last_scan":
+        None,
 
-if "last_status" not in st.session_state:
-    st.session_state.last_status = "READY"
+    "last_source":
+        None,
 
-if "force_scan" not in st.session_state:
-    st.session_state.force_scan = False
+    "last_status":
+        "READY",
+
+    "force_scan":
+        False
+}
+
+
+for key, value in defaults.items():
+
+    if key not in st.session_state:
+
+        st.session_state[key] = value
 
 
 # ============================================================
-# HTTP SESSION
+# HTTP
 # ============================================================
 
 @st.cache_resource
-def get_http_session():
+def get_http():
 
     session = requests.Session()
 
     session.headers.update(
         {
-            "User-Agent": "Spot-AI-Scanner/2.0",
-            "Accept": "application/json"
+            "User-Agent":
+                "Spot-AI-Scanner/3.0",
+            "Accept":
+                "application/json"
         }
     )
 
     return session
 
 
-HTTP = get_http_session()
+HTTP = get_http()
 
 
 # ============================================================
-# GENERAL HELPERS
+# EXCEPTIONS
+# ============================================================
+
+class DataProviderError(Exception):
+    pass
+
+
+class BinanceRestrictedError(Exception):
+    pass
+
+
+# ============================================================
+# HELPERS
 # ============================================================
 
 def utc_now():
-    return datetime.now(timezone.utc)
+
+    return datetime.now(
+        timezone.utc
+    )
 
 
 def safe_float(
@@ -185,59 +184,98 @@ def safe_float(
 ):
 
     try:
+
         return float(value)
+
     except Exception:
+
         return default
 
 
-def timeframe_minutes(
-    timeframe
-):
+def clean_ohlcv(df):
 
-    values = {
-        "1m": 1,
-        "3m": 3,
-        "5m": 5,
-        "15m": 15,
-        "30m": 30,
-        "1h": 60,
-        "4h": 240,
-        "1d": 1440
-    }
+    if df is None:
 
-    return values.get(
-        timeframe,
-        15
+        return pd.DataFrame()
+
+    if df.empty:
+
+        return df
+
+    required = [
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume"
+    ]
+
+    missing = [
+        x for x in required
+        if x not in df.columns
+    ]
+
+    if missing:
+
+        raise DataProviderError(
+            "Eksik OHLCV kolonları: "
+            + ", ".join(missing)
+        )
+
+    result = df.copy()
+
+    result["timestamp"] = pd.to_datetime(
+        result["timestamp"],
+        utc=True,
+        errors="coerce"
     )
 
+    for column in [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume"
+    ]:
+
+        result[column] = pd.to_numeric(
+            result[column],
+            errors="coerce"
+        )
+
+    result = result.dropna(
+        subset=[
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume"
+        ]
+    )
+
+    result = (
+        result
+        .sort_values("timestamp")
+        .drop_duplicates("timestamp")
+        .reset_index(drop=True)
+    )
+
+    return result
+
 
 # ============================================================
-# EXCEPTIONS
+# KRAKEN REQUEST
 # ============================================================
 
-class BinanceRestrictedError(
-    Exception
-):
-    pass
-
-
-class DataProviderError(
-    Exception
-):
-    pass
-
-
-# ============================================================
-# BINANCE HTTP
-# ============================================================
-
-def binance_get(
+def kraken_get(
     endpoint,
     params=None
 ):
 
     url = (
-        BINANCE_BASE_URL.rstrip("/")
+        KRAKEN_BASE_URL
         + endpoint
     )
 
@@ -252,31 +290,399 @@ def binance_get(
     except requests.RequestException as exc:
 
         raise DataProviderError(
-            f"Network error: {exc}"
+            f"Kraken network error: {exc}"
+        )
+
+    if response.status_code >= 400:
+
+        raise DataProviderError(
+            f"Kraken HTTP "
+            f"{response.status_code}: "
+            f"{response.text[:500]}"
+        )
+
+    try:
+
+        data = response.json()
+
+    except Exception as exc:
+
+        raise DataProviderError(
+            f"Kraken JSON hatası: {exc}"
+        )
+
+    errors = data.get(
+        "error",
+        []
+    )
+
+    if errors:
+
+        raise DataProviderError(
+            "Kraken API: "
+            + str(errors)
+        )
+
+    return data.get(
+        "result",
+        {}
+    )
+
+
+# ============================================================
+# KRAKEN SYMBOLS
+# ============================================================
+
+@st.cache_data(
+    ttl=900,
+    show_spinner=False
+)
+def get_kraken_symbols():
+
+    result = kraken_get(
+        KRAKEN_ASSET_PAIRS
+    )
+
+    symbols = []
+
+    for key, item in result.items():
+
+        if not isinstance(
+            item,
+            dict
+        ):
+
+            continue
+
+        status = item.get(
+            "status",
+            "online"
+        )
+
+        if status != "online":
+
+            continue
+
+        quote = item.get(
+            "quote",
+            ""
+        )
+
+        wsname = item.get(
+            "wsname",
+            ""
+        )
+
+        altname = item.get(
+            "altname",
+            key
+        )
+
+        # Kraken quote formats:
+        # ZUSD / USD
+        # USDT
+        quote_clean = str(
+            quote
+        ).replace(
+            "Z",
+            ""
+        ).replace(
+            "X",
+            ""
+        )
+
+        if (
+            quote_clean not in
+            SUPPORTED_QUOTES
+            and not str(
+                wsname
+            ).endswith(
+                "/USD"
+            )
+            and not str(
+                wsname
+            ).endswith(
+                "/USDT"
+            )
+        ):
+
+            continue
+
+        # Do not include obvious
+        # derivatives/futures.
+
+        if ".d" in str(
+            altname
+        ).lower():
+
+            continue
+
+        symbols.append(
+            {
+                "api_symbol":
+                    altname,
+
+                "display_symbol":
+                    wsname
+                    or altname
+            }
+        )
+
+    symbols = sorted(
+        symbols,
+        key=lambda x:
+            x["display_symbol"]
+    )
+
+    return symbols
+
+
+# ============================================================
+# KRAKEN OHLC
+# ============================================================
+
+def get_kraken_ohlc(
+    symbol,
+    since=None
+):
+
+    params = {
+        "pair": symbol,
+
+        # Kraken OHLC uses interval
+        # in minutes.
+        "interval": 15
+    }
+
+    if since is not None:
+
+        params["since"] = int(
+            since
+        )
+
+    result = kraken_get(
+        KRAKEN_OHLC,
+        params
+    )
+
+    pair_key = None
+
+    for key in result.keys():
+
+        if key != "last":
+
+            pair_key = key
+
+            break
+
+    if pair_key is None:
+
+        return pd.DataFrame()
+
+    rows = result[
+        pair_key
+    ]
+
+    if not rows:
+
+        return pd.DataFrame()
+
+    output = []
+
+    for row in rows:
+
+        # Kraken:
+        # time, open, high, low, close,
+        # vwap, volume, count
+
+        output.append(
+            {
+                "timestamp":
+                    pd.to_datetime(
+                        int(
+                            row[0]
+                        ),
+                        unit="s",
+                        utc=True
+                    ),
+
+                "open":
+                    safe_float(
+                        row[1]
+                    ),
+
+                "high":
+                    safe_float(
+                        row[2]
+                    ),
+
+                "low":
+                    safe_float(
+                        row[3]
+                    ),
+
+                "close":
+                    safe_float(
+                        row[4]
+                    ),
+
+                "volume":
+                    safe_float(
+                        row[6]
+                    )
+            }
+        )
+
+    return clean_ohlcv(
+        pd.DataFrame(
+            output
+        )
+    )
+
+
+# ============================================================
+# KRAKEN HISTORY
+# ============================================================
+
+def download_kraken_history(
+    symbol,
+    target
+):
+
+    # Kraken's public OHLC endpoint has
+    # a limited amount of historical data.
+    #
+    # Therefore we request what is
+    # actually available and use the
+    # maximum available history.
+
+    frames = []
+
+    since = None
+
+    previous_oldest = None
+
+    max_iterations = min(
+        math.ceil(
+            target / 720
+        ),
+        100
+    )
+
+    for _ in range(
+        max_iterations
+    ):
+
+        df = get_kraken_ohlc(
+            symbol,
+            since
+        )
+
+        if df.empty:
+
+            break
+
+        frames.append(
+            df
+        )
+
+        oldest = int(
+            df[
+                "timestamp"
+            ].min().timestamp()
+        )
+
+        if (
+            previous_oldest
+            is not None
+            and oldest >= previous_oldest
+        ):
+
+            break
+
+        previous_oldest = oldest
+
+        # Kraken OHLC endpoint normally
+        # returns recent candles. We stop
+        # if target has already been met.
+
+        combined = clean_ohlcv(
+            pd.concat(
+                frames,
+                ignore_index=True
+            )
+        )
+
+        if len(combined) >= target:
+
+            break
+
+        # Kraken public OHLC does not
+        # provide unlimited pagination in
+        # the same way as Binance.
+
+        break
+
+    if not frames:
+
+        return pd.DataFrame()
+
+    result = clean_ohlcv(
+        pd.concat(
+            frames,
+            ignore_index=True
+        )
+    )
+
+    return (
+        result
+        .tail(target)
+        .reset_index(drop=True)
+    )
+
+
+# ============================================================
+# BINANCE
+# ============================================================
+
+def binance_get(
+    endpoint,
+    params=None
+):
+
+    url = (
+        BINANCE_BASE_URL
+        + endpoint
+    )
+
+    try:
+
+        response = HTTP.get(
+            url,
+            params=params,
+            timeout=REQUEST_TIMEOUT
+        )
+
+    except requests.RequestException as exc:
+
+        raise DataProviderError(
+            f"Binance network error: {exc}"
         )
 
     if response.status_code == 451:
 
         raise BinanceRestrictedError(
-            "HTTP 451: Binance API bu çalışma "
-            "ortamından erişime izin vermiyor."
-        )
-
-    if response.status_code == 429:
-
-        raise DataProviderError(
-            "HTTP 429: Binance rate limit."
+            "HTTP 451: Binance API bu "
+            "çalışma ortamından erişime "
+            "izin vermiyor."
         )
 
     if response.status_code >= 400:
 
-        try:
-            body = response.json()
-        except Exception:
-            body = response.text[:500]
-
         raise DataProviderError(
-            f"HTTP {response.status_code}: {body}"
+            f"Binance HTTP "
+            f"{response.status_code}: "
+            f"{response.text[:500]}"
         )
 
     try:
@@ -286,13 +692,9 @@ def binance_get(
     except Exception as exc:
 
         raise DataProviderError(
-            f"JSON parse error: {exc}"
+            f"Binance JSON hatası: {exc}"
         )
 
-
-# ============================================================
-# BINANCE SYMBOLS
-# ============================================================
 
 @st.cache_data(
     ttl=900,
@@ -300,13 +702,13 @@ def binance_get(
 )
 def get_binance_symbols():
 
-    data = binance_get(
+    result = binance_get(
         BINANCE_EXCHANGE_INFO
     )
 
     symbols = []
 
-    for item in data.get(
+    for item in result.get(
         "symbols",
         []
     ):
@@ -314,41 +716,32 @@ def get_binance_symbols():
         if item.get(
             "status"
         ) != "TRADING":
+
             continue
 
-        if (
-            item.get(
-                "isSpotTradingAllowed"
-            )
-            is False
-        ):
+        if item.get(
+            "isSpotTradingAllowed"
+        ) is False:
+
             continue
 
-        quote = item.get(
-            "quoteAsset",
-            ""
+        if item.get(
+            "quoteAsset"
+        ) not in [
+            "USDT",
+            "USDC"
+        ]:
+
+            continue
+
+        symbols.append(
+            item["symbol"]
         )
-
-        if quote not in SUPPORTED_QUOTES:
-            continue
-
-        symbol = item.get(
-            "symbol"
-        )
-
-        if symbol:
-            symbols.append(
-                symbol
-            )
 
     return sorted(
         symbols
     )
 
-
-# ============================================================
-# BINANCE KLINES
-# ============================================================
 
 def get_binance_klines(
     symbol,
@@ -357,17 +750,24 @@ def get_binance_klines(
 ):
 
     params = {
-        "symbol": symbol,
-        "interval": TIMEFRAME,
-        "limit": min(
-            int(limit),
-            1000
-        )
+        "symbol":
+            symbol,
+
+        "interval":
+            "15m",
+
+        "limit":
+            min(
+                int(limit),
+                1000
+            )
     }
 
     if end_time is not None:
 
-        params["endTime"] = int(
+        params[
+            "endTime"
+        ] = int(
             end_time
         )
 
@@ -376,36 +776,35 @@ def get_binance_klines(
         params
     )
 
-    if not data:
-
-        return pd.DataFrame()
-
     rows = []
 
-    for item in data:
+    for row in data:
 
         rows.append(
             {
-                "timestamp": pd.to_datetime(
-                    int(item[0]),
-                    unit="ms",
-                    utc=True
-                ),
-                "open": safe_float(
-                    item[1]
-                ),
-                "high": safe_float(
-                    item[2]
-                ),
-                "low": safe_float(
-                    item[3]
-                ),
-                "close": safe_float(
-                    item[4]
-                ),
-                "volume": safe_float(
-                    item[5]
-                )
+                "timestamp":
+                    pd.to_datetime(
+                        int(
+                            row[0]
+                        ),
+                        unit="ms",
+                        utc=True
+                    ),
+
+                "open":
+                    safe_float(row[1]),
+
+                "high":
+                    safe_float(row[2]),
+
+                "low":
+                    safe_float(row[3]),
+
+                "close":
+                    safe_float(row[4]),
+
+                "volume":
+                    safe_float(row[5])
             }
         )
 
@@ -414,30 +813,23 @@ def get_binance_klines(
     )
 
 
-# ============================================================
-# BINANCE LARGE HISTORY
-# ============================================================
-
 def download_binance_history(
     symbol,
-    target,
-    progress_callback=None
+    target
 ):
 
-    target = int(target)
-
-    chunks = []
+    frames = []
 
     end_time = None
 
     total = 0
 
-    max_loops = math.ceil(
+    loops = math.ceil(
         target / 1000
     )
 
-    for loop_index in range(
-        max_loops
+    for _ in range(
+        loops
     ):
 
         df = get_binance_klines(
@@ -447,9 +839,10 @@ def download_binance_history(
         )
 
         if df.empty:
+
             break
 
-        chunks.append(
+        frames.append(
             df
         )
 
@@ -467,300 +860,25 @@ def download_binance_history(
             - 1
         )
 
-        if progress_callback:
-
-            progress_callback(
-                min(
-                    total / target,
-                    1.0
-                )
-            )
-
-        if len(df) < 1000:
-            break
-
         if total >= target:
+
             break
 
-        if (
-            loop_index % 10
-            == 0
-        ):
-
-            time.sleep(
-                0.05
-            )
-
-    if not chunks:
+    if not frames:
 
         return pd.DataFrame()
-
-    result = pd.concat(
-        chunks,
-        ignore_index=True
-    )
 
     result = clean_ohlcv(
-        result
-    )
-
-    result = (
-        result
-        .sort_values(
-            "timestamp"
+        pd.concat(
+            frames,
+            ignore_index=True
         )
-        .drop_duplicates(
-            "timestamp"
-        )
-        .tail(target)
-        .reset_index(
-            drop=True
-        )
-    )
-
-    return result
-
-
-# ============================================================
-# CCXT
-# ============================================================
-
-@st.cache_resource
-def import_ccxt():
-
-    try:
-
-        import ccxt
-
-        return ccxt
-
-    except ImportError:
-
-        return None
-
-
-def create_ccxt_exchange(
-    exchange_id
-):
-
-    ccxt = import_ccxt()
-
-    if ccxt is None:
-
-        raise DataProviderError(
-            "CCXT kurulu değil. "
-            "requirements.txt kontrol edin."
-        )
-
-    if not hasattr(
-        ccxt,
-        exchange_id
-    ):
-
-        raise DataProviderError(
-            f"Exchange bulunamadı: "
-            f"{exchange_id}"
-        )
-
-    exchange_class = getattr(
-        ccxt,
-        exchange_id
-    )
-
-    exchange = exchange_class(
-        {
-            "enableRateLimit": True,
-            "timeout": 30000
-        }
-    )
-
-    return exchange
-
-
-def get_ccxt_symbols(
-    exchange_id
-):
-
-    exchange = create_ccxt_exchange(
-        exchange_id
-    )
-
-    try:
-
-        markets = (
-            exchange.load_markets()
-        )
-
-    except Exception as exc:
-
-        raise DataProviderError(
-            f"{exchange_id} market listesi "
-            f"alınamadı: {exc}"
-        )
-
-    symbols = []
-
-    for symbol, market in markets.items():
-
-        try:
-
-            if market.get(
-                "spot"
-            ) is not True:
-
-                continue
-
-            if market.get(
-                "active"
-            ) is False:
-
-                continue
-
-            quote = market.get(
-                "quote"
-            )
-
-            if quote not in SUPPORTED_QUOTES:
-
-                continue
-
-            symbols.append(
-                symbol
-            )
-
-        except Exception:
-
-            continue
-
-    return sorted(
-        symbols
-    )
-
-
-# ============================================================
-# CCXT HISTORY
-# ============================================================
-
-def get_ccxt_history(
-    exchange_id,
-    symbol,
-    target,
-    progress_callback=None
-):
-
-    exchange = create_ccxt_exchange(
-        exchange_id
-    )
-
-    limit = 1000
-
-    rows = []
-
-    timeframe_ms = (
-        timeframe_minutes(
-            TIMEFRAME
-        )
-        * 60
-        * 1000
-    )
-
-    # Most exchanges allow historical
-    # pagination with "since".
-
-    since = None
-
-    max_loops = math.ceil(
-        target / limit
-    )
-
-    for index in range(
-        max_loops
-    ):
-
-        try:
-
-            batch = (
-                exchange.fetch_ohlcv(
-                    symbol,
-                    timeframe=TIMEFRAME,
-                    since=since,
-                    limit=limit
-                )
-            )
-
-        except Exception as exc:
-
-            raise DataProviderError(
-                f"{exchange_id} {symbol} "
-                f"OHLCV hatası: {exc}"
-            )
-
-        if not batch:
-
-            break
-
-        rows.extend(
-            batch
-        )
-
-        if progress_callback:
-
-            progress_callback(
-                min(
-                    len(rows) / target,
-                    1.0
-                )
-            )
-
-        if len(batch) < limit:
-
-            break
-
-        last_timestamp = (
-            batch[-1][0]
-        )
-
-        since = (
-            last_timestamp
-            + timeframe_ms
-        )
-
-        if len(rows) >= target:
-
-            break
-
-    if not rows:
-
-        return pd.DataFrame()
-
-    df = pd.DataFrame(
-        rows,
-        columns=[
-            "timestamp",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume"
-        ]
-    )
-
-    df["timestamp"] = pd.to_datetime(
-        df["timestamp"],
-        unit="ms",
-        utc=True
-    )
-
-    df = clean_ohlcv(
-        df
     )
 
     return (
-        df
+        result
         .tail(target)
-        .reset_index(
-            drop=True
-        )
+        .reset_index(drop=True)
     )
 
 
@@ -768,7 +886,7 @@ def get_ccxt_history(
 # CSV
 # ============================================================
 
-def read_csv_ohlcv(
+def read_csv(
     uploaded_file
 ):
 
@@ -786,15 +904,11 @@ def read_csv_ohlcv(
             f"CSV okunamadı: {exc}"
         )
 
-    original_columns = list(
-        df.columns
-    )
+    mapping = {}
 
-    normalized = {}
+    for column in df.columns:
 
-    for column in original_columns:
-
-        key = (
+        normalized = (
             str(column)
             .strip()
             .lower()
@@ -804,7 +918,9 @@ def read_csv_ohlcv(
             )
         )
 
-        normalized[key] = column
+        mapping[
+            normalized
+        ] = column
 
     aliases = {
 
@@ -849,10 +965,10 @@ def read_csv_ohlcv(
 
         for name in names:
 
-            if name in normalized:
+            if name in mapping:
 
                 rename[
-                    normalized[name]
+                    mapping[name]
                 ] = target
 
                 break
@@ -867,98 +983,10 @@ def read_csv_ohlcv(
 
 
 # ============================================================
-# CLEAN OHLCV
-# ============================================================
-
-def clean_ohlcv(
-    df
-):
-
-    if df is None:
-
-        return pd.DataFrame()
-
-    if df.empty:
-
-        return df
-
-    required = [
-        "timestamp",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume"
-    ]
-
-    missing = [
-        column
-        for column in required
-        if column not in df.columns
-    ]
-
-    if missing:
-
-        raise DataProviderError(
-            "Eksik OHLCV kolonları: "
-            + ", ".join(missing)
-        )
-
-    result = df.copy()
-
-    result[
-        "timestamp"
-    ] = pd.to_datetime(
-        result["timestamp"],
-        utc=True,
-        errors="coerce"
-    )
-
-    for column in [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume"
-    ]:
-
-        result[column] = pd.to_numeric(
-            result[column],
-            errors="coerce"
-        )
-
-    result = result.dropna(
-        subset=[
-            "timestamp",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume"
-        ]
-    )
-
-    result = (
-        result
-        .sort_values(
-            "timestamp"
-        )
-        .drop_duplicates(
-            "timestamp"
-        )
-        .reset_index(
-            drop=True
-        )
-    )
-
-    return result
-
-
-# ============================================================
 # INDICATORS
 # ============================================================
 
-def calculate_ema(
+def ema(
     series,
     period
 ):
@@ -970,7 +998,7 @@ def calculate_ema(
     ).mean()
 
 
-def calculate_rsi(
+def rsi(
     series,
     period=14
 ):
@@ -997,17 +1025,23 @@ def calculate_rsi(
         min_periods=period
     ).mean()
 
-    rs = avg_gain / (
-        avg_loss + 1e-12
+    rs = (
+        avg_gain
+        / (
+            avg_loss + 1e-12
+        )
     )
 
     return (
         100
-        - 100 / (1 + rs)
+        - 100
+        / (
+            1 + rs
+        )
     )
 
 
-def calculate_atr(
+def atr(
     df,
     period=14
 ):
@@ -1018,25 +1052,19 @@ def calculate_atr(
 
     close = df["close"]
 
-    previous_close = close.shift(
-        1
-    )
-
-    tr1 = high - low
-
-    tr2 = (
-        high - previous_close
-    ).abs()
-
-    tr3 = (
-        low - previous_close
-    ).abs()
+    previous = close.shift(1)
 
     tr = pd.concat(
         [
-            tr1,
-            tr2,
-            tr3
+            high - low,
+            (
+                high
+                - previous
+            ).abs(),
+            (
+                low
+                - previous
+            ).abs()
         ],
         axis=1
     ).max(
@@ -1050,23 +1078,23 @@ def calculate_atr(
     ).mean()
 
 
-def calculate_macd(
+def macd(
     series
 ):
 
-    fast = calculate_ema(
+    fast = ema(
         series,
         12
     )
 
-    slow = calculate_ema(
+    slow = ema(
         series,
         26
     )
 
     line = fast - slow
 
-    signal = calculate_ema(
+    signal = ema(
         line,
         9
     )
@@ -1082,7 +1110,7 @@ def calculate_macd(
     )
 
 
-def calculate_bollinger(
+def bollinger(
     series,
     period=20
 ):
@@ -1112,7 +1140,7 @@ def calculate_bollinger(
     )
 
 
-def calculate_adx(
+def adx(
     df,
     period=14
 ):
@@ -1123,47 +1151,43 @@ def calculate_adx(
 
     close = df["close"]
 
-    up_move = high.diff()
+    up = high.diff()
 
-    down_move = -low.diff()
+    down = -low.diff()
 
     plus_dm = np.where(
         (
-            up_move > down_move
+            up > down
         )
         & (
-            up_move > 0
+            up > 0
         ),
-        up_move,
+        up,
         0
     )
 
     minus_dm = np.where(
         (
-            down_move > up_move
+            down > up
         )
         & (
-            down_move > 0
+            down > 0
         ),
-        down_move,
+        down,
         0
     )
 
-    tr1 = high - low
-
-    tr2 = (
-        high - close.shift(1)
-    ).abs()
-
-    tr3 = (
-        low - close.shift(1)
-    ).abs()
-
     tr = pd.concat(
         [
-            tr1,
-            tr2,
-            tr3
+            high - low,
+            (
+                high
+                - close.shift(1)
+            ).abs(),
+            (
+                low
+                - close.shift(1)
+            ).abs()
         ],
         axis=1
     ).max(
@@ -1174,40 +1198,39 @@ def calculate_adx(
         period
     ).mean()
 
-    plus_dm_series = pd.Series(
-        plus_dm,
-        index=df.index
-    )
-
-    minus_dm_series = pd.Series(
-        minus_dm,
-        index=df.index
-    )
-
     plus_di = (
         100
-        * plus_dm_series.rolling(
+        * pd.Series(
+            plus_dm,
+            index=df.index
+        ).rolling(
             period
         ).mean()
         / (
-            atr_value + 1e-12
+            atr_value
+            + 1e-12
         )
     )
 
     minus_di = (
         100
-        * minus_dm_series.rolling(
+        * pd.Series(
+            minus_dm,
+            index=df.index
+        ).rolling(
             period
         ).mean()
         / (
-            atr_value + 1e-12
+            atr_value
+            + 1e-12
         )
     )
 
     dx = (
         100
         * (
-            plus_di - minus_di
+            plus_di
+            - minus_di
         ).abs()
         / (
             plus_di
@@ -1222,7 +1245,7 @@ def calculate_adx(
 
 
 # ============================================================
-# FEATURE ENGINEERING
+# FEATURES
 # ============================================================
 
 def build_features(
@@ -1239,9 +1262,7 @@ def build_features(
 
     volume = data["volume"]
 
-    # --------------------------------------------------------
     # RETURNS
-    # --------------------------------------------------------
 
     for period in [
         1,
@@ -1259,9 +1280,7 @@ def build_features(
             period
         )
 
-    # --------------------------------------------------------
     # EMA
-    # --------------------------------------------------------
 
     for period in [
         5,
@@ -1273,64 +1292,67 @@ def build_features(
         800
     ]:
 
-        value = calculate_ema(
+        value = ema(
             close,
             period
         )
-
-        data[
-            f"ema_{period}"
-        ] = value
 
         data[
             f"ema_dist_{period}"
         ] = (
             close
             / (
-                value + 1e-12
+                value
+                + 1e-12
             )
             - 1
         )
 
-    data["ema_5_20"] = (
-        data["ema_5"]
+    data[
+        "ema_5_20"
+    ] = (
+        ema(close, 5)
         / (
-            data["ema_20"]
+            ema(close, 20)
             + 1e-12
         )
         - 1
     )
 
-    data["ema_20_50"] = (
-        data["ema_20"]
+    data[
+        "ema_20_50"
+    ] = (
+        ema(close, 20)
         / (
-            data["ema_50"]
+            ema(close, 50)
             + 1e-12
         )
         - 1
     )
 
-    data["ema_50_200"] = (
-        data["ema_50"]
+    data[
+        "ema_50_200"
+    ] = (
+        ema(close, 50)
         / (
-            data["ema_200"]
+            ema(close, 200)
             + 1e-12
         )
         - 1
     )
 
-    data["ema_200_800"] = (
-        data["ema_200"]
+    data[
+        "ema_200_800"
+    ] = (
+        ema(close, 200)
         / (
-            data["ema_800"]
+            ema(close, 800)
             + 1e-12
         )
         - 1
     )
 
-    # --------------------------------------------------------
     # RSI
-    # --------------------------------------------------------
 
     for period in [
         7,
@@ -1340,24 +1362,30 @@ def build_features(
 
         data[
             f"rsi_{period}"
-        ] = calculate_rsi(
+        ] = rsi(
             close,
             period
         )
 
-    # --------------------------------------------------------
     # MACD
-    # --------------------------------------------------------
 
     (
         macd_line,
         macd_signal,
         macd_hist
-    ) = calculate_macd(
+    ) = macd(
         close
     )
 
-    data["macd"] = macd_line
+    data[
+        "macd_norm"
+    ] = (
+        macd_line
+        / (
+            close
+            + 1e-12
+        )
+    )
 
     data[
         "macd_signal"
@@ -1367,95 +1395,54 @@ def build_features(
         "macd_hist"
     ] = macd_hist
 
-    data[
-        "macd_norm"
-    ] = (
-        macd_line
-        / (
-            close + 1e-12
-        )
-    )
-
-    # --------------------------------------------------------
     # BOLLINGER
-    # --------------------------------------------------------
 
     (
-        bb_middle,
-        bb_upper,
-        bb_lower
-    ) = calculate_bollinger(
+        middle,
+        upper,
+        lower
+    ) = bollinger(
         close,
         20
     )
 
     data[
-        "bb_middle"
-    ] = bb_middle
-
-    data[
-        "bb_upper"
-    ] = bb_upper
-
-    data[
-        "bb_lower"
-    ] = bb_lower
-
-    data[
         "bb_width"
     ] = (
-        bb_upper
-        - bb_lower
+        upper - lower
     ) / (
-        bb_middle
+        middle
         + 1e-12
     )
 
     data[
         "bb_position"
     ] = (
-        close
-        - bb_lower
+        close - lower
     ) / (
-        bb_upper
-        - bb_lower
+        upper - lower
         + 1e-12
     )
 
-    # --------------------------------------------------------
     # ATR
-    # --------------------------------------------------------
-
-    data[
-        "atr"
-    ] = calculate_atr(
-        data,
-        14
-    )
 
     data[
         "atr_pct"
     ] = (
-        data["atr"]
+        atr(data)
         / (
-            close + 1e-12
+            close
+            + 1e-12
         )
     )
 
-    # --------------------------------------------------------
     # ADX
-    # --------------------------------------------------------
 
     data[
         "adx"
-    ] = calculate_adx(
-        data,
-        14
-    )
+    ] = adx(data)
 
-    # --------------------------------------------------------
     # STOCHASTIC
-    # --------------------------------------------------------
 
     lowest = low.rolling(
         14
@@ -1470,7 +1457,8 @@ def build_features(
     ] = (
         100
         * (
-            close - lowest
+            close
+            - lowest
         )
         / (
             highest
@@ -1482,20 +1470,20 @@ def build_features(
     data[
         "stoch_d"
     ] = (
-        data["stoch_k"]
+        data[
+            "stoch_k"
+        ]
         .rolling(3)
         .mean()
     )
 
-    # --------------------------------------------------------
     # CANDLE
-    # --------------------------------------------------------
 
     candle_range = (
         high - low
     )
 
-    candle_body = (
+    body = (
         close
         - data["open"]
     )
@@ -1503,9 +1491,10 @@ def build_features(
     data[
         "body_pct"
     ] = (
-        candle_body
+        body
         / (
-            close + 1e-12
+            close
+            + 1e-12
         )
     )
 
@@ -1514,7 +1503,8 @@ def build_features(
     ] = (
         candle_range
         / (
-            close + 1e-12
+            close
+            + 1e-12
         )
     )
 
@@ -1541,16 +1531,14 @@ def build_features(
     data[
         "body_to_range"
     ] = (
-        candle_body.abs()
+        body.abs()
         / (
             candle_range
             + 1e-12
         )
     )
 
-    # --------------------------------------------------------
     # VOLUME
-    # --------------------------------------------------------
 
     volume_mean = (
         volume
@@ -1588,13 +1576,7 @@ def build_features(
         "volume_change"
     ] = volume.pct_change()
 
-    # --------------------------------------------------------
     # VOLATILITY
-    # --------------------------------------------------------
-
-    returns = data[
-        "ret_1"
-    ]
 
     for period in [
         12,
@@ -1606,14 +1588,12 @@ def build_features(
         data[
             f"volatility_{period}"
         ] = (
-            returns
+            data["ret_1"]
             .rolling(period)
             .std()
         )
 
-    # --------------------------------------------------------
     # HIGH / LOW
-    # --------------------------------------------------------
 
     for period in [
         48,
@@ -1654,13 +1634,10 @@ def build_features(
             - 1
         )
 
-    # --------------------------------------------------------
     # DRAWDOWN
-    # --------------------------------------------------------
 
     running_high = (
-        close
-        .cummax()
+        close.cummax()
     )
 
     data[
@@ -1674,9 +1651,7 @@ def build_features(
         - 1
     )
 
-    # --------------------------------------------------------
-    # PRICE Z SCORE
-    # --------------------------------------------------------
+    # Z SCORE
 
     for period in [
         50,
@@ -1700,10 +1675,11 @@ def build_features(
         ] = (
             close - mean
         ) / (
-            std + 1e-12
+            std
+            + 1e-12
         )
 
-    data = data.replace(
+    return data.replace(
         [
             np.inf,
             -np.inf
@@ -1711,11 +1687,9 @@ def build_features(
         np.nan
     )
 
-    return data
-
 
 # ============================================================
-# FEATURE LIST
+# FEATURE COLUMNS
 # ============================================================
 
 def feature_columns():
@@ -1793,29 +1767,31 @@ def feature_columns():
 # ============================================================
 
 def create_target(
-    df,
+    data,
     future_bars
 ):
 
-    data = df.copy()
+    result = data.copy()
 
     future_return = (
-        data["close"]
-        .shift(-future_bars)
-        / data["close"]
+        result["close"]
+        .shift(
+            -future_bars
+        )
+        / result["close"]
         - 1
     )
 
-    data[
+    result[
         "future_return"
     ] = future_return
 
     volatility = (
-        data[
+        result[
             "volatility_24"
         ]
         .fillna(
-            data[
+            result[
                 "ret_1"
             ].std()
         )
@@ -1832,32 +1808,34 @@ def create_target(
         lower=0.002
     )
 
-    # 0 = SELL
-    # 1 = HOLD
-    # 2 = BUY
+    # 0 SELL
+    # 1 HOLD
+    # 2 BUY
 
-    data[
+    result[
         "target"
     ] = 1
 
-    data.loc[
-        future_return > threshold,
+    result.loc[
+        future_return
+        > threshold,
         "target"
     ] = 2
 
-    data.loc[
-        future_return < -threshold,
+    result.loc[
+        future_return
+        < -threshold,
         "target"
     ] = 0
 
-    return data
+    return result
 
 
 # ============================================================
-# MLP
+# MODELS
 # ============================================================
 
-def create_classifier():
+def classifier_model():
 
     return Pipeline(
         [
@@ -1876,7 +1854,6 @@ def create_classifier():
                     ),
                     activation="relu",
                     solver="adam",
-                    alpha=0.0001,
                     batch_size=256,
                     learning_rate_init=0.001,
                     max_iter=100,
@@ -1889,7 +1866,7 @@ def create_classifier():
     )
 
 
-def create_regressor():
+def regression_model():
 
     return Pipeline(
         [
@@ -1912,7 +1889,7 @@ def create_regressor():
 # TRAIN
 # ============================================================
 
-def train_models(
+def train(
     df,
     future_bars,
     train_limit
@@ -1929,19 +1906,23 @@ def train_models(
 
     columns = feature_columns()
 
-    usable = features.dropna(
-        subset=columns
-        + [
-            "target",
-            "future_return"
-        ]
-    ).copy()
+    usable = (
+        features
+        .dropna(
+            subset=columns
+            + [
+                "target",
+                "future_return"
+            ]
+        )
+        .copy()
+    )
 
     if len(usable) < 500:
 
-        raise ValueError(
-            "Model için yeterli temiz veri "
-            f"yok. Temiz satır: {len(usable)}"
+        raise DataProviderError(
+            f"AI için yeterli veri yok. "
+            f"Temiz veri: {len(usable)}"
         )
 
     usable = usable.tail(
@@ -1965,14 +1946,17 @@ def train_models(
 
     if y.nunique() < 2:
 
-        raise ValueError(
-            "AI training target yalnızca "
-            "tek sınıf içeriyor."
+        raise DataProviderError(
+            "AI target tek sınıf içeriyor."
         )
 
-    classifier = create_classifier()
+    classifier = (
+        classifier_model()
+    )
 
-    regressor = create_regressor()
+    regressor = (
+        regression_model()
+    )
 
     classifier.fit(
         X,
@@ -1985,12 +1969,16 @@ def train_models(
     )
 
     predictions = (
-        classifier.predict(X)
+        classifier.predict(
+            X
+        )
     )
 
-    accuracy = accuracy_score(
-        y,
-        predictions
+    accuracy = (
+        accuracy_score(
+            y,
+            predictions
+        )
     )
 
     return (
@@ -2006,22 +1994,24 @@ def train_models(
 # PREDICTION
 # ============================================================
 
-def predict_latest(
+def predict(
     classifier,
     regressor,
     features,
     columns
 ):
 
-    valid = features.dropna(
-        subset=columns
+    valid = (
+        features
+        .dropna(
+            subset=columns
+        )
     )
 
     if valid.empty:
 
-        raise ValueError(
-            "Son candle için feature "
-            "oluşturulamadı."
+        raise DataProviderError(
+            "Latest candle için feature yok."
         )
 
     latest = valid.iloc[-1]
@@ -2044,14 +2034,10 @@ def predict_latest(
     )
 
     probability_map = {
-        int(
-            class_id
-        ): float(
-            probability
-        )
-        for class_id,
-        probability
-        in zip(
+        int(c):
+            float(p)
+
+        for c, p in zip(
             classes,
             probabilities
         )
@@ -2102,10 +2088,6 @@ def predict_latest(
 
         confidence = p_hold
 
-    # --------------------------------------------------------
-    # METRICS
-    # --------------------------------------------------------
-
     price = float(
         latest["close"]
     )
@@ -2122,7 +2104,7 @@ def predict_latest(
         latest["atr_pct"]
     )
 
-    adx = safe_float(
+    adx_value = safe_float(
         latest["adx"]
     )
 
@@ -2142,37 +2124,37 @@ def predict_latest(
         latest["volatility_24"]
     )
 
-    # --------------------------------------------------------
     # SCORE
-    # --------------------------------------------------------
 
     direction = (
         p_buy
         - p_sell
     )
 
-    momentum_component = np.tanh(
+    momentum_score = np.tanh(
         momentum * 20
     )
 
-    trend_component = np.tanh(
+    trend_score = np.tanh(
         trend * 20
     )
 
-    volume_component = np.tanh(
-        (volume_ratio - 1)
-        / 2
+    volume_score = np.tanh(
+        (
+            volume_ratio
+            - 1
+        ) / 2
     )
 
     if np.isnan(
         volatility
     ):
 
-        risk_component = 0.0
+        risk_score = 0
 
     else:
 
-        risk_component = (
+        risk_score = (
             1
             - np.clip(
                 volatility * 30,
@@ -2184,10 +2166,10 @@ def predict_latest(
     score = (
         50
         + direction * 25
-        + momentum_component * 10
-        + trend_component * 7
-        + volume_component * 4
-        + risk_component * 4
+        + momentum_score * 10
+        + trend_score * 7
+        + volume_score * 4
+        + risk_score * 4
     )
 
     score = float(
@@ -2200,15 +2182,20 @@ def predict_latest(
 
     return {
 
-        "signal": signal,
+        "signal":
+            signal,
 
-        "confidence": confidence,
+        "confidence":
+            confidence,
 
-        "p_buy": p_buy,
+        "p_buy":
+            p_buy,
 
-        "p_hold": p_hold,
+        "p_hold":
+            p_hold,
 
-        "p_sell": p_sell,
+        "p_sell":
+            p_sell,
 
         "expected_return":
             expected_return,
@@ -2226,7 +2213,7 @@ def predict_latest(
             atr_pct,
 
         "adx":
-            adx,
+            adx_value,
 
         "volume_ratio":
             volume_ratio,
@@ -2246,17 +2233,17 @@ def predict_latest(
 
 
 # ============================================================
-# ANALYZE SYMBOL
+# ANALYZE
 # ============================================================
 
-def analyze_symbol(
+def analyze(
     symbol,
     df,
     future_bars,
     train_limit
 ):
 
-    start_time = time.time()
+    started = time.time()
 
     (
         classifier,
@@ -2264,13 +2251,13 @@ def analyze_symbol(
         features,
         columns,
         accuracy
-    ) = train_models(
+    ) = train(
         df,
         future_bars,
         train_limit
     )
 
-    prediction = predict_latest(
+    prediction = predict(
         classifier,
         regressor,
         features,
@@ -2312,7 +2299,9 @@ def analyze_symbol(
             prediction["rsi14"],
 
         "bb_position":
-            prediction["bb_position"],
+            prediction[
+                "bb_position"
+            ],
 
         "atr_pct":
             prediction["atr_pct"],
@@ -2321,7 +2310,9 @@ def analyze_symbol(
             prediction["adx"],
 
         "volume_ratio":
-            prediction["volume_ratio"],
+            prediction[
+                "volume_ratio"
+            ],
 
         "momentum":
             prediction["momentum"],
@@ -2345,7 +2336,7 @@ def analyze_symbol(
 
         "processing_seconds":
             time.time()
-            - start_time
+            - started
     }
 
 
@@ -2357,52 +2348,27 @@ st.sidebar.header(
     "⚙️ Scanner Settings"
 )
 
-
 data_source = st.sidebar.selectbox(
     "Data Source",
     [
-        "CCXT Exchange",
+        "Kraken REST",
         "CSV / Uploaded Data",
         "Binance REST"
-    ],
-    index=0
+    ]
 )
-
-
-if data_source == "CCXT Exchange":
-
-    exchange_id = st.sidebar.selectbox(
-        "Exchange",
-        [
-            "kraken",
-            "coinbase",
-            "kucoin",
-            "okx",
-            "bybit",
-            "bitget"
-        ],
-        index=0
-    )
-
-else:
-
-    exchange_id = None
 
 
 uploaded_file = None
 
-if data_source == "CSV / Uploaded Data":
+if data_source == (
+    "CSV / Uploaded Data"
+):
 
     uploaded_file = (
         st.sidebar.file_uploader(
             "OHLCV CSV",
             type=["csv"]
         )
-    )
-
-    st.sidebar.caption(
-        "Gerekli kolonlar: "
-        "timestamp, open, high, low, close, volume"
     )
 
 
@@ -2423,7 +2389,7 @@ symbol_limit = st.sidebar.slider(
     "Maximum Symbols",
     1,
     100,
-    DEFAULT_SYMBOL_LIMIT
+    10
 )
 
 
@@ -2431,7 +2397,7 @@ future_bars = st.sidebar.slider(
     "Future Bars",
     3,
     48,
-    DEFAULT_FUTURE_BARS
+    12
 )
 
 
@@ -2439,7 +2405,7 @@ train_limit = st.sidebar.slider(
     "Training Rows",
     2_000,
     30_000,
-    DEFAULT_TRAIN_LIMIT,
+    10_000,
     step=1_000
 )
 
@@ -2455,138 +2421,98 @@ min_confidence = st.sidebar.slider(
 
 auto_refresh = st.sidebar.checkbox(
     "15 Dakikada Otomatik Tarama",
-    value=True
+    True
 )
 
 
-st.sidebar.divider()
-
-
-manual_scan = st.sidebar.button(
+if st.sidebar.button(
     "🔄 Şimdi Tara",
     use_container_width=True
-)
-
-
-if manual_scan:
+):
 
     st.session_state.force_scan = True
 
 
-st.sidebar.divider()
-
-
 st.sidebar.info(
-    "⚠️ Bu uygulama hiçbir emir göndermez. "
-    "Sadece OHLCV verisini analiz eder."
+    "No Order Execution: "
+    "Bu uygulama hiçbir alım/satım emri göndermez."
 )
 
 
 # ============================================================
-# SYMBOL DISCOVERY
+# DISCOVER
 # ============================================================
 
-def discover_symbols():
+def discover():
 
-    if data_source == "CSV / Uploaded Data":
+    if data_source == "Kraken REST":
+
+        pairs = get_kraken_symbols()
+
+        if not pairs:
+
+            raise DataProviderError(
+                "Kraken Spot sembol bulunamadı."
+            )
+
+        return pairs[
+            :symbol_limit
+        ]
+
+    if data_source == (
+        "CSV / Uploaded Data"
+    ):
 
         if uploaded_file is None:
 
             raise DataProviderError(
-                "Önce bir CSV dosyası yükleyin."
+                "CSV yüklenmedi."
             )
 
         return [
-            "UPLOADED_DATA"
-        ]
+            {
+                "api_symbol":
+                    "UPLOADED_DATA",
 
-    if data_source == "CCXT Exchange":
-
-        symbols = get_ccxt_symbols(
-            exchange_id
-        )
-
-        if not symbols:
-
-            raise DataProviderError(
-                f"{exchange_id} üzerinde "
-                "Spot sembol bulunamadı."
-            )
-
-        return symbols[
-            :symbol_limit
+                "display_symbol":
+                    "UPLOADED_DATA"
+            }
         ]
 
     if data_source == "Binance REST":
 
-        try:
-
-            symbols = (
-                get_binance_symbols()
-            )
-
-        except BinanceRestrictedError:
-
-            raise
-
-        except Exception:
-
-            raise
-
-        return symbols[
+        return get_binance_symbols()[
             :symbol_limit
         ]
 
     raise DataProviderError(
-        "Geçersiz data source."
+        "Bilinmeyen data source."
     )
 
 
 # ============================================================
-# LOAD DATA
+# LOAD
 # ============================================================
 
-def load_symbol_data(
-    symbol
+def load_symbol(
+    pair
 ):
 
-    # --------------------------------------------------------
-    # CSV
-    # --------------------------------------------------------
-
-    if (
-        data_source
-        == "CSV / Uploaded Data"
+    if data_source == (
+        "Kraken REST"
     ):
 
-        df = read_csv_ohlcv(
-            uploaded_file
-        )
+        api_symbol = pair[
+            "api_symbol"
+        ]
 
-        return (
-            df
-            .tail(
-                candle_target
-            )
-            .reset_index(
-                drop=True
-            )
-        )
-
-    # --------------------------------------------------------
-    # CCXT
-    # --------------------------------------------------------
-
-    if (
-        data_source
-        == "CCXT Exchange"
-    ):
+        display_symbol = pair[
+            "display_symbol"
+        ]
 
         cache_key = (
-            "CCXT|"
-            + str(exchange_id)
-            + "|"
-            + str(symbol)
+            "KRAKEN|"
+            + api_symbol
         )
 
         cached = (
@@ -2602,43 +2528,54 @@ def load_symbol_data(
         ):
 
             return (
-                cached
-                .tail(
+                display_symbol,
+                cached.tail(
                     candle_target
-                )
-                .reset_index(
-                    drop=True
                 )
             )
 
-        df = get_ccxt_history(
-            exchange_id,
-            symbol,
+        df = download_kraken_history(
+            api_symbol,
             candle_target
         )
 
         if not df.empty:
 
-            st.session_state.candle_cache[
+            st.session_state[
+                "candle_cache"
+            ][
                 cache_key
-            ] = df.tail(
+            ] = df
+
+        return (
+            display_symbol,
+            df
+        )
+
+    if data_source == (
+        "CSV / Uploaded Data"
+    ):
+
+        df = read_csv(
+            uploaded_file
+        )
+
+        return (
+            "UPLOADED_DATA",
+            df.tail(
                 candle_target
             )
+        )
 
-        return df
-
-    # --------------------------------------------------------
-    # BINANCE
-    # --------------------------------------------------------
-
-    if (
-        data_source
-        == "Binance REST"
+    if data_source == (
+        "Binance REST"
     ):
+
+        symbol = pair
 
         cache_key = (
             "BINANCE|"
-            + str(symbol)
+            + symbol
         )
 
         cached = (
@@ -2654,12 +2591,9 @@ def load_symbol_data(
         ):
 
             return (
-                cached
-                .tail(
+                symbol,
+                cached.tail(
                     candle_target
-                )
-                .reset_index(
-                    drop=True
                 )
             )
 
@@ -2670,16 +2604,19 @@ def load_symbol_data(
 
         if not df.empty:
 
-            st.session_state.candle_cache[
+            st.session_state[
+                "candle_cache"
+            ][
                 cache_key
-            ] = df.tail(
-                candle_target
-            )
+            ] = df
 
-        return df
+        return (
+            symbol,
+            df
+        )
 
     raise DataProviderError(
-        "Data source hatası."
+        "Data source bulunamadı."
     )
 
 
@@ -2697,62 +2634,75 @@ def run_scan():
 
     results = []
 
-    progress_bar = st.progress(
+    progress = st.progress(
         0
     )
 
-    status_box = st.empty()
+    status = st.empty()
 
     try:
 
-        status_box.info(
-            "Sembol listesi alınıyor..."
+        status.info(
+            "Spot sembolleri alınıyor..."
         )
 
-        symbols = discover_symbols()
+        pairs = discover()
 
-        total = len(symbols)
+        total = len(
+            pairs
+        )
 
         if total == 0:
 
             raise DataProviderError(
-                "Hiç sembol bulunamadı."
+                "Sembol bulunamadı."
             )
 
-        status_box.success(
-            f"{total} sembol bulundu."
-        )
-
-        for index, symbol in enumerate(
-            symbols
+        for index, pair in enumerate(
+            pairs
         ):
 
-            status_box.info(
-                f"Analiz ediliyor: "
-                f"{symbol} "
+            if isinstance(
+                pair,
+                dict
+            ):
+
+                label = pair[
+                    "display_symbol"
+                ]
+
+            else:
+
+                label = str(
+                    pair
+                )
+
+            status.info(
+                f"Tarama: {label} "
                 f"({index + 1}/{total})"
             )
 
             try:
 
-                df = load_symbol_data(
-                    symbol
+                symbol, df = load_symbol(
+                    pair
                 )
 
                 if df.empty:
 
                     raise DataProviderError(
-                        "OHLCV verisi boş."
+                        "OHLCV veri seti boş."
                     )
 
-                if len(df) < 500:
+                if len(df) < 1_000:
 
                     raise DataProviderError(
                         f"Yetersiz candle: "
-                        f"{len(df)}"
+                        f"{len(df)}. "
+                        "En az 1,000 candle gerekli."
                     )
 
-                result = analyze_symbol(
+                result = analyze(
                     symbol,
                     df,
                     future_bars,
@@ -2765,21 +2715,23 @@ def run_scan():
 
             except Exception as exc:
 
-                error_message = (
-                    f"{type(exc).__name__}: "
-                    f"{str(exc)}"
-                )
-
-                st.session_state.scan_errors.append(
+                st.session_state[
+                    "scan_errors"
+                ].append(
                     {
                         "symbol":
-                            symbol,
+                            label,
+
                         "error":
-                            error_message
+                            (
+                                type(exc).__name__
+                                + ": "
+                                + str(exc)
+                            )
                     }
                 )
 
-            progress_bar.progress(
+            progress.progress(
                 int(
                     (
                         index + 1
@@ -2806,116 +2758,108 @@ def run_scan():
                 )
             )
 
-        st.session_state.scan_results = (
-            result_df
+        st.session_state[
+            "scan_results"
+        ] = result_df
+
+        st.session_state[
+            "last_scan"
+        ] = utc_now()
+
+        st.session_state[
+            "last_source"
+        ] = data_source
+
+        st.session_state[
+            "last_status"
+        ] = (
+            "SUCCESS"
+            if not result_df.empty
+            else "NO_RESULTS"
         )
-
-        st.session_state.last_scan = (
-            utc_now()
-        )
-
-        st.session_state.last_source = (
-            data_source
-        )
-
-        if result_df.empty:
-
-            st.session_state.last_status = (
-                "NO_RESULTS"
-            )
-
-        else:
-
-            st.session_state.last_status = (
-                "SUCCESS"
-            )
 
     except BinanceRestrictedError as exc:
 
         message = (
-            "HTTP 451: Binance API bu çalışma "
-            "ortamından erişime izin vermiyor."
+            "HTTP 451: Binance API bu "
+            "çalışma ortamından erişime "
+            "izin vermiyor."
         )
 
-        st.session_state.scan_errors.append(
+        st.session_state[
+            "scan_errors"
+        ].append(
             {
-                "symbol": "BINANCE",
-                "error": message
+                "symbol":
+                    "BINANCE",
+
+                "error":
+                    message
             }
         )
 
-        st.session_state.last_status = (
-            "BINANCE_451"
-        )
+        st.session_state[
+            "last_status"
+        ] = "BINANCE_451"
 
         st.error(
             message
         )
 
-        st.warning(
-            "Bu durum Python veya Streamlit "
-            "kod hatası değildir."
-        )
-
         st.info(
-            "Data Source bölümünden "
-            "'CCXT Exchange' seçin. "
-            "Varsayılan seçenek Kraken Spot'tur."
+            "Binance yerine sol menüden "
+            "'Kraken REST' seçebilirsiniz."
         )
 
     except Exception as exc:
 
         message = (
-            f"{type(exc).__name__}: "
-            f"{str(exc)}"
+            type(exc).__name__
+            + ": "
+            + str(exc)
         )
 
-        st.session_state.scan_errors.append(
+        st.session_state[
+            "scan_errors"
+        ].append(
             {
-                "symbol": "SYSTEM",
-                "error": message
+                "symbol":
+                    "SYSTEM",
+
+                "error":
+                    message
             }
         )
 
-        st.session_state.last_status = (
-            "ERROR"
-        )
+        st.session_state[
+            "last_status"
+        ] = "ERROR"
 
         st.error(
-            f"Tarama hatası: {message}"
+            "Tarama hatası: "
+            + message
         )
 
     finally:
 
-        progress_bar.empty()
+        progress.empty()
 
-        status_box.empty()
+        status.empty()
 
-        st.session_state.force_scan = (
-            False
-        )
-
-
-# ============================================================
-# SCAN TRIGGER
-# ============================================================
-
-def should_run_scan():
-
-    if st.session_state.force_scan:
-
-        return True
-
-    if auto_refresh:
-
-        return True
-
-    return False
+        st.session_state[
+            "force_scan"
+        ] = False
 
 
 # ============================================================
-# FRAGMENT SUPPORT
+# RUN
 # ============================================================
+
+should_run = (
+    st.session_state.force_scan
+    or auto_refresh
+)
+
 
 if hasattr(
     st,
@@ -2923,13 +2867,15 @@ if hasattr(
 ):
 
     @st.fragment(
-        run_every="15m"
-        if auto_refresh
-        else None
+        run_every=(
+            "15m"
+            if auto_refresh
+            else None
+        )
     )
     def scanner():
 
-        if should_run_scan():
+        if should_run:
 
             run_scan()
 
@@ -2937,7 +2883,7 @@ if hasattr(
 
 else:
 
-    if should_run_scan():
+    if should_run:
 
         run_scan()
 
@@ -2948,7 +2894,9 @@ else:
 
 st.divider()
 
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4 = st.columns(
+    4
+)
 
 with c1:
 
@@ -2974,21 +2922,17 @@ with c3:
 
 with c4:
 
-    if st.session_state.last_scan:
-
-        st.metric(
-            "Last Scan",
-            st.session_state.last_scan.strftime(
-                "%Y-%m-%d %H:%M:%S"
+    st.metric(
+        "Last Scan",
+        (
+            st.session_state.last_scan
+            .strftime(
+                "%H:%M:%S"
             )
+            if st.session_state.last_scan
+            else "-"
         )
-
-    else:
-
-        st.metric(
-            "Last Scan",
-            "-"
-        )
+    )
 
 
 # ============================================================
@@ -3006,41 +2950,11 @@ if results.empty:
         "Henüz sonuç yok."
     )
 
-    if (
-        data_source
-        == "Binance REST"
-    ):
-
-        st.info(
-            "Binance REST seçildi. "
-            "Eğer HTTP 451 alıyorsanız "
-            "Binance bu çalışma ortamına "
-            "API erişimi vermiyor."
-        )
-
-    elif (
-        data_source
-        == "CCXT Exchange"
-    ):
-
-        st.info(
-            f"{exchange_id} Spot üzerinden "
-            "veri alınmaya çalışılıyor."
-        )
-
-    else:
-
-        st.info(
-            "OHLCV CSV yükleyip "
-            "'Şimdi Tara' butonuna basın."
-        )
-
-
 else:
 
-    # ========================================================
+    # --------------------------------------------------------
     # BUY
-    # ========================================================
+    # --------------------------------------------------------
 
     buy = results[
         results["signal"]
@@ -3067,46 +2981,40 @@ else:
     if buy.empty:
 
         st.info(
-            "Confidence filtresini geçen "
-            "BUY sinyali bulunamadı."
+            "BUY sinyali yok."
         )
 
     else:
 
-        display = buy.copy()
+        view = buy.copy()
 
-        display[
+        view[
             "confidence"
-        ] = (
-            display[
-                "confidence"
-            ] * 100
-        ).round(2)
+        ] *= 100
 
-        display[
+        view[
             "expected_return"
-        ] = (
-            display[
-                "expected_return"
-            ] * 100
-        ).round(3)
+        ] *= 100
 
-        display[
+        view[
             "p_buy"
-        ] = (
-            display[
-                "p_buy"
-            ] * 100
-        ).round(2)
+        ] *= 100
 
-        display[
-            "score"
-        ] = display[
-            "score"
-        ].round(2)
+        view = view.round(
+            {
+                "confidence": 2,
+                "expected_return": 3,
+                "p_buy": 2,
+                "score": 2,
+                "rsi14": 2,
+                "adx": 2,
+                "volume_ratio": 2,
+                "price": 8
+            }
+        )
 
         st.dataframe(
-            display[
+            view[
                 [
                     "symbol",
                     "score",
@@ -3124,9 +3032,9 @@ else:
             hide_index=True
         )
 
-    # ========================================================
+    # --------------------------------------------------------
     # SELL
-    # ========================================================
+    # --------------------------------------------------------
 
     sell = results[
         results["signal"]
@@ -3156,46 +3064,40 @@ else:
     if sell.empty:
 
         st.info(
-            "Confidence filtresini geçen "
-            "SELL sinyali bulunamadı."
+            "SELL sinyali yok."
         )
 
     else:
 
-        display = sell.copy()
+        view = sell.copy()
 
-        display[
+        view[
             "confidence"
-        ] = (
-            display[
-                "confidence"
-            ] * 100
-        ).round(2)
+        ] *= 100
 
-        display[
+        view[
             "expected_return"
-        ] = (
-            display[
-                "expected_return"
-            ] * 100
-        ).round(3)
+        ] *= 100
 
-        display[
+        view[
             "p_sell"
-        ] = (
-            display[
-                "p_sell"
-            ] * 100
-        ).round(2)
+        ] *= 100
 
-        display[
-            "score"
-        ] = display[
-            "score"
-        ].round(2)
+        view = view.round(
+            {
+                "confidence": 2,
+                "expected_return": 3,
+                "p_sell": 2,
+                "score": 2,
+                "rsi14": 2,
+                "adx": 2,
+                "volume_ratio": 2,
+                "price": 8
+            }
+        )
 
         st.dataframe(
-            display[
+            view[
                 [
                     "symbol",
                     "score",
@@ -3213,9 +3115,9 @@ else:
             hide_index=True
         )
 
-    # ========================================================
+    # --------------------------------------------------------
     # HOLD
-    # ========================================================
+    # --------------------------------------------------------
 
     hold = results[
         results["signal"]
@@ -3229,29 +3131,27 @@ else:
     if hold.empty:
 
         st.info(
-            "HOLD sonucu yok."
+            "HOLD yok."
         )
 
     else:
 
-        hold_display = hold.copy()
+        view = hold.copy()
 
-        hold_display[
+        view[
             "confidence"
-        ] = (
-            hold_display[
-                "confidence"
-            ] * 100
-        ).round(2)
+        ] *= 100
 
-        hold_display[
-            "score"
-        ] = hold_display[
-            "score"
-        ].round(2)
+        view[
+            "expected_return"
+        ] *= 100
+
+        view = view.round(
+            3
+        )
 
         st.dataframe(
-            hold_display[
+            view[
                 [
                     "symbol",
                     "score",
@@ -3268,9 +3168,9 @@ else:
             hide_index=True
         )
 
-    # ========================================================
-    # ALL RESULTS
-    # ========================================================
+    # --------------------------------------------------------
+    # ALL
+    # --------------------------------------------------------
 
     with st.expander(
         "📋 Tüm AI Sonuçları"
@@ -3282,161 +3182,74 @@ else:
             hide_index=True
         )
 
-    # ========================================================
-    # SYMBOL DETAIL
-    # ========================================================
+    # --------------------------------------------------------
+    # DETAIL
+    # --------------------------------------------------------
 
     st.subheader(
         "🔎 Symbol Detail"
     )
 
     selected_symbol = st.selectbox(
-        "Coin",
+        "Symbol",
         results[
             "symbol"
         ].tolist()
     )
 
-    selected = results[
+    row = results[
         results["symbol"]
         == selected_symbol
     ].iloc[0]
 
-    d1, d2, d3, d4 = st.columns(4)
+    a, b, c, d = st.columns(
+        4
+    )
 
-    with d1:
+    with a:
 
         st.metric(
             "Signal",
-            selected[
-                "signal"
-            ]
+            row["signal"]
         )
 
-    with d2:
+    with b:
 
         st.metric(
             "Confidence",
-            f"{selected['confidence'] * 100:.2f}%"
+            f"{row['confidence'] * 100:.2f}%"
         )
 
-    with d3:
+    with c:
 
         st.metric(
             "Expected Return",
-            f"{selected['expected_return'] * 100:.3f}%"
+            f"{row['expected_return'] * 100:.3f}%"
         )
 
-    with d4:
+    with d:
 
         st.metric(
-            "AI Score",
-            f"{selected['score']:.2f}"
+            "Score",
+            f"{row['score']:.2f}"
         )
-
-    detail = pd.DataFrame(
-        {
-            "Metric": [
-                "Price",
-                "BUY Probability",
-                "HOLD Probability",
-                "SELL Probability",
-                "RSI 14",
-                "Bollinger Position",
-                "ATR %",
-                "ADX",
-                "Volume Ratio",
-                "Momentum 24",
-                "EMA Trend 20/50",
-                "Volatility",
-                "Training Accuracy",
-                "Candle Count",
-                "Processing Time"
-            ],
-
-            "Value": [
-
-                selected[
-                    "price"
-                ],
-
-                f"{selected['p_buy'] * 100:.2f}%",
-
-                f"{selected['p_hold'] * 100:.2f}%",
-
-                f"{selected['p_sell'] * 100:.2f}%",
-
-                selected[
-                    "rsi14"
-                ],
-
-                selected[
-                    "bb_position"
-                ],
-
-                selected[
-                    "atr_pct"
-                ],
-
-                selected[
-                    "adx"
-                ],
-
-                selected[
-                    "volume_ratio"
-                ],
-
-                selected[
-                    "momentum"
-                ],
-
-                selected[
-                    "trend"
-                ],
-
-                selected[
-                    "volatility"
-                ],
-
-                f"{selected['training_accuracy'] * 100:.2f}%",
-
-                selected[
-                    "candles"
-                ],
-
-                f"{selected['processing_seconds']:.2f}s"
-            ]
-        }
-    )
-
-    st.dataframe(
-        detail,
-        use_container_width=True,
-        hide_index=True
-    )
 
 
 # ============================================================
-# CSV EXPORT
+# EXPORT
 # ============================================================
 
 if not results.empty:
 
     st.divider()
 
-    st.subheader(
-        "💾 Export"
-    )
-
-    csv_data = results.to_csv(
-        index=False
-    ).encode(
-        "utf-8"
-    )
-
     st.download_button(
-        label="⬇️ AI Results CSV",
-        data=csv_data,
+        "⬇️ Download AI Results CSV",
+        data=results.to_csv(
+            index=False
+        ).encode(
+            "utf-8"
+        ),
         file_name=(
             "spot_ai_results.csv"
         ),
@@ -3456,12 +3269,12 @@ with st.expander(
     if not st.session_state.candle_cache:
 
         st.info(
-            "Candle cache boş."
+            "Candle Cache boş."
         )
 
     else:
 
-        cache_rows = []
+        cache_data = []
 
         for key, df in (
             st.session_state
@@ -3469,14 +3282,11 @@ with st.expander(
             .items()
         ):
 
-            if (
-                df is None
-                or df.empty
-            ):
+            if df.empty:
 
                 continue
 
-            cache_rows.append(
+            cache_data.append(
                 {
                     "source":
                         key,
@@ -3500,25 +3310,19 @@ with st.expander(
                 }
             )
 
-        if cache_rows:
+        if cache_data:
 
             st.dataframe(
                 pd.DataFrame(
-                    cache_rows
+                    cache_data
                 ),
                 use_container_width=True,
                 hide_index=True
             )
 
-        else:
-
-            st.info(
-                "Cache kullanılabilir veri içermiyor."
-            )
-
 
 # ============================================================
-# ERROR DETAILS
+# ERRORS
 # ============================================================
 
 if st.session_state.scan_errors:
@@ -3529,37 +3333,24 @@ if st.session_state.scan_errors:
         "⚠️ Hata Detayları"
     )
 
-    for error in (
+    for item in (
         st.session_state.scan_errors
     ):
 
         if isinstance(
-            error,
+            item,
             dict
         ):
 
-            symbol = str(
-                error.get(
-                    "symbol",
-                    "SYSTEM"
-                )
-            )
-
-            message = str(
-                error.get(
-                    "error",
-                    "Bilinmeyen hata"
-                )
-            )
-
             st.error(
-                f"{symbol}: {message}"
+                f"{item.get('symbol', 'SYSTEM')}: "
+                f"{item.get('error', 'Bilinmeyen hata')}"
             )
 
         else:
 
             st.error(
-                str(error)
+                str(item)
             )
 
 
@@ -3570,12 +3361,12 @@ if st.session_state.scan_errors:
 st.divider()
 
 st.caption(
-    "Spot AI Scanner | 15m | 500K target | "
+    "Spot AI Scanner | 15m | 500K Target | "
     "MLP AI | No Order Execution"
 )
 
 st.caption(
     "Bu sistem yalnızca teknik verilerden "
-    "istatistiksel BUY / HOLD / SELL tahmini "
-    "üretir. Yatırım tavsiyesi değildir."
+    "istatistiksel BUY / HOLD / SELL tahmini üretir. "
+    "Yatırım tavsiyesi değildir."
 )
