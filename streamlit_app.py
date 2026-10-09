@@ -5,16 +5,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from datetime import datetime, timezone
-from streamlit_autorefresh import st_autorefresh
-
-# =========================================================
-# SMART FUTURES SCANNER
-# Data: OKX public USDT perpetual swaps
-# Hourly market refresh
-# Signals: BUY / SELL
-# Ranking: highest 24h percentage change first
-# No API keys, no order placement, no Plotly
-# =========================================================
 
 st.set_page_config(
     page_title="Smart Futures AI Scanner",
@@ -25,7 +15,6 @@ st.set_page_config(
 BASE_URL = "https://www.okx.com"
 TIMEOUT = 20
 INTERVAL = "15m"
-REFRESH_MS = 60 * 60 * 1000
 
 session = requests.Session()
 session.headers.update({
@@ -34,15 +23,7 @@ session.headers.update({
 })
 
 
-# ---------------- AUTOMATIC HOURLY REFRESH ----------------
-
-hourly_tick = st_autorefresh(
-    interval=REFRESH_MS,
-    limit=None,
-    key="hourly_market_refresh",
-)
-
-# ---------------- PUBLIC API ----------------
+# ---------------- API ----------------
 
 def api_get(path, params=None):
     response = session.get(
@@ -85,8 +66,6 @@ def get_tickers():
     )
 
 
-# ---------------- MARKET DATA ----------------
-
 def build_market_table(symbols, tickers, min_volume):
     symbol_set = set(symbols)
     rows = []
@@ -123,12 +102,16 @@ def build_market_table(symbols, tickers, min_volume):
     if df.empty:
         return df
 
-    return (
-        df.sort_values("24h change (%)", ascending=False)
-        .reset_index(drop=True)
-        .assign(Rank=lambda x: np.arange(1, len(x) + 1))
-    )
+    df = df.sort_values(
+        "24h change (%)",
+        ascending=False,
+    ).reset_index(drop=True)
 
+    df.insert(0, "Rank", np.arange(1, len(df) + 1))
+    return df
+
+
+# ---------------- CANDLES ----------------
 
 def parse_candles(data):
     if not data:
@@ -154,6 +137,7 @@ def parse_candles(data):
     )
     df = df.drop_duplicates("timestamp")
     df = df.sort_values("timestamp").reset_index(drop=True)
+
     df["datetime"] = pd.to_datetime(
         df["timestamp"], unit="ms", utc=True
     )
@@ -165,19 +149,19 @@ def get_candles(symbol, target=500):
     frames = []
     seen = set()
 
-    latest_data = api_get(
-        "/api/v5/market/candles",
-        {
-            "instId": symbol,
-            "bar": INTERVAL,
-            "limit": str(min(target, 300)),
-        },
+    latest = parse_candles(
+        api_get(
+            "/api/v5/market/candles",
+            {
+                "instId": symbol,
+                "bar": INTERVAL,
+                "limit": str(min(target, 300)),
+            },
+        )
     )
 
-    latest = parse_candles(latest_data)
     frames.append(latest)
     seen.update(latest["timestamp"].astype(int).tolist())
-
     before = int(latest["timestamp"].min())
 
     for _ in range(12):
@@ -221,14 +205,12 @@ def get_candles(symbol, target=500):
     result = result.reset_index(drop=True)
 
     if len(result) < 150:
-        raise RuntimeError(
-            f"Not enough completed candles: {len(result)}"
-        )
+        raise RuntimeError("Not enough completed candles.")
 
     return result
 
 
-# ---------------- SMARTER FEATURES ----------------
+# ---------------- MODEL ----------------
 
 def make_features(df):
     close = df["close"].replace(0, np.nan)
@@ -239,11 +221,9 @@ def make_features(df):
 
     f = pd.DataFrame(index=df.index)
 
-    # Multi-horizon price momentum.
     for lag in [1, 2, 3, 4, 8, 12, 24, 48, 96]:
         f[f"return_{lag}"] = close.pct_change(lag)
 
-    # Candle geometry.
     f["body"] = (df["close"] - df["open"]) / open_price
     f["range"] = (high - low) / close
 
@@ -258,46 +238,27 @@ def make_features(df):
         df[["open", "close"]].min(axis=1) - low
     ) / close
 
-    # Momentum consistency and rolling volatility.
-    one_return = close.pct_change()
+    returns = close.pct_change()
 
     for window in [4, 8, 16, 32, 64]:
-        f[f"mean_return_{window}"] = (
-            one_return.rolling(window).mean()
-        )
-        f[f"volatility_{window}"] = (
-            one_return.rolling(window).std()
-        )
-        f[f"range_mean_{window}"] = (
-            f["range"].rolling(window).mean()
-        )
+        f[f"mean_return_{window}"] = returns.rolling(window).mean()
+        f[f"volatility_{window}"] = returns.rolling(window).std()
+        f[f"range_mean_{window}"] = f["range"].rolling(window).mean()
 
-    # Volume expansion / contraction.
     for lag in [1, 2, 4, 8]:
-        f[f"volume_change_{lag}"] = (
-            volume / volume.shift(lag) - 1
-        )
+        f[f"volume_change_{lag}"] = volume / volume.shift(lag) - 1
 
-    f["relative_volume_24"] = (
-        volume / volume.rolling(24).mean() - 1
-    )
-
-    f["relative_volume_48"] = (
-        volume / volume.rolling(48).mean() - 1
-    )
+    f["relative_volume_24"] = volume / volume.rolling(24).mean() - 1
+    f["relative_volume_48"] = volume / volume.rolling(48).mean() - 1
 
     return f.replace([np.inf, -np.inf], np.nan)
 
 
-# ---------------- LOGISTIC MODEL ----------------
-
 def sigmoid(z):
-    return 1.0 / (
-        1.0 + np.exp(-np.clip(z, -35, 35))
-    )
+    return 1 / (1 + np.exp(-np.clip(z, -35, 35)))
 
 
-def train_model(X, y, epochs=500, learning_rate=0.04):
+def train_model(X, y, epochs=400, learning_rate=0.04):
     n, p = X.shape
     weights = np.zeros(p)
     bias = 0.0
@@ -306,10 +267,7 @@ def train_model(X, y, epochs=500, learning_rate=0.04):
         pred = sigmoid(X @ weights + bias)
         error = pred - y
 
-        grad_w = (
-            X.T @ error
-        ) / n + 0.005 * weights
-
+        grad_w = X.T @ error / n + 0.005 * weights
         grad_b = error.mean()
         lr = learning_rate / (1 + epoch / 200)
 
@@ -321,8 +279,6 @@ def train_model(X, y, epochs=500, learning_rate=0.04):
 
 def analyze_model(df):
     features = make_features(df)
-
-    # Predict direction four candles ahead (one hour on 15m).
     future_return = df["close"].shift(-4) / df["close"] - 1
 
     valid = features.notna().all(axis=1) & future_return.notna()
@@ -330,7 +286,7 @@ def analyze_model(df):
     y = (future_return.loc[valid].to_numpy() > 0).astype(float)
 
     if len(X) < 180:
-        raise RuntimeError("Not enough valid training samples.")
+        raise RuntimeError("Not enough training data.")
 
     split = int(len(X) * 0.8)
     split = max(60, min(split, len(X) - 30))
@@ -340,7 +296,6 @@ def analyze_model(df):
     y_train = y[:split]
     y_test = y[split:]
 
-    # Scale using training data only.
     mean_train = X_train_raw.mean(axis=0)
     std_train = X_train_raw.std(axis=0)
     std_train[std_train < 1e-9] = 1.0
@@ -349,14 +304,14 @@ def analyze_model(df):
     X_test = (X_test_raw - mean_train) / std_train
 
     weights, bias = train_model(X_train, y_train)
-    test_prob = sigmoid(X_test @ weights + bias)
-    test_pred = (test_prob >= 0.5).astype(float)
+
+    test_pred = (
+        sigmoid(X_test @ weights + bias) >= 0.5
+    ).astype(float)
 
     accuracy = float((test_pred == y_test).mean() * 100)
 
-    # Balanced accuracy treats rising/falling classes separately.
     class_scores = []
-
     for label in [0.0, 1.0]:
         mask = y_test == label
         if mask.any():
@@ -369,7 +324,6 @@ def analyze_model(df):
         if class_scores else accuracy
     )
 
-    # Retrain using all labeled historical samples.
     mean_all = X.mean(axis=0)
     std_all = X.std(axis=0)
     std_all[std_all < 1e-9] = 1.0
@@ -382,9 +336,8 @@ def analyze_model(df):
     if not np.isfinite(latest).all():
         raise RuntimeError("Invalid latest candle features.")
 
-    latest_scaled = (latest - mean_all) / std_all
     p_up = float(
-        sigmoid(latest_scaled @ weights + bias)[0]
+        sigmoid(((latest - mean_all) / std_all) @ weights + bias)[0]
     )
 
     return {
@@ -397,214 +350,191 @@ def analyze_model(df):
     }
 
 
-# ---------------- UI ----------------
+# ---------------- MARKET REFRESH FRAGMENT ----------------
 
-st.title("📈 Smart Futures AI Scanner")
-st.caption(
-    "OKX USDT perpetual swaps | Hourly refresh | "
-    "BUY / SELL predictions | Highest 24h change first"
-)
-
-with st.sidebar:
-    st.header("Settings")
+@st.fragment(run_every="1h")
+def market_panel():
+    st.subheader("Live Futures Market")
 
     min_volume = st.number_input(
         "Minimum 24h volume (contracts)",
         min_value=0.0,
         value=0.0,
         step=1000.0,
+        key="min_volume",
     )
 
-    candle_count = st.selectbox(
-        "Historical 15-minute candles",
-        [200, 300, 500, 800, 1000],
-        index=2,
-    )
+    if st.button("Refresh market now", key="refresh_market"):
+        get_instruments.clear()
+        get_tickers.clear()
 
-    scan_count = st.selectbox(
-        "Model scan",
-        ["TOP 20", "TOP 50", "TOP 100", "ALL CONTRACTS"],
-        index=0,
-    )
+    try:
+        symbols = get_instruments()
+        tickers = get_tickers()
+        market = build_market_table(symbols, tickers, min_volume)
 
-    min_probability = st.slider(
-        "Minimum BUY/SELL probability (%)",
-        50, 95, 60,
-    )
+        if market.empty:
+            st.warning("No contracts returned by the API.")
+            return
 
-    min_accuracy = st.slider(
-        "Minimum balanced test accuracy (%)",
-        0, 90, 50,
-    )
+        top = market.iloc[0]
+        rising = int((market["24h change (%)"] > 0).sum())
+        falling = int((market["24h change (%)"] < 0).sum())
 
-    signal_filter = st.selectbox(
-        "Signal filter",
-        ["ALL", "BUY", "SELL"],
-    )
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("USDT perpetual contracts", len(market))
+        c2.metric("Rising", rising)
+        c3.metric("Falling", falling)
+        c4.metric(
+            "Top 24h mover",
+            f"{top['Symbol']} {top['24h change (%)']:+.2f}%"
+        )
 
-    manual_refresh = st.button(
-        "Refresh now",
-        type="primary",
-        use_container_width=True,
-    )
+        st.caption(
+            "Last market refresh (UTC): "
+            + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        )
 
-# Auto refresh count changes each hour.
-if "last_refresh_tick" not in st.session_state:
-    st.session_state["last_refresh_tick"] = -1
+        st.dataframe(
+            market.head(20),
+            use_container_width=True,
+            hide_index=True,
+        )
 
-if "market_table" not in st.session_state:
-    st.session_state["market_table"] = None
+        with st.expander(f"All contracts ({len(market)})"):
+            st.dataframe(
+                market,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.download_button(
+            "Download market CSV",
+            data=market.to_csv(index=False).encode("utf-8-sig"),
+            file_name="futures_market.csv",
+            mime="text/csv",
+            key="download_market",
+        )
+
+    except Exception as exc:
+        st.error("Market data request failed.")
+        st.code(str(exc))
+
+
+# ---------------- MAIN APP ----------------
+
+st.title("📈 Smart Futures AI Scanner")
+st.caption(
+    "OKX public USDT perpetual data | Hourly market refresh | BUY / SELL"
+)
+
+market_panel()
+
+st.divider()
+st.subheader("🤖 BUY / SELL Model Scan")
+
+scan_count = st.selectbox(
+    "How many contracts should the model analyze?",
+    ["TOP 20", "TOP 50", "TOP 100", "ALL CONTRACTS"],
+)
+
+candle_count = st.selectbox(
+    "Historical 15-minute candles per contract",
+    [200, 300, 500, 800, 1000],
+    index=2,
+)
+
+min_probability = st.slider(
+    "Minimum BUY/SELL probability (%)",
+    50, 95, 60,
+)
+
+min_accuracy = st.slider(
+    "Minimum balanced test accuracy (%)",
+    0, 90, 50,
+)
+
+signal_filter = st.selectbox(
+    "Signal filter",
+    ["ALL", "BUY", "SELL"],
+)
 
 if "model_results" not in st.session_state:
     st.session_state["model_results"] = []
 
-hour_changed = (
-    hourly_tick != st.session_state["last_refresh_tick"]
-)
-
-should_refresh = (
-    manual_refresh
-    or st.session_state["market_table"] is None
-    or hour_changed
-)
-
-if should_refresh:
-    try:
-        with st.spinner("Refreshing futures market data..."):
-            symbols = get_instruments()
-            tickers = get_tickers()
-            market = build_market_table(
-                symbols, tickers, min_volume
-            )
-
-            if market.empty:
-                st.error("No contracts returned by the public API.")
-                st.stop()
-
-            st.session_state["market_table"] = market
-            st.session_state["last_refresh_tick"] = hourly_tick
-            st.session_state["last_updated_utc"] = (
-                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            )
-
-            # Old model predictions are no longer presented as fresh.
-            st.session_state["model_results"] = []
-
-    except Exception as exc:
-        st.error("Could not refresh market data.")
-        st.code(str(exc))
-        st.info(
-            "This app uses OKX data, not Binance data. "
-            "Check public API availability if the request fails."
-        )
-        st.stop()
-
-market = st.session_state["market_table"].copy()
-market = market.sort_values(
-    "24h change (%)", ascending=False
-).reset_index(drop=True)
-market["Rank"] = np.arange(1, len(market) + 1)
-
-top = market.iloc[0]
-rising = int((market["24h change (%)"] > 0).sum())
-falling = int((market["24h change (%)"] < 0).sum())
-
-a, b, c, d = st.columns(4)
-a.metric("Active USDT perpetuals", len(market))
-b.metric("Rising", rising)
-c.metric("Falling", falling)
-d.metric(
-    "Top 24h mover",
-    f"{top['Symbol']} {top['24h change (%)']:+.2f}%"
-)
-
-st.caption(
-    "Last market refresh (UTC): "
-    + st.session_state.get("last_updated_utc", "Not yet refreshed")
-)
-
-st.subheader("🔥 Highest 24-hour percentage change")
-st.dataframe(
-    market.head(20),
-    use_container_width=True,
-    hide_index=True,
-)
-
-with st.expander(f"All contracts ({len(market)})"):
-    st.dataframe(
-        market,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-st.download_button(
-    "Download full market list CSV",
-    data=market.to_csv(index=False).encode("utf-8-sig"),
-    file_name="futures_market_list.csv",
-    mime="text/csv",
-)
-
-st.divider()
-st.subheader("🤖 Smart BUY / SELL model")
 
 if st.button("START MODEL SCAN"):
-    if scan_count == "ALL CONTRACTS":
-        selected_market = market
-    elif scan_count == "TOP 100":
-        selected_market = market.head(100)
-    elif scan_count == "TOP 50":
-        selected_market = market.head(50)
-    else:
-        selected_market = market.head(20)
+    try:
+        with st.spinner("Loading market list..."):
+            symbols = get_instruments()
+            tickers = get_tickers()
+            market = build_market_table(symbols, tickers, 0)
 
-    results = []
-    progress = st.progress(0)
-    status = st.empty()
+        if market.empty:
+            st.error("No market contracts found.")
+            st.stop()
 
-    for i, row in enumerate(selected_market.to_dict("records")):
-        symbol = row["Symbol"]
-        status.write(
-            f"Analyzing {symbol} ({i + 1}/{len(selected_market)})"
-        )
+        if scan_count == "TOP 20":
+            selected_market = market.head(20)
+        elif scan_count == "TOP 50":
+            selected_market = market.head(50)
+        elif scan_count == "TOP 100":
+            selected_market = market.head(100)
+        else:
+            selected_market = market
 
-        try:
-            candles = get_candles(symbol, candle_count)
-            prediction = analyze_model(candles)
+        results = []
+        progress = st.progress(0)
+        status = st.empty()
 
-            results.append({
-                "Symbol": symbol,
-                "24h change (%)": row["24h change (%)"],
-                "Signal": prediction["Signal"],
-                "BUY probability (%)": prediction["BUY probability (%)"],
-                "SELL probability (%)": prediction["SELL probability (%)"],
-                "Test accuracy (%)": prediction["Test accuracy (%)"],
-                "Balanced accuracy (%)": prediction["Balanced accuracy (%)"],
-                "Last price": row["Last price"],
-                "Test samples": prediction["Test samples"],
-                "_candles": candles,
-                "_error": "",
-            })
+        for i, row in enumerate(selected_market.to_dict("records")):
+            symbol = row["Symbol"]
+            status.write(
+                f"Analyzing {symbol} ({i + 1}/{len(selected_market)})"
+            )
 
-        except Exception as exc:
-            results.append({
-                "Symbol": symbol,
-                "24h change (%)": row["24h change (%)"],
-                "Signal": "DATA ERROR",
-                "BUY probability (%)": np.nan,
-                "SELL probability (%)": np.nan,
-                "Test accuracy (%)": np.nan,
-                "Balanced accuracy (%)": np.nan,
-                "Last price": row["Last price"],
-                "Test samples": 0,
-                "_candles": None,
-                "_error": str(exc),
-            })
+            try:
+                candles = get_candles(symbol, candle_count)
+                prediction = analyze_model(candles)
 
-        progress.progress((i + 1) / len(selected_market))
-        time.sleep(0.15)
+                results.append({
+                    "Symbol": symbol,
+                    "24h change (%)": row["24h change (%)"],
+                    "Signal": prediction["Signal"],
+                    "BUY probability (%)": prediction["BUY probability (%)"],
+                    "SELL probability (%)": prediction["SELL probability (%)"],
+                    "Test accuracy (%)": prediction["Test accuracy (%)"],
+                    "Balanced accuracy (%)": prediction["Balanced accuracy (%)"],
+                    "Last price": row["Last price"],
+                    "Test samples": prediction["Test samples"],
+                    "_candles": candles,
+                    "_error": "",
+                })
 
-    st.session_state["model_results"] = results
-    status.success("Model scan completed.")
+            except Exception as exc:
+                results.append({
+                    "Symbol": symbol,
+                    "24h change (%)": row["24h change (%)"],
+                    "Signal": "DATA ERROR",
+                    "BUY probability (%)": np.nan,
+                    "SELL probability (%)": np.nan,
+                    "Test accuracy (%)": np.nan,
+                    "Balanced accuracy (%)": np.nan,
+                    "Last price": row["Last price"],
+                    "Test samples": 0,
+                    "_candles": None,
+                    "_error": str(exc),
+                })
+
+            progress.progress((i + 1) / len(selected_market))
+            time.sleep(0.15)
+
+        st.session_state["model_results"] = results
+        status.success("Model scan completed.")
+
+    except Exception as exc:
+        st.error("Could not start model scan.")
+        st.code(str(exc))
 
 
 results = st.session_state["model_results"]
@@ -634,9 +564,7 @@ if results:
         ].copy()
 
         if signal_filter != "ALL":
-            filtered = filtered[
-                filtered["Signal"] == signal_filter
-            ]
+            filtered = filtered[filtered["Signal"] == signal_filter]
 
         columns = [
             "Symbol",
@@ -650,7 +578,7 @@ if results:
             "Test samples",
         ]
 
-        st.subheader("🏆 Model ranking — highest 24h change first")
+        st.subheader("Model results — highest 24h change first")
         st.dataframe(
             filtered[columns],
             use_container_width=True,
@@ -659,48 +587,36 @@ if results:
 
         st.download_button(
             "Download model results CSV",
-            data=filtered[columns].to_csv(
-                index=False
-            ).encode("utf-8-sig"),
+            data=filtered[columns].to_csv(index=False).encode("utf-8-sig"),
             file_name="smart_futures_results.csv",
             mime="text/csv",
         )
 
-        selected_symbol = st.selectbox(
-            "Select a contract for the price chart",
+        chart_symbol = st.selectbox(
+            "Select contract for chart",
             [r["Symbol"] for r in good],
         )
 
         selected = next(
-            r for r in good if r["Symbol"] == selected_symbol
+            r for r in good if r["Symbol"] == chart_symbol
         )
 
         candles = selected["_candles"].set_index("datetime")
-
         st.line_chart(
             candles[["close"]],
             y="close",
             use_container_width=True,
         )
 
-        x1, x2, x3, x4 = st.columns(4)
-        x1.metric("Signal", selected["Signal"])
-        x2.metric(
-            "24h change",
-            f"{selected['24h change (%)']:+.2f}%"
-        )
-        x3.metric(
-            "BUY probability",
-            f"{selected['BUY probability (%)']:.2f}%"
-        )
-        x4.metric(
-            "SELL probability",
-            f"{selected['SELL probability (%)']:.2f}%"
-        )
+        a, b, c, d = st.columns(4)
+        a.metric("Signal", selected["Signal"])
+        b.metric("24h change", f"{selected['24h change (%)']:+.2f}%")
+        c.metric("BUY probability", f"{selected['BUY probability (%)']:.2f}%")
+        d.metric("SELL probability", f"{selected['SELL probability (%)']:.2f}%")
 
 st.divider()
 st.caption(
-    "Hourly refresh runs while the app is active. "
-    "The model predicts direction, not guaranteed profit. "
-    "This app uses OKX public data and does not place orders."
+    "Market data refreshes every hour while the app is active. "
+    "Model predictions do not automatically rerun every hour. "
+    "This uses OKX data, not Binance data, and places no orders."
 )
