@@ -1,8 +1,5 @@
-import os
+```python
 import time
-import hmac
-import hashlib
-from urllib.parse import urlencode
 from datetime import datetime, timezone
 
 import numpy as np
@@ -13,6 +10,7 @@ import streamlit as st
 try:
     import torch
     from torch import nn
+
     TORCH_AVAILABLE = True
 except ImportError:
     torch = None
@@ -21,53 +19,40 @@ except ImportError:
 
 
 # ============================================================
-# CONFIGURATION
+# AYARLAR
 # ============================================================
 
 st.set_page_config(
-    page_title="Deep Learning Crypto Scanner",
+    page_title="LSTM Crypto Dashboard",
     page_icon="🧠",
     layout="wide",
 )
 
-BINANCE_API = "https://api.binance.com"
-BINANCE_TESTNET = "https://testnet.binance.vision"
-
 CANDLE_COUNT = 1000
-INTERVAL_SECONDS = 900
+INTERVAL_SECONDS = 15 * 60
 REQUEST_TIMEOUT = 20
+
+BINANCE_HOSTS = [
+    "https://api.binance.com",
+    "https://api-gcp.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+]
 
 HTTP = requests.Session()
 HTTP.headers.update({
-    "User-Agent": "LSTM-Spot-Scanner/1.0"
+    "User-Agent": "LSTM-Crypto-Dashboard/1.0"
 })
 
 
 # ============================================================
-# BINANCE PUBLIC API
+# BINANCE API
 # ============================================================
 
-def api_get(url, params=None):
-    response = HTTP.get(
-        url,
-        params=params,
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
-    return response.json()
-
-
 def binance_get(path, params=None):
-    hosts = [
-        BINANCE_API,
-        "https://api-gcp.binance.com",
-        "https://api1.binance.com",
-        "https://api2.binance.com",
-    ]
-
     errors = []
 
-    for host in hosts:
+    for host in BINANCE_HOSTS:
         try:
             response = HTTP.get(
                 host + path,
@@ -83,7 +68,7 @@ def binance_get(path, params=None):
             return response.json()
 
         except requests.RequestException as exc:
-            errors.append(f"{host}: {exc}")
+            errors.append(f"{host}: {str(exc)[:120]}")
 
     raise RuntimeError(
         "Binance API bağlantısı başarısız: "
@@ -91,10 +76,10 @@ def binance_get(path, params=None):
     )
 
 
-def get_spot_markets():
+@st.cache_data(ttl=300, show_spinner=False)
+def get_spot_symbols():
     data = binance_get("/api/v3/exchangeInfo")
-
-    markets = []
+    symbols = []
 
     for item in data.get("symbols", []):
         if item.get("status") != "TRADING":
@@ -106,38 +91,40 @@ def get_spot_markets():
         if item.get("isSpotTradingAllowed") is False:
             continue
 
-        markets.append(item["symbol"])
+        symbols.append(item["symbol"])
 
-    return markets
+    return sorted(set(symbols))
 
 
-def get_24h_tickers():
+@st.cache_data(ttl=60, show_spinner=False)
+def get_tickers():
     data = binance_get("/api/v3/ticker/24hr")
-    result = {}
+    tickers = {}
 
     for item in data:
         try:
-            result[item["symbol"]] = {
+            tickers[item["symbol"]] = {
                 "price": float(item["lastPrice"]),
-                "quote_volume": float(item["quoteVolume"]),
                 "change_24h_pct": float(
                     item["priceChangePercent"]
                 ),
+                "quote_volume": float(
+                    item["quoteVolume"]
+                ),
+                "high_24h": float(item["highPrice"]),
+                "low_24h": float(item["lowPrice"]),
             }
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, ValueError, TypeError):
             continue
 
-    return result
+    return tickers
 
 
-# ============================================================
-# CANDLE DATA
-# ============================================================
-
+@st.cache_data(ttl=60, show_spinner=False)
 def get_candles(symbol, limit=CANDLE_COUNT):
     """
-    Son tamamlanmış 15 dakikalık mumları getirir.
-    Devam eden mum analiz dışında bırakılır.
+    Son 1000 tamamlanmış 15 dakikalık mumu alır.
+    Devam eden mum analiz dışı bırakılır.
     """
 
     now = int(
@@ -179,35 +166,37 @@ def get_candles(symbol, limit=CANDLE_COUNT):
                 "volume": float(candle[5]),
                 "quote_volume": float(candle[7]),
             })
-        except (ValueError, TypeError, IndexError):
+        except (IndexError, TypeError, ValueError):
             continue
 
     df = pd.DataFrame(rows)
 
     if df.empty:
         raise ValueError(
-            f"{symbol}: Mum verisi alınamadı."
+            f"{symbol}: mum verisi alınamadı."
         )
 
     df = df.drop_duplicates(
         subset=["timestamp"]
     ).sort_values("timestamp")
 
-    # Sadece tamamlanmış mumlar.
     df = df[
         df["timestamp"] < current_candle_start
     ]
 
-    df = df.replace(
-        [np.inf, -np.inf],
-        np.nan,
-    )
+    numeric_columns = [
+        "open", "high", "low", "close",
+        "volume", "quote_volume",
+    ]
+
+    for column in numeric_columns:
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce",
+        )
 
     df = df.dropna(
-        subset=[
-            "open", "high", "low",
-            "close", "volume",
-        ]
+        subset=numeric_columns
     )
 
     df = df[
@@ -223,13 +212,13 @@ def get_candles(symbol, limit=CANDLE_COUNT):
 
 
 # ============================================================
-# DEEP LEARNING FEATURES
+# DERİN ÖĞRENME GİRDİLERİ
 # ============================================================
 
 def make_features(df):
     """
-    Yalnızca mum ve hacim verilerinden özellikler oluşturur.
-    RSI, EMA, MACD veya indikatör oylaması kullanılmaz.
+    Ham mum ve hacim verilerinden model girdileri üretir.
+    Teknik indikatör kullanılmaz.
     """
 
     close = df["close"].astype(float)
@@ -272,7 +261,7 @@ def make_features(df):
 
 
 # ============================================================
-# LSTM MODEL
+# LSTM MODELİ
 # ============================================================
 
 if TORCH_AVAILABLE:
@@ -293,11 +282,11 @@ if TORCH_AVAILABLE:
                 num_layers=num_layers,
                 batch_first=True,
                 dropout=(
-                    dropout if num_layers > 1 else 0
+                    dropout if num_layers > 1 else 0.0
                 ),
             )
 
-            self.output_layer = nn.Sequential(
+            self.head = nn.Sequential(
                 nn.Linear(hidden_size, 32),
                 nn.ReLU(),
                 nn.Dropout(0.1),
@@ -305,32 +294,23 @@ if TORCH_AVAILABLE:
             )
 
         def forward(self, x):
-            sequence, _ = self.lstm(x)
-            last_step = sequence[:, -1, :]
-            return self.output_layer(last_step)
+            output, _ = self.lstm(x)
+            return self.head(output[:, -1, :])
 
 
 # ============================================================
-# MODEL TRAINING
+# MODEL EĞİTİMİ VE TAHMİN
 # ============================================================
 
-def train_lstm(
+def train_and_predict(
     candles,
     lookback=48,
     epochs=5,
 ):
-    """
-    Sonraki mumun kapanışının yukarıda olma
-    olasılığını tahmin eder.
-
-    Veri kronolojik olarak eğitim ve doğrulama
-    bölümlerine ayrılır.
-    """
-
     if not TORCH_AVAILABLE:
         raise RuntimeError(
             "PyTorch kurulu değil. "
-            "python -m pip install torch"
+            "pip install torch komutunu çalıştırın."
         )
 
     if len(candles) < lookback + 150:
@@ -338,46 +318,45 @@ def train_lstm(
             "Model eğitimi için yeterli mum yok."
         )
 
-    features_df = make_features(candles)
+    feature_df = make_features(candles)
 
     close = candles["close"].to_numpy(
         dtype=np.float64
     )
 
-    # Hedef: sonraki kapanış mevcut kapanıştan yüksek mi?
+    # Bir sonraki mumun kapanışı yukarıda mı?
     labels = (
         close[1:] > close[:-1]
     ).astype(np.float32)
 
-    # Her hedef için yalnızca bilinen geçmiş özellikler.
-    features_df = features_df.iloc[:-1].copy()
+    # Her özellik satırının hedefi bir sonraki mumdur.
+    feature_df = feature_df.iloc[:-1].copy()
 
-    split = int(len(features_df) * 0.8)
+    split = int(len(feature_df) * 0.8)
 
     if split <= lookback:
         raise ValueError(
-            "Eğitim verisi yetersiz."
+            "Eğitim bölümü çok küçük."
         )
 
-    # Ölçekleyici yalnızca eğitim döneminde hesaplanır.
-    means = features_df.iloc[:split].mean()
+    # Ölçekleme parametreleri sadece eğitim verisinden.
+    train_features = feature_df.iloc[:split]
+
+    means = train_features.mean()
 
     stds = (
-        features_df.iloc[:split]
-        .std()
+        train_features.std()
         .replace(0, 1)
         .fillna(1)
     )
 
     scaled = (
-        (features_df - means) / stds
+        (feature_df - means) / stds
     ).clip(-8, 8).fillna(0).to_numpy(
         dtype=np.float32
     )
 
-    latest_features = make_features(
-        candles
-    )
+    latest_features = make_features(candles)
 
     latest_scaled = (
         (latest_features - means) / stds
@@ -389,30 +368,15 @@ def train_lstm(
     targets = []
     end_indices = []
 
-    for end in range(
-        lookback - 1,
-        len(scaled),
-    ):
+    for end in range(lookback - 1, len(scaled)):
         sequences.append(
-            scaled[
-                end - lookback + 1:
-                end + 1
-            ]
+            scaled[end - lookback + 1:end + 1]
         )
-
         targets.append(labels[end])
         end_indices.append(end)
 
-    X = np.asarray(
-        sequences,
-        dtype=np.float32,
-    )
-
-    y = np.asarray(
-        targets,
-        dtype=np.float32,
-    )
-
+    X = np.asarray(sequences, dtype=np.float32)
+    y = np.asarray(targets, dtype=np.float32)
     end_indices = np.asarray(end_indices)
 
     train_mask = end_indices < split
@@ -420,12 +384,12 @@ def train_lstm(
 
     if train_mask.sum() < 50:
         raise ValueError(
-            "Eğitim örnekleri yetersiz."
+            "Yeterli eğitim örneği yok."
         )
 
     if validation_mask.sum() < 20:
         raise ValueError(
-            "Doğrulama örnekleri yetersiz."
+            "Yeterli doğrulama örneği yok."
         )
 
     torch.manual_seed(42)
@@ -460,33 +424,22 @@ def train_lstm(
         device=device,
     )
 
-    batch_size = min(
-        128,
-        len(train_x),
-    )
+    batch_size = min(128, len(train_x))
 
     model.train()
 
     for _ in range(int(epochs)):
-        permutation = torch.randperm(
+        order = torch.randperm(
             len(train_x),
             device=device,
         )
 
-        for start in range(
-            0,
-            len(permutation),
-            batch_size,
-        ):
-            indices = permutation[
-                start:start + batch_size
-            ]
+        for start in range(0, len(order), batch_size):
+            indices = order[start:start + batch_size]
 
             optimizer.zero_grad()
 
-            logits = model(
-                train_x[indices]
-            )
+            logits = model(train_x[indices])
 
             loss = loss_function(
                 logits,
@@ -502,7 +455,6 @@ def train_lstm(
 
             optimizer.step()
 
-    # Kronolojik doğrulama.
     model.eval()
 
     with torch.no_grad():
@@ -554,24 +506,24 @@ def train_lstm(
 
 
 # ============================================================
-# BUY / SELL / HOLD SIGNALS
+# MODEL SİNYALİ
 # ============================================================
 
-def get_signal(up_probability):
-    if not np.isfinite(up_probability):
+def get_signal(probability):
+    if not np.isfinite(probability):
         return "HOLD"
 
-    if up_probability >= 60:
+    if probability >= 60:
         return "BUY"
 
-    if up_probability <= 40:
+    if probability <= 40:
         return "SELL"
 
     return "HOLD"
 
 
 # ============================================================
-# ANALYZE ONE COIN
+# TEK COIN ANALİZİ
 # ============================================================
 
 def analyze_coin(
@@ -580,182 +532,52 @@ def analyze_coin(
     lookback,
     epochs,
 ):
-    candles = get_candles(
-        symbol,
-        CANDLE_COUNT,
-    )
+    candles = get_candles(symbol, CANDLE_COUNT)
 
-    prediction = train_lstm(
+    prediction = train_and_predict(
         candles,
         lookback=lookback,
         epochs=epochs,
     )
 
-    close = float(
-        candles.iloc[-1]["close"]
-    )
-
     return {
         "symbol": symbol,
         "price": ticker["price"],
-        "last_completed_close": close,
         "change_24h_pct": ticker["change_24h_pct"],
         "volume_24h_usdt": ticker["quote_volume"],
+        "last_completed_close": float(
+            candles.iloc[-1]["close"]
+        ),
         "candles_used": len(candles),
-        "up_probability_pct": prediction[
-            "up_probability_pct"
-        ],
-        "down_probability_pct": prediction[
-            "down_probability_pct"
-        ],
-        "validation_accuracy_pct": prediction[
-            "validation_accuracy_pct"
-        ],
-        "training_samples": prediction[
-            "training_samples"
-        ],
-        "validation_samples": prediction[
-            "validation_samples"
-        ],
+        "history_days": round(
+            len(candles) * 15 / 60 / 24,
+            2,
+        ),
+        **prediction,
     }
 
 
 # ============================================================
-# BINANCE SPOT TESTNET SIGNED REQUEST
+# GÖSTERGE PANELİ
 # ============================================================
 
-def testnet_signed_request(
-    method,
-    path,
-    params,
-):
-    """
-    Bu fonksiyon yalnızca Spot TESTNET adresini kullanır.
-    Gerçek Binance API adresine emir göndermez.
-    """
-
-    api_key = os.getenv(
-        "BINANCE_TESTNET_API_KEY",
-        "",
-    ).strip()
-
-    api_secret = os.getenv(
-        "BINANCE_TESTNET_API_SECRET",
-        "",
-    ).strip()
-
-    if not api_key or not api_secret:
-        raise RuntimeError(
-            "Testnet API anahtarları tanımlı değil. "
-            "BINANCE_TESTNET_API_KEY ve "
-            "BINANCE_TESTNET_API_SECRET değişkenlerini ayarlayın."
-        )
-
-    payload = dict(params)
-
-    payload["timestamp"] = int(
-        time.time() * 1000
-    )
-
-    payload["recvWindow"] = 5000
-
-    query_string = urlencode(payload)
-
-    signature = hmac.new(
-        api_secret.encode("utf-8"),
-        query_string.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-
-    url = (
-        f"{BINANCE_TESTNET}{path}"
-        f"?{query_string}&signature={signature}"
-    )
-
-    response = HTTP.request(
-        method,
-        url,
-        headers={
-            "X-MBX-APIKEY": api_key,
-        },
-        timeout=REQUEST_TIMEOUT,
-    )
-
-    response.raise_for_status()
-
-    return response.json()
-
-
-def submit_testnet_order(
-    symbol,
-    side,
-    usdt_amount=0,
-    coin_quantity=0,
-):
-    if side not in ("BUY", "SELL"):
-        raise ValueError(
-            "Emir BUY veya SELL olmalıdır."
-        )
-
-    params = {
-        "symbol": symbol,
-        "side": side,
-        "type": "MARKET",
-        "newOrderRespType": "FULL",
-    }
-
-    if side == "BUY":
-        if usdt_amount <= 0:
-            raise ValueError(
-                "USDT alım tutarı sıfırdan büyük olmalıdır."
-            )
-
-        params["quoteOrderQty"] = (
-            f"{usdt_amount:.8f}"
-            .rstrip("0")
-            .rstrip(".")
-        )
-
-    else:
-        if coin_quantity <= 0:
-            raise ValueError(
-                "Satılacak coin miktarı sıfırdan büyük olmalıdır."
-            )
-
-        params["quantity"] = (
-            f"{coin_quantity:.8f}"
-            .rstrip("0")
-            .rstrip(".")
-        )
-
-    return testnet_signed_request(
-        "POST",
-        "/api/v3/order",
-        params,
-    )
-
-
-# ============================================================
-# STREAMLIT USER INTERFACE
-# ============================================================
-
-st.title("🧠 LSTM Deep Learning Crypto Scanner")
+st.title("🧠 LSTM Crypto Dashboard")
 
 st.write(
-    "Binance Spot USDT piyasaları üzerinde "
-    "derin öğrenme tabanlı tahmin."
+    "Binance Spot USDT piyasalarını derin öğrenme "
+    "modeliyle analiz eden gösterge paneli."
 )
 
 st.info(
-    "Her coin için son 1.000 tamamlanmış 15 dakikalık "
-    "mum kullanılır. RSI, EMA, MACD veya indikatör "
-    "puanlaması kullanılmaz."
+    "Yalnızca mum ve hacim verileri kullanılır. "
+    "RSI, EMA, MACD, Bollinger Bands veya "
+    "indikatör puanlaması yoktur."
 )
 
 st.warning(
-    "BUY / SELL / HOLD model sinyalleridir; kâr garantisi "
-    "değildir. Emirler yalnızca Binance Spot Testnet'e "
-    "gönderilir. Canlı işlemler bu uygulamada kapalıdır."
+    "BUY / SELL / HOLD tahminlerdir, kâr garantisi değildir. "
+    "Bu uygulama yalnızca veri ve sinyal gösterir; "
+    "hiçbir alım-satım emri göndermez."
 )
 
 
@@ -769,7 +591,7 @@ with st.sidebar:
     scan_count = st.number_input(
         "Taranacak coin sayısı",
         min_value=1,
-        max_value=200,
+        max_value=100,
         value=20,
         step=5,
     )
@@ -787,34 +609,10 @@ with st.sidebar:
         value=5,
     )
 
-    st.divider()
-
-    st.header("Testnet emir ayarları")
-
-    usdt_amount = st.number_input(
-        "BUY tutarı (USDT)",
-        min_value=5.0,
-        max_value=100000.0,
-        value=10.0,
-        step=5.0,
-    )
-
-    coin_quantity = st.number_input(
-        "SELL miktarı (coin)",
-        min_value=0.0,
-        value=0.0,
-        step=0.001,
-        format="%.8f",
-    )
-
-    testnet_enabled = st.checkbox(
-        "Testnet emirlerini etkinleştir",
-        value=False,
-    )
-
-    st.caption(
-        "Testnet emirleri varsayılan olarak kapalıdır. "
-        "Gerçek API anahtarlarını kullanmayın."
+    start_scan = st.button(
+        "Taramayı başlat",
+        type="primary",
+        use_container_width=True,
     )
 
     if not TORCH_AVAILABLE:
@@ -823,13 +621,289 @@ with st.sidebar:
             "Terminalde: python -m pip install torch"
         )
 
-    start_scan = st.button(
-        "Derin öğrenme taramasını başlat",
-        type="primary",
-        use_container_width=True,
-    )
-
 
 # ============================================================
 # SESSION STATE
-#
+# ============================================================
+
+if "results" not in st.session_state:
+    st.session_state.results = None
+
+if "scan_errors" not in st.session_state:
+    st.session_state.scan_errors = []
+
+if "scan_time" not in st.session_state:
+    st.session_state.scan_time = None
+
+
+# ============================================================
+# SCAN
+# ============================================================
+
+if start_scan:
+    if not TORCH_AVAILABLE:
+        st.error(
+            "Önce PyTorch kurun: python -m pip install torch"
+        )
+    else:
+        progress = st.progress(0)
+        status = st.empty()
+
+        results = []
+        errors = []
+
+        try:
+            status.write("Binance Spot piyasaları yükleniyor...")
+
+            symbols = get_spot_symbols()
+            tickers = get_tickers()
+
+            candidates = []
+
+            for symbol in symbols:
+                ticker = tickers.get(symbol)
+
+                if ticker is not None:
+                    candidates.append({
+                        "symbol": symbol,
+                        **ticker,
+                    })
+
+            # Hacmi yüksek coinler önce taranır.
+            candidates.sort(
+                key=lambda row: row["quote_volume"],
+                reverse=True,
+            )
+
+            candidates = candidates[:int(scan_count)]
+
+            if not candidates:
+                raise RuntimeError(
+                    "Aktif USDT Spot piyasası bulunamadı."
+                )
+
+            for index, item in enumerate(candidates):
+                symbol = item["symbol"]
+
+                status.write(
+                    f"{index + 1}/{len(candidates)} "
+                    f"— {symbol} analiz ediliyor..."
+                )
+
+                try:
+                    result = analyze_coin(
+                        symbol,
+                        item,
+                        int(lookback),
+                        int(epochs),
+                    )
+
+                    result["signal"] = get_signal(
+                        result["up_probability_pct"]
+                    )
+
+                    results.append(result)
+
+                except Exception as exc:
+                    errors.append({
+                        "symbol": symbol,
+                        "error": str(exc)[:250],
+                    })
+
+                progress.progress(
+                    (index + 1) / len(candidates)
+                )
+
+                time.sleep(0.05)
+
+            st.session_state.results = pd.DataFrame(results)
+            st.session_state.scan_errors = errors
+            st.session_state.scan_time = (
+                datetime.now(timezone.utc)
+                .strftime("%Y-%m-%d %H:%M:%S UTC")
+            )
+
+            status.success(
+                f"Tarama tamamlandı: {len(results)} başarılı, "
+                f"{len(errors)} hatalı."
+            )
+
+        except Exception as exc:
+            st.error(f"Tarama başarısız: {exc}")
+
+
+# ============================================================
+# SONUÇLAR
+# ============================================================
+
+results = st.session_state.results
+
+if results is None:
+    st.info(
+        "Sol panelden ayarları seçip taramayı başlatın."
+    )
+
+elif results.empty:
+    st.warning(
+        "Sonuç bulunamadı. Binance bağlantısını ve "
+        "tarama hatalarını kontrol edin."
+    )
+
+else:
+    st.caption(
+        f"Son tarama: {st.session_state.scan_time or '-'}"
+    )
+
+    if "up_probability_pct" not in results.columns:
+        results["up_probability_pct"] = np.nan
+
+    results["up_probability_pct"] = pd.to_numeric(
+        results["up_probability_pct"],
+        errors="coerce",
+    )
+
+    results["down_probability_pct"] = (
+        100 - results["up_probability_pct"]
+    )
+
+    results["signal"] = results[
+        "up_probability_pct"
+    ].apply(get_signal)
+
+    results = (
+        results.sort_values(
+            "up_probability_pct",
+            ascending=False,
+            na_position="last",
+        )
+        .reset_index(drop=True)
+    )
+
+    st.session_state.results = results
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    col1.metric(
+        "Analiz edilen coin",
+        len(results),
+    )
+
+    col2.metric(
+        "BUY",
+        int((results["signal"] == "BUY").sum()),
+    )
+
+    col3.metric(
+        "SELL",
+        int((results["signal"] == "SELL").sum()),
+    )
+
+    col4.metric(
+        "HOLD",
+        int((results["signal"] == "HOLD").sum()),
+    )
+
+    st.subheader("Model sonuçları")
+
+    st.dataframe(
+        results,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.download_button(
+        "CSV olarak indir",
+        data=results.to_csv(
+            index=False
+        ).encode("utf-8-sig"),
+        file_name="lstm_dashboard_results.csv",
+        mime="text/csv",
+    )
+
+    st.subheader("En yüksek yükseliş olasılığı")
+
+    st.dataframe(
+        results.head(10),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.subheader("Coin ayrıntısı")
+
+    selected_symbol = st.selectbox(
+        "Coin seç",
+        results["symbol"].tolist(),
+    )
+
+    selected = results.loc[
+        results["symbol"] == selected_symbol
+    ].iloc[0]
+
+    m1, m2, m3 = st.columns(3)
+
+    m1.metric(
+        "Anlık fiyat",
+        f"{selected['price']:.8g} USDT",
+    )
+
+    m2.metric(
+        "Yükseliş olasılığı",
+        f"{selected['up_probability_pct']:.2f}%",
+    )
+
+    m3.metric(
+        "Düşüş olasılığı",
+        f"{selected['down_probability_pct']:.2f}%",
+    )
+
+    st.metric(
+        "Model sinyali",
+        selected["signal"],
+    )
+
+    st.metric(
+        "Kronolojik doğrulama doğruluğu",
+        f"{selected['validation_accuracy_pct']:.2f}%",
+    )
+
+    candles = get_candles(
+        selected_symbol,
+        CANDLE_COUNT,
+    )
+
+    st.subheader(
+        f"{selected_symbol} — son 1000 tamamlanmış mum"
+    )
+
+    chart_data = candles.copy()
+
+    chart_data["datetime"] = pd.to_datetime(
+        chart_data["timestamp"],
+        unit="s",
+        utc=True,
+    )
+
+    st.line_chart(
+        chart_data.set_index("datetime")["close"],
+        height=350,
+    )
+
+    st.caption(
+        "Doğrulama doğruluğu geçmiş bir veri bölümünde ölçülür; "
+        "gelecekteki performansın garantisi değildir. "
+        "Bu gösterge paneli emir göndermez."
+    )
+
+    if st.session_state.scan_errors:
+        with st.expander(
+            f"Tarama hataları "
+            f"({len(st.session_state.scan_errors)})"
+        ):
+            st.dataframe(
+                pd.DataFrame(
+                    st.session_state.scan_errors
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+```
