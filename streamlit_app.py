@@ -406,6 +406,29 @@ elif results.empty:
     st.warning("Başarılı sonuç yok. Hata listesini kontrol edin veya daha fazla piyasa tarayın.")
 else:
     st.caption(f"Borsa: {st.session_state.get('provider', '-')} | Tarama zamanı: {st.session_state.get('scan_time', '-')}")
+
+    # Compatibility guard: Streamlit may retain results from an older app version
+    # in session_state. Normalize older model-probability column names before sorting.
+    probability_aliases = (
+        "dl_up_probability_pct",
+        "prediction_probability_pct",
+        "up_probability",
+    )
+    if "up_probability_pct" not in results.columns:
+        alias = next((name for name in probability_aliases if name in results.columns), None)
+        if alias is not None:
+            results = results.rename(columns={alias: "up_probability_pct"})
+        else:
+            # Do not crash if a scan returned rows without the model output field.
+            results["up_probability_pct"] = np.nan
+            st.warning(
+                "Sonuçlarda 'up_probability_pct' alanı bulunamadı. "
+                "Bu tarama için yükseliş olasılığı mevcut değil; modeli yeniden çalıştırın."
+            )
+
+    results["up_probability_pct"] = pd.to_numeric(
+        results["up_probability_pct"], errors="coerce"
+    )
     ranked = results.sort_values("up_probability_pct", ascending=False, na_position="last").reset_index(drop=True)
     c1, c2, c3 = st.columns(3)
     c1.metric("Analiz edilen coin", len(ranked))
