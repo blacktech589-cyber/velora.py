@@ -667,7 +667,7 @@ if results is not None:
         st.dataframe(results, use_container_width=True, hide_index=True)
         st.download_button(
             "Tüm sonuçları CSV indir",
-            results.to_csv(index=False).encode("utf-8-sig"),
+            results_display.to_csv(index=False).encode("utf-8-sig"),
             "all_scan_results.csv",
             "text/csv",
         )
