@@ -16,10 +16,6 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
 st.set_page_config(
     page_title="LSTM Crypto Scanner",
     page_icon="🧠",
@@ -36,21 +32,18 @@ API_BASES = [
     "https://api4.binance.com",
 ]
 
-INTERVAL = "15m"
 CANDLE_LIMIT = 1000
+INTERVAL = "15m"
 LOOKBACK = 48
 DEFAULT_EPOCHS = 5
 MAX_WORKERS = 3
-
 BUY_THRESHOLD = 0.60
 SELL_THRESHOLD = 0.40
 
-REQUEST_TIMEOUT = 15
 
-
-# ============================================================
-# HTTP SESSION
-# ============================================================
+# ---------------------------------------------------------
+# CONNECTION
+# ---------------------------------------------------------
 
 @st.cache_resource
 def get_session():
@@ -64,36 +57,35 @@ def get_session():
 def api_get(endpoint, params=None):
     errors = []
 
-    for base_url in API_BASES:
+    for base in API_BASES:
         try:
             response = get_session().get(
-                base_url + endpoint,
+                base + endpoint,
                 params=params,
-                timeout=REQUEST_TIMEOUT
+                timeout=15
             )
-
             response.raise_for_status()
             return response.json()
 
         except requests.RequestException as exc:
             errors.append(
-                f"{base_url}: {str(exc)[:150]}"
+                f"{base}: {str(exc)[:100]}"
             )
 
     raise RuntimeError(
-        "Binance veri adreslerinin tümü başarısız oldu:\n"
+        "Binance veri adresleri başarısız:\n"
         + "\n".join(errors)
     )
 
 
-# ============================================================
-# BINANCE SPOT MARKETS
-# ============================================================
+# ---------------------------------------------------------
+# SPOT MARKETS
+# ---------------------------------------------------------
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_spot_symbols():
     data = api_get("/api/v3/exchangeInfo")
-    symbols = []
+    result = []
 
     for item in data.get("symbols", []):
         if (
@@ -101,9 +93,9 @@ def get_spot_symbols():
             and item.get("quoteAsset") == "USDT"
             and item.get("isSpotTradingAllowed", False)
         ):
-            symbols.append(item["symbol"])
+            result.append(item["symbol"])
 
-    return sorted(set(symbols))
+    return sorted(set(result))
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -121,29 +113,28 @@ def get_tickers():
                 "high_24h": float(item["highPrice"]),
                 "low_24h": float(item["lowPrice"])
             })
-        except (KeyError, ValueError, TypeError):
+        except (KeyError, TypeError, ValueError):
             continue
 
     return pd.DataFrame(rows)
 
 
-# ============================================================
-# CANDLE DATA
-# ============================================================
+# ---------------------------------------------------------
+# CANDLES
+# ---------------------------------------------------------
 
 @st.cache_data(ttl=120, show_spinner=False)
 def get_candles(symbol, count=1000):
     interval_ms = 15 * 60 * 1000
     now_ms = int(time.time() * 1000)
-
-    # Most recent completed 15-minute candle.
     end_ms = (now_ms // interval_ms) * interval_ms - 1
+
     rows = []
 
     while len(rows) < count:
         limit = min(1000, count - len(rows))
 
-        data = api_get(
+        page = api_get(
             "/api/v3/klines",
             {
                 "symbol": symbol,
@@ -153,36 +144,22 @@ def get_candles(symbol, count=1000):
             }
         )
 
-        if not data:
+        if not page:
             break
 
-        rows = data + rows
-        end_ms = int(data[0][0]) - 1
+        rows = page + rows
+        end_ms = int(page[0][0]) - 1
 
-        if len(data) < limit:
+        if len(page) < limit or len(rows) >= count:
             break
-
-        if len(rows) >= count:
-            break
-
-        time.sleep(0.05)
 
     if not rows:
         return pd.DataFrame()
 
     columns = [
-        "open_time",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "close_time",
-        "quote_volume",
-        "trades",
-        "taker_base",
-        "taker_quote",
-        "ignore"
+        "open_time", "open", "high", "low", "close",
+        "volume", "close_time", "quote_volume",
+        "trades", "taker_base", "taker_quote", "ignore"
     ]
 
     df = pd.DataFrame(rows, columns=columns)
@@ -198,28 +175,23 @@ def get_candles(symbol, count=1000):
         errors="coerce"
     )
 
-    numeric_columns = [
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "quote_volume"
-    ]
+    for col in [
+        "open", "high", "low", "close",
+        "volume", "quote_volume"
+    ]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    for column in numeric_columns:
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce"
-        )
-
-    # Exclude any candle that has not closed yet.
     df = df[df["close_time"] < now_ms]
 
     df = (
         df.drop_duplicates(subset=["open_time"])
         .sort_values("open_time")
-        .dropna(subset=numeric_columns)
+        .dropna(
+            subset=[
+                "open", "high", "low",
+                "close", "volume", "quote_volume"
+            ]
+        )
         .tail(count)
         .reset_index(drop=True)
     )
@@ -227,11 +199,9 @@ def get_candles(symbol, count=1000):
     return df
 
 
-# ============================================================
-# FEATURE ENGINEERING
-# Raw candle and volume data only.
-# No RSI, EMA, MACD, or Bollinger Bands.
-# ============================================================
+# ---------------------------------------------------------
+# FEATURES: RAW PRICE AND VOLUME ONLY
+# ---------------------------------------------------------
 
 def make_features(df):
     close = df["close"].to_numpy(dtype=np.float64)
@@ -241,37 +211,29 @@ def make_features(df):
     volume = df["volume"].to_numpy(dtype=np.float64)
     quote_volume = df["quote_volume"].to_numpy(dtype=np.float64)
 
-    safe_close = np.maximum(close, 1e-12)
-    safe_open = np.maximum(open_price, 1e-12)
-    safe_volume = np.maximum(volume, 1e-12)
-    safe_quote_volume = np.maximum(quote_volume, 1e-12)
+    close = np.maximum(close, 1e-12)
+    open_price = np.maximum(open_price, 1e-12)
+    volume = np.maximum(volume, 1e-12)
+    quote_volume = np.maximum(quote_volume, 1e-12)
 
     returns = np.zeros(len(close))
-    volume_changes = np.zeros(len(volume))
-    quote_volume_changes = np.zeros(len(quote_volume))
+    volume_change = np.zeros(len(volume))
+    quote_change = np.zeros(len(quote_volume))
 
-    returns[1:] = np.log(
-        safe_close[1:] / safe_close[:-1]
+    returns[1:] = np.log(close[1:] / close[:-1])
+    volume_change[1:] = np.log(volume[1:] / volume[:-1])
+    quote_change[1:] = np.log(
+        quote_volume[1:] / quote_volume[:-1]
     )
 
-    volume_changes[1:] = np.log(
-        safe_volume[1:] / safe_volume[:-1]
-    )
-
-    quote_volume_changes[1:] = np.log(
-        safe_quote_volume[1:] / safe_quote_volume[:-1]
-    )
-
-    body = np.log(safe_close / safe_open)
-    candle_range = (high - low) / safe_close
-
+    body = np.log(close / open_price)
+    candle_range = (high - low) / close
     upper_wick = (
         high - np.maximum(open_price, close)
-    ) / safe_close
-
+    ) / close
     lower_wick = (
         np.minimum(open_price, close) - low
-    ) / safe_close
+    ) / close
 
     features = np.column_stack([
         returns,
@@ -279,42 +241,37 @@ def make_features(df):
         candle_range,
         upper_wick,
         lower_wick,
-        volume_changes,
-        quote_volume_changes
+        volume_change,
+        quote_change
     ])
 
     return np.nan_to_num(
         features,
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0
+        nan=0,
+        posinf=0,
+        neginf=0
     ).astype(np.float32)
 
 
-# ============================================================
-# LSTM MODEL
-# ============================================================
+# ---------------------------------------------------------
+# LSTM
+# ---------------------------------------------------------
 
 if TORCH_AVAILABLE:
 
     class LSTMModel(nn.Module):
-        def __init__(
-            self,
-            input_size=7,
-            hidden_size=48,
-            num_layers=2
-        ):
+        def __init__(self, input_size=7, hidden_size=48):
             super().__init__()
 
             self.lstm = nn.LSTM(
                 input_size=input_size,
                 hidden_size=hidden_size,
-                num_layers=num_layers,
+                num_layers=2,
                 batch_first=True,
                 dropout=0.2
             )
 
-            self.classifier = nn.Sequential(
+            self.output = nn.Sequential(
                 nn.Linear(hidden_size, 24),
                 nn.ReLU(),
                 nn.Dropout(0.2),
@@ -322,100 +279,70 @@ if TORCH_AVAILABLE:
             )
 
         def forward(self, x):
-            output, _ = self.lstm(x)
-            return self.classifier(output[:, -1, :])
+            result, _ = self.lstm(x)
+            return self.output(result[:, -1, :])
 
 
-# ============================================================
-# TRAIN AND PREDICT
-# ============================================================
+# ---------------------------------------------------------
+# TRAINING AND PREDICTION
+# ---------------------------------------------------------
 
-def train_model(df, epochs=DEFAULT_EPOCHS):
+def train_model(df, epochs):
     if not TORCH_AVAILABLE:
         raise RuntimeError(
-            "PyTorch kurulu değil. requirements.txt dosyasını kontrol et."
+            "PyTorch kurulmamış. requirements.txt dosyasını kontrol et."
         )
 
     if len(df) < 200:
-        raise ValueError(
-            "En az 200 tamamlanmış mum gerekli."
-        )
+        raise ValueError("En az 200 mum gerekli.")
 
     features = make_features(df)
     closes = df["close"].to_numpy(dtype=np.float64)
+    split = int(len(features) * 0.8)
 
-    split = int(len(features) * 0.80)
-
-    # Fit normalization using training data only.
     mean = features[:split].mean(axis=0)
     std = features[:split].std(axis=0)
     std[std < 1e-8] = 1.0
 
     scaled = (features - mean) / std
-
     scaled = np.nan_to_num(
         scaled,
-        nan=0.0,
-        posinf=0.0,
-        neginf=0.0
+        nan=0,
+        posinf=0,
+        neginf=0
     ).astype(np.float32)
 
-    X = []
-    y = []
-    target_positions = []
+    X, y, positions = [], [], []
 
-    # Use the previous 48 candles to predict the next candle direction.
-    for target_i in range(LOOKBACK, len(df)):
-        X.append(
-            scaled[target_i - LOOKBACK:target_i]
-        )
-
-        y.append(
-            1 if closes[target_i] > closes[target_i - 1] else 0
-        )
-
-        target_positions.append(target_i)
+    for i in range(LOOKBACK, len(df)):
+        X.append(scaled[i - LOOKBACK:i])
+        y.append(int(closes[i] > closes[i - 1]))
+        positions.append(i)
 
     X = np.asarray(X, dtype=np.float32)
     y = np.asarray(y, dtype=np.int64)
-    target_positions = np.asarray(target_positions)
+    positions = np.asarray(positions)
 
-    train_mask = target_positions < split
-    validation_mask = target_positions >= split
+    train_mask = positions < split
+    val_mask = positions >= split
 
-    X_train = X[train_mask]
-    y_train = y[train_mask]
-
-    X_val = X[validation_mask]
-    y_val = y[validation_mask]
+    X_train, y_train = X[train_mask], y[train_mask]
+    X_val, y_val = X[val_mask], y[val_mask]
 
     if len(X_train) < 50 or len(X_val) < 10:
-        raise ValueError(
-            "Eğitim veya doğrulama verisi yetersiz."
-        )
+        raise ValueError("Eğitim/doğrulama verisi yetersiz.")
 
     torch.manual_seed(42)
     np.random.seed(42)
     torch.set_num_threads(1)
 
-    model = LSTMModel(
-        input_size=features.shape[1]
-    )
+    model = LSTMModel(input_size=features.shape[1])
 
-    counts = np.bincount(
-        y_train,
-        minlength=2
-    ).astype(np.float32)
+    counts = np.bincount(y_train, minlength=2).astype(np.float32)
+    weights = len(y_train) / (2 * np.maximum(counts, 1))
 
-    class_weights = len(y_train) / (
-        2.0 * np.maximum(counts, 1.0)
-    )
-
-    criterion = nn.CrossEntropyLoss(
-        weight=torch.tensor(
-            class_weights,
-            dtype=torch.float32
-        )
+    loss_fn = nn.CrossEntropyLoss(
+        weight=torch.tensor(weights, dtype=torch.float32)
     )
 
     optimizer = torch.optim.Adam(
@@ -440,15 +367,13 @@ def train_model(df, epochs=DEFAULT_EPOCHS):
     for _ in range(int(epochs)):
         for batch_x, batch_y in loader:
             optimizer.zero_grad()
-
             logits = model(batch_x)
-            loss = criterion(logits, batch_y)
-
+            loss = loss_fn(logits, batch_y)
             loss.backward()
 
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(),
-                max_norm=1.0
+                1.0
             )
 
             optimizer.step()
@@ -460,52 +385,35 @@ def train_model(df, epochs=DEFAULT_EPOCHS):
             torch.tensor(X_val, dtype=torch.float32)
         )
 
-        val_probabilities = torch.softmax(
-            val_logits,
-            dim=1
-        ).numpy()
+        val_probs = torch.softmax(val_logits, dim=1).numpy()
+        val_predictions = np.argmax(val_probs, axis=1)
 
-        val_predictions = np.argmax(
-            val_probabilities,
-            axis=1
-        )
+        accuracy = float(np.mean(val_predictions == y_val))
 
-        accuracy = float(
-            np.mean(val_predictions == y_val)
-        )
-
-        class_recalls = []
+        recalls = []
 
         for class_id in (0, 1):
             mask = y_val == class_id
 
             if mask.any():
-                class_recalls.append(
-                    float(
-                        np.mean(
-                            val_predictions[mask] == class_id
-                        )
-                    )
+                recalls.append(
+                    float(np.mean(val_predictions[mask] == class_id))
                 )
 
         balanced_accuracy = (
-            float(np.mean(class_recalls))
-            if class_recalls
-            else float("nan")
+            float(np.mean(recalls))
+            if recalls else float("nan")
         )
 
-        latest_sequence = torch.tensor(
+        latest_x = torch.tensor(
             scaled[-LOOKBACK:][None, :, :],
             dtype=torch.float32
         )
 
-        latest_probabilities = torch.softmax(
-            model(latest_sequence),
-            dim=1
-        )[0].numpy()
+        probs = torch.softmax(model(latest_x), dim=1)[0].numpy()
 
-    down_probability = float(latest_probabilities[0])
-    up_probability = float(latest_probabilities[1])
+    down_probability = float(probs[0])
+    up_probability = float(probs[1])
 
     if up_probability >= BUY_THRESHOLD:
         signal = "BUY"
@@ -525,32 +433,30 @@ def train_model(df, epochs=DEFAULT_EPOCHS):
     }
 
 
-# ============================================================
-# ANALYZE ONE SYMBOL
-# ============================================================
+# ---------------------------------------------------------
+# ANALYZE SYMBOL
+# ---------------------------------------------------------
 
 def analyze_symbol(symbol, epochs):
     try:
         df = get_candles(symbol, CANDLE_LIMIT)
 
         if df.empty or len(df) < 200:
-            raise ValueError(
-                "Yeterli tamamlanmış mum bulunamadı."
-            )
+            raise ValueError("Yeterli tamamlanmış mum bulunamadı.")
 
-        prediction = train_model(df, epochs)
+        result = train_model(df, epochs)
 
         return {
             "symbol": symbol,
-            "signal": prediction["signal"],
+            "signal": result["signal"],
             "price": float(df["close"].iloc[-1]),
-            "up_probability": prediction["up_probability"],
-            "down_probability": prediction["down_probability"],
-            "accuracy": prediction["accuracy"],
-            "balanced_accuracy": prediction["balanced_accuracy"],
+            "up_probability": result["up_probability"],
+            "down_probability": result["down_probability"],
+            "accuracy": result["accuracy"],
+            "balanced_accuracy": result["balanced_accuracy"],
             "candles": len(df),
-            "train_samples": prediction["train_samples"],
-            "validation_samples": prediction["validation_samples"],
+            "train_samples": result["train_samples"],
+            "validation_samples": result["validation_samples"],
             "error": None
         }
 
@@ -561,9 +467,9 @@ def analyze_symbol(symbol, epochs):
         }
 
 
-# ============================================================
+# ---------------------------------------------------------
 # SIDEBAR
-# ============================================================
+# ---------------------------------------------------------
 
 st.sidebar.header("Tarama ayarları")
 
@@ -577,10 +483,7 @@ scan_mode = st.sidebar.selectbox(
 
 coin_count = st.sidebar.slider(
     "Taranacak parite sayısı",
-    min_value=5,
-    max_value=100,
-    value=20,
-    step=5
+    5, 100, 20, 5
 )
 
 minimum_volume = st.sidebar.number_input(
@@ -592,9 +495,7 @@ minimum_volume = st.sidebar.number_input(
 
 epochs = st.sidebar.slider(
     "LSTM eğitim turu",
-    min_value=2,
-    max_value=15,
-    value=DEFAULT_EPOCHS
+    2, 15, DEFAULT_EPOCHS
 )
 
 show_errors = st.sidebar.checkbox(
@@ -607,9 +508,17 @@ if st.sidebar.button("Önbelleği temizle"):
     st.rerun()
 
 
-# ============================================================
-# LOAD MARKET DATA
-# ============================================================
+# ---------------------------------------------------------
+# MARKET LOADING
+# ---------------------------------------------------------
+
+if not TORCH_AVAILABLE:
+    st.error(
+        "PyTorch kurulu değil. Önce requirements.txt dosyasını "
+        "güncelle ve Streamlit Cloud'un paket kurulumunu tamamlamasını bekle."
+    )
+    st.code("torch")
+    st.stop()
 
 try:
     with st.spinner("Binance Spot verileri alınıyor..."):
@@ -617,23 +526,12 @@ try:
         tickers = get_tickers()
 
 except Exception as exc:
-    st.error(
-        "Binance verileri alınamadı. Alternatif adresler de başarısız oldu."
-    )
-
+    st.error("Binance verileri alınamadı.")
     st.code(str(exc))
-
-    st.write(
-        "Bu durum Streamlit Cloud sunucusunun Binance'a erişememesi, "
-        "HTTP 451 bölgesel kısıtlaması, ağ sorunu veya geçici API "
-        "hatasından kaynaklanabilir. Alternatif adresler de aynı "
-        "kısıtlamaya tabi olabilir."
-    )
-
     st.stop()
 
 if tickers.empty:
-    st.error("Binance ticker verisi boş döndü.")
+    st.error("Binance ticker verisi boş.")
     st.stop()
 
 tickers = tickers[
@@ -642,35 +540,29 @@ tickers = tickers[
 
 tickers = tickers[
     tickers["volume_24h"] >= minimum_volume
-].copy()
-
-tickers = tickers.sort_values(
+].sort_values(
     "volume_24h",
     ascending=False
 )
 
 if scan_mode == "En yüksek hacimli pariteler":
-    symbols_to_scan = (
-        tickers.head(coin_count)["symbol"].tolist()
-    )
+    symbols_to_scan = tickers.head(coin_count)["symbol"].tolist()
 else:
     symbols_to_scan = tickers["symbol"].tolist()
 
 if not symbols_to_scan:
-    st.warning(
-        "Filtrelere uygun parite bulunamadı. Minimum hacmi azalt."
-    )
+    st.warning("Filtrelere uygun parite yok. Minimum hacmi düşür.")
     st.stop()
 
 st.caption(
-    f"Tarama listesi: {len(symbols_to_scan)} parite | "
-    "Zaman dilimi: 15 dakika | Hedef: 1.000 tamamlanmış mum"
+    f"{len(symbols_to_scan)} parite | 15 dakika | "
+    "Hedef: 1.000 tamamlanmış mum"
 )
 
 
-# ============================================================
-# RUN SCAN
-# ============================================================
+# ---------------------------------------------------------
+# SCAN
+# ---------------------------------------------------------
 
 if "results" not in st.session_state:
     st.session_state["results"] = []
@@ -684,22 +576,15 @@ if st.button(
     progress = st.progress(0)
     status = st.empty()
 
-    with ThreadPoolExecutor(
-        max_workers=MAX_WORKERS
-    ) as executor:
-
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
-            executor.submit(
-                analyze_symbol,
-                symbol,
-                epochs
-            ): symbol
+            executor.submit(analyze_symbol, symbol, epochs): symbol
             for symbol in symbols_to_scan
         }
 
         total = len(futures)
 
-        for i, future in enumerate(
+        for index, future in enumerate(
             as_completed(futures),
             start=1
         ):
@@ -713,13 +598,12 @@ if st.button(
                     "error": str(exc)[:500]
                 })
 
-            progress.progress(i / total)
+            progress.progress(index / total)
             status.write(
-                f"Analiz ediliyor: {symbol} ({i}/{total})"
+                f"Analiz: {symbol} ({index}/{total})"
             )
 
     st.session_state["results"] = results
-
     progress.empty()
     status.empty()
 
@@ -727,9 +611,9 @@ if st.button(
     st.rerun()
 
 
-# ============================================================
+# ---------------------------------------------------------
 # RESULTS
-# ============================================================
+# ---------------------------------------------------------
 
 results = st.session_state["results"]
 
@@ -739,13 +623,8 @@ if results:
     if "error" not in result_df.columns:
         result_df["error"] = None
 
-    successful = result_df[
-        result_df["error"].isna()
-    ].copy()
-
-    failed = result_df[
-        result_df["error"].notna()
-    ].copy()
+    successful = result_df[result_df["error"].isna()].copy()
+    failed = result_df[result_df["error"].notna()].copy()
 
     if not successful.empty:
         successful = successful.sort_values(
@@ -753,11 +632,7 @@ if results:
             ascending=[False, False]
         ).reset_index(drop=True)
 
-        successful.insert(
-            0,
-            "rank",
-            np.arange(1, len(successful) + 1)
-        )
+        successful.insert(0, "rank", np.arange(1, len(successful) + 1))
 
         successful["up_pct"] = (
             successful["up_probability"] * 100
@@ -775,31 +650,25 @@ if results:
             successful["balanced_accuracy"] * 100
         ).round(2)
 
-        col1, col2, col3, col4 = st.columns(4)
+        c1, c2, c3, c4 = st.columns(4)
 
-        col1.metric(
-            "Başarılı analiz",
-            len(successful)
-        )
-
-        col2.metric(
+        c1.metric("Başarılı analiz", len(successful))
+        c2.metric(
             "BUY",
             int((successful["signal"] == "BUY").sum())
         )
-
-        col3.metric(
+        c3.metric(
             "SELL",
             int((successful["signal"] == "SELL").sum())
         )
-
-        col4.metric(
+        c4.metric(
             "HOLD",
             int((successful["signal"] == "HOLD").sum())
         )
 
-        st.subheader("🏆 LSTM sinyal sıralaması")
+        st.subheader("🏆 LSTM sıralaması")
 
-        display_columns = [
+        columns = [
             "rank",
             "symbol",
             "signal",
@@ -813,7 +682,7 @@ if results:
             "validation_samples"
         ]
 
-        display_df = successful[display_columns].rename(
+        display = successful[columns].rename(
             columns={
                 "rank": "Sıra",
                 "symbol": "Parite",
@@ -830,16 +699,14 @@ if results:
         )
 
         st.dataframe(
-            display_df,
+            display,
             use_container_width=True,
             hide_index=True
         )
 
         st.download_button(
-            "📥 Sonuçları CSV indir",
-            data=successful.to_csv(
-                index=False
-            ).encode("utf-8-sig"),
+            "📥 CSV indir",
+            data=successful.to_csv(index=False).encode("utf-8-sig"),
             file_name="lstm_crypto_results.csv",
             mime="text/csv"
         )
@@ -847,7 +714,7 @@ if results:
         st.subheader("🔎 Parite detayı")
 
         selected_symbol = st.selectbox(
-            "Grafiğini görmek istediğin parite",
+            "Parite seç",
             successful["symbol"].tolist()
         )
 
@@ -857,31 +724,22 @@ if results:
 
         a, b, c, d = st.columns(4)
 
-        a.metric(
-            "Model sinyali",
-            selected["signal"]
-        )
-
+        a.metric("Sinyal", selected["signal"])
         b.metric(
             "Yükseliş olasılığı",
             f'{selected["up_probability"] * 100:.2f}%'
         )
-
         c.metric(
             "Düşüş olasılığı",
             f'{selected["down_probability"] * 100:.2f}%'
         )
-
         d.metric(
             "Doğrulama doğruluğu",
             f'{selected["accuracy"] * 100:.2f}%'
         )
 
         try:
-            chart_df = get_candles(
-                selected_symbol,
-                CANDLE_LIMIT
-            )
+            chart_df = get_candles(selected_symbol, CANDLE_LIMIT)
 
             if not chart_df.empty:
                 chart = chart_df.set_index("open_time")
@@ -890,12 +748,9 @@ if results:
                     f"{selected_symbol} — kapanış fiyatı"
                 )
 
-                st.line_chart(
-                    chart[["close"]],
-                    height=350
-                )
+                st.line_chart(chart[["close"]], height=350)
 
-                st.subheader("Mumların yüksek/düşük aralığı")
+                st.subheader("Yüksek/düşük fiyat aralığı")
 
                 st.area_chart(
                     chart[["low", "high"]],
@@ -913,14 +768,10 @@ if results:
                     )
 
         except Exception as exc:
-            st.warning(
-                f"Grafik verisi alınamadı: {exc}"
-            )
+            st.warning(f"Grafik yüklenemedi: {exc}")
 
     else:
-        st.warning(
-            "Başarılı analiz bulunamadı. Hata tablosunu kontrol et."
-        )
+        st.warning("Başarılı analiz bulunamadı.")
 
     if show_errors and not failed.empty:
         st.subheader("⚠️ Analiz hataları")
@@ -933,24 +784,23 @@ if results:
 
 else:
     st.write(
-        "Tarama henüz yapılmadı. Sol taraftaki ayarları seç ve "
-        "'LSTM taramasını başlat' düğmesine bas."
+        "Henüz tarama yapılmadı. Sol taraftaki ayarları seç "
+        "ve taramayı başlat."
     )
 
 
-# ============================================================
+# ---------------------------------------------------------
 # FOOTER
-# ============================================================
+# ---------------------------------------------------------
 
 st.divider()
 
 st.caption(
-    "Model, sonraki 15 dakikalık mumun yönünü sınıflandırmaya çalışır. "
+    "Model sonraki 15 dakikalık mumun yönünü sınıflandırmaya çalışır. "
     "Geçmiş doğruluk gelecekteki performansı garanti etmez."
 )
 
 st.caption(
-    "Uygulama emir göndermez ve otomatik alım satım yapmaz. "
-    "UTC zamanı: "
+    "Otomatik alım satım yoktur. UTC: "
     + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 )
