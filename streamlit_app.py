@@ -8,26 +8,23 @@ import requests
 import streamlit as st
 
 # =========================================================
-# CONFIG
+# AYARLAR
 # =========================================================
 
 st.set_page_config(
-    page_title="Monthly Crypto Bottom Scanner",
-    page_icon="📉",
+    page_title="Hyperactive Binance Spot Scanner",
+    page_icon="⚡",
     layout="wide",
 )
 
-BINANCE = "https://api.binance.com"
-GATE = "https://api.gateio.ws/api/v4"
-
+API = "https://api.binance.com"
 INTERVAL = "15m"
 INTERVAL_SECONDS = 900
-BARS_30_DAYS = 30 * 24 * 4  # 2,880 completed candles
-LOOKBACK_SECONDS = 30 * 24 * 60 * 60
+BARS_30_DAYS = 30 * 24 * 4
 REQUEST_TIMEOUT = 20
 
 HEADERS = {
-    "User-Agent": "MonthlyCryptoBottomScanner/1.0",
+    "User-Agent": "HyperactiveSpotScanner/1.0",
     "Accept": "application/json",
 }
 
@@ -36,12 +33,12 @@ session.headers.update(HEADERS)
 
 
 # =========================================================
-# HTTP
+# API YARDIMCILARI
 # =========================================================
 
-def get_json(url, params=None):
+def get_json(path, params=None):
     response = session.get(
-        url,
+        f"{API}{path}",
         params=params,
         timeout=REQUEST_TIMEOUT,
     )
@@ -50,14 +47,14 @@ def get_json(url, params=None):
 
 
 # =========================================================
-# BINANCE ACTIVE SPOT USDT MARKETS
+# AKTİF BINANCE SPOT USDT MARKETLERİ
 # =========================================================
 
-def get_binance_markets():
-    data = get_json(f"{BINANCE}/api/v3/exchangeInfo")
+def get_markets():
+    info = get_json("/api/v3/exchangeInfo")
     markets = []
 
-    for item in data.get("symbols", []):
+    for item in info.get("symbols", []):
         if item.get("status") != "TRADING":
             continue
 
@@ -75,28 +72,28 @@ def get_binance_markets():
         markets.append({
             "symbol": symbol,
             "market_id": symbol,
-            "base": item.get("baseAsset", ""),
-            "provider": "Binance",
+            "base_asset": item.get("baseAsset", ""),
         })
 
     if not markets:
-        raise RuntimeError("Binance aktif Spot USDT marketi bulunamadı.")
+        raise RuntimeError("Aktif Binance Spot USDT marketi bulunamadı.")
 
     return markets
 
 
-def get_binance_tickers():
-    data = get_json(f"{BINANCE}/api/v3/ticker/24hr")
+def get_tickers():
+    data = get_json("/api/v3/ticker/24hr")
     tickers = {}
 
     for item in data:
-        symbol = item.get("symbol")
-
         try:
-            tickers[symbol] = {
+            tickers[item["symbol"]] = {
                 "price": float(item["lastPrice"]),
-                "volume": float(item["quoteVolume"]),
+                "quote_volume": float(item["quoteVolume"]),
                 "change_24h": float(item["priceChangePercent"]),
+                "high_24h": float(item["highPrice"]),
+                "low_24h": float(item["lowPrice"]),
+                "trades_24h": int(item["count"]),
             }
         except (KeyError, TypeError, ValueError):
             continue
@@ -105,90 +102,30 @@ def get_binance_tickers():
 
 
 # =========================================================
-# GATE.IO ACTIVE SPOT USDT MARKETS
+# MUM VERİSİNİ SAYFALAYARAK ÇEK
 # =========================================================
 
-def get_gate_markets():
-    data = get_json(f"{GATE}/spot/currency_pairs")
-    markets = []
-
-    for item in data:
-        market_id = item.get("id", "")
-        base = item.get("base", "")
-        quote = item.get("quote", "")
-
-        if not market_id or not base or quote != "USDT":
-            continue
-
-        status = str(item.get("trade_status", "")).lower()
-
-        # Exclude unknown or non-tradable market states.
-        if status != "tradable":
-            continue
-
-        if item.get("delisted") is True:
-            continue
-
-        markets.append({
-            "symbol": f"{base}USDT",
-            "market_id": market_id,
-            "base": base,
-            "provider": "Gate.io",
-        })
-
-    if not markets:
-        raise RuntimeError("Gate.io aktif Spot USDT marketi bulunamadı.")
-
-    return markets
-
-
-def get_gate_tickers():
-    data = get_json(f"{GATE}/spot/tickers")
-    tickers = {}
-
-    for item in data:
-        market_id = item.get("currency_pair", "")
-
-        if not market_id.endswith("_USDT"):
-            continue
-
-        try:
-            tickers[market_id] = {
-                "price": float(item["last"]),
-                "volume": float(item["quote_volume"]),
-                "change_24h": float(item["change_percentage"]),
-            }
-        except (KeyError, TypeError, ValueError):
-            continue
-
-    return tickers
-
-
-# =========================================================
-# BINANCE: PAGINATED 30-DAY CANDLES
-# =========================================================
-
-def load_binance_candles(market_id):
+def load_30_day_candles(symbol):
     now = int(datetime.now(timezone.utc).timestamp())
-    current_candle_start = (now // INTERVAL_SECONDS) * INTERVAL_SECONDS
+    current_start = (now // INTERVAL_SECONDS) * INTERVAL_SECONDS
 
-    # Request extra history so that 2,880 completed candles remain
-    # after removing the current, potentially incomplete candle.
-    start = current_candle_start - (BARS_30_DAYS + 10) * INTERVAL_SECONDS
-    end = current_candle_start
+    # 30 gün + ek mumlar; güncel tamamlanmamış mum sonradan çıkarılır.
+    start_time = (
+        current_start - (BARS_30_DAYS + 10) * INTERVAL_SECONDS
+    ) * 1000
 
+    end_time = current_start * 1000
+    cursor = start_time
     rows = []
-    cursor = start * 1000
-    end_ms = end * 1000
 
-    while cursor < end_ms:
+    while cursor < end_time:
         raw = get_json(
-            f"{BINANCE}/api/v3/klines",
+            "/api/v3/klines",
             params={
-                "symbol": market_id,
+                "symbol": symbol,
                 "interval": INTERVAL,
                 "startTime": cursor,
-                "endTime": end_ms,
+                "endTime": end_time,
                 "limit": 1000,
             },
         )
@@ -205,12 +142,13 @@ def load_binance_candles(market_id):
                     "low": float(candle[3]),
                     "close": float(candle[4]),
                     "volume": float(candle[5]),
+                    "quote_volume": float(candle[7]),
+                    "trades": int(candle[8]),
                 })
             except (ValueError, TypeError, IndexError):
                 continue
 
-        last_open_ms = int(raw[-1][0])
-        next_cursor = last_open_ms + INTERVAL_SECONDS * 1000
+        next_cursor = int(raw[-1][0]) + INTERVAL_SECONDS * 1000
 
         if next_cursor <= cursor:
             break
@@ -220,103 +158,24 @@ def load_binance_candles(market_id):
         if len(raw) < 1000:
             break
 
-        time.sleep(0.05)
+        time.sleep(0.04)
 
-    return clean_candles(rows)
-
-
-# =========================================================
-# GATE.IO: PAGINATED 30-DAY CANDLES
-# =========================================================
-
-def load_gate_candles(market_id):
-    now = int(datetime.now(timezone.utc).timestamp())
-    current_candle_start = (now // INTERVAL_SECONDS) * INTERVAL_SECONDS
-
-    start = current_candle_start - (
-        BARS_30_DAYS + 10
-    ) * INTERVAL_SECONDS
-
-    end = current_candle_start
-
-    rows = []
-    cursor = start
-
-    while cursor < end:
-        page_end = min(
-            cursor + 999 * INTERVAL_SECONDS,
-            end,
-        )
-
-        raw = get_json(
-            f"{GATE}/spot/candlesticks",
-            params={
-                "currency_pair": market_id,
-                "interval": INTERVAL,
-                "from": cursor,
-                "to": page_end,
-                "limit": 1000,
-            },
-        )
-
-        if not raw:
-            break
-
-        for candle in raw:
-            if len(candle) < 6:
-                continue
-
-            try:
-                rows.append({
-                    "timestamp": int(candle[0]),
-                    "open": float(candle[5]),
-                    "high": float(candle[3]),
-                    "low": float(candle[4]),
-                    "close": float(candle[2]),
-                    "volume": float(candle[6])
-                    if len(candle) > 6 else 0.0,
-                })
-            except (ValueError, TypeError, IndexError):
-                continue
-
-        cursor = page_end + INTERVAL_SECONDS
-        time.sleep(0.05)
-
-    return clean_candles(rows)
-
-
-# =========================================================
-# CLEAN AND VALIDATE CANDLES
-# =========================================================
-
-def clean_candles(rows):
     df = pd.DataFrame(rows)
 
-    required = [
-        "timestamp", "open", "high", "low", "close", "volume"
-    ]
-
     if df.empty:
-        return pd.DataFrame(columns=required)
-
-    for column in required:
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce",
-        )
+        return df
 
     df = (
-        df.dropna(subset=required)
-        .drop_duplicates(subset=["timestamp"])
+        df.drop_duplicates(subset=["timestamp"])
         .sort_values("timestamp")
         .reset_index(drop=True)
     )
 
-    # Remove current incomplete candle.
+    # Sadece tamamlanmış mumlar.
     now = int(datetime.now(timezone.utc).timestamp())
-    current_candle_start = (now // INTERVAL_SECONDS) * INTERVAL_SECONDS
+    current_start = (now // INTERVAL_SECONDS) * INTERVAL_SECONDS
 
-    df = df[df["timestamp"] < current_candle_start].copy()
+    df = df[df["timestamp"] < current_start].copy()
 
     df = df[
         (df["open"] > 0)
@@ -324,212 +183,253 @@ def clean_candles(rows):
         & (df["low"] > 0)
         & (df["close"] > 0)
         & (df["high"] >= df["low"])
-        & (df["high"] >= df["open"])
-        & (df["high"] >= df["close"])
-        & (df["low"] <= df["open"])
-        & (df["low"] <= df["close"])
-    ].copy()
+    ]
 
     return df.reset_index(drop=True)
 
 
-def load_candles(market):
-    if market["provider"] == "Binance":
-        return load_binance_candles(market["market_id"])
+# =========================================================
+# TEKNİK GÖSTERGELER
+# =========================================================
 
-    if market["provider"] == "Gate.io":
-        return load_gate_candles(market["market_id"])
+def calculate_rsi(close, period=14):
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
-    raise RuntimeError("Bilinmeyen borsa.")
+    avg_gain = gain.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period,
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period,
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - 100 / (1 + rs)
+
+
+def calculate_atr(df, period=14):
+    previous_close = df["close"].shift(1)
+
+    tr = pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - previous_close).abs(),
+            (df["low"] - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    return tr.rolling(period).mean()
 
 
 # =========================================================
-# MONTHLY BOTTOM ANALYSIS
+# AYLIK DİP + HİPERAKTİFLİK
 # =========================================================
 
-def analyze_monthly_bottom(
-    df,
-    max_distance_pct=10.0,
-    require_three_rising=True,
-):
+def analyze_market(df, ticker, max_bottom_distance=10.0):
     if len(df) < BARS_30_DAYS:
         return {
             "valid": False,
             "reason": (
-                f"Yalnızca {len(df)} tamamlanmış mum var; "
-                f"{BARS_30_DAYS} gerekli."
+                f"Yeterli aylık geçmiş yok: {len(df)} / "
+                f"{BARS_30_DAYS} tamamlanmış mum."
             ),
         }
 
-    # Exact latest 30 days of completed 15-minute candles.
-    recent = df.tail(BARS_30_DAYS).reset_index(drop=True)
+    month = df.tail(BARS_30_DAYS).reset_index(drop=True)
 
-    bottom_position = int(
-        recent["low"].to_numpy().argmin()
-    )
+    # Aylık en düşük fiyat.
+    bottom_pos = int(month["low"].to_numpy().argmin())
+    bottom_price = float(month.iloc[bottom_pos]["low"])
+    current_price = float(month.iloc[-1]["close"])
 
-    bottom_price = float(
-        recent.iloc[bottom_position]["low"]
-    )
+    if bottom_price <= 0:
+        return {"valid": False, "reason": "Geçersiz dip fiyatı."}
 
-    current_price = float(
-        recent.iloc[-1]["close"]
-    )
+    distance_pct = (current_price / bottom_price - 1) * 100
 
-    distance_pct = (
-        (current_price - bottom_price) / bottom_price * 100
-        if bottom_price > 0 else np.nan
-    )
-
-    last_three = recent.tail(3)
-
-    closes = last_three["close"].to_numpy()
-    opens = last_three["open"].to_numpy()
+    # Son üç tamamlanmış mum.
+    last3 = month.tail(3)
+    closes = last3["close"].to_numpy()
+    opens = last3["open"].to_numpy()
 
     three_rising = bool(
-        len(closes) == 3
-        and closes[0] < closes[1] < closes[2]
+        closes[0] < closes[1] < closes[2]
     )
 
-    latest_green = bool(
-        closes[-1] > opens[-1]
-    )
-
-    bottom_before_last_three = (
-        bottom_position < len(recent) - 3
-    )
+    last_green = bool(closes[-1] > opens[-1])
+    bottom_before_last3 = bottom_pos < len(month) - 3
 
     near_bottom = bool(
-        np.isfinite(distance_pct)
-        and 0 <= distance_pct <= max_distance_pct
+        0 <= distance_pct <= max_bottom_distance
     )
 
-    reversal = bool(
+    # Hacim ve oynaklık metrikleri.
+    month["return"] = month["close"].pct_change()
+    month["atr"] = calculate_atr(month)
+    month["rsi"] = calculate_rsi(month["close"])
+
+    atr_pct = (
+        float(month["atr"].iloc[-1] / current_price * 100)
+        if pd.notna(month["atr"].iloc[-1])
+        else np.nan
+    )
+
+    # Ortalama 24 saatlik quote hacmi:
+    # son 96 adet 15 dakikalık mumun quote hacmi toplamı.
+    quote_volume = month["quote_volume"].fillna(0)
+    volume_24h = float(quote_volume.tail(96).sum())
+
+    # 24 saatlik gerçekleşmiş oynaklık: 15 dakikalık getirilerin
+    # standart sapması, 96 dönem üzerinden yıllıklandırılmadan yüzde.
+    returns_24h = month["return"].tail(96).dropna()
+    volatility_24h_pct = (
+        float(returns_24h.std(ddof=1) * np.sqrt(96) * 100)
+        if len(returns_24h) >= 48
+        else np.nan
+    )
+
+    # Hareketliliği ölçen puan. Sıralama puanıdır; olasılık değildir.
+    volume_score = min(
+        100,
+        max(0, np.log10(max(volume_24h, 1)) * 10),
+    )
+
+    volatility_score = (
+        min(100, max(0, volatility_24h_pct * 5))
+        if pd.notna(volatility_24h_pct)
+        else 0
+    )
+
+    activity_score = (
+        0.5 * volume_score + 0.5 * volatility_score
+    )
+
+    # Her iki koşulun da aynı anda karşılanması gerekir.
+    is_hyperactive = bool(
+        volume_24h > 0
+        and pd.notna(volatility_24h_pct)
+        and volatility_24h_pct > 0
+    )
+
+    is_monthly_bottom_reversal = bool(
         near_bottom
-        and bottom_before_last_three
-        and latest_green
-        and (
-            three_rising
-            if require_three_rising
-            else True
-        )
+        and bottom_before_last3
+        and three_rising
+        and last_green
+        and is_hyperactive
     )
 
-    if reversal:
-        signal = "AYLIK DİPTEN DÖNÜŞ"
-    elif three_rising and latest_green:
-        signal = "YÜKSELİYOR"
+    if is_monthly_bottom_reversal:
+        signal = "HİPERAKTİF AYLIK DİP DÖNÜŞÜ"
+    elif near_bottom and is_hyperactive:
+        signal = "AYLIK DİBE YAKIN / HİPERAKTİF"
+    elif three_rising and last_green:
+        signal = "YÜKSELİŞ MOMENTUMU"
     else:
-        signal = "BEKLE"
-
-    bottom_timestamp = int(
-        recent.iloc[bottom_position]["timestamp"]
-    )
+        signal = "DİĞER"
 
     bottom_time = datetime.fromtimestamp(
-        bottom_timestamp,
+        int(month.iloc[bottom_pos]["timestamp"]),
         tz=timezone.utc,
     ).strftime("%Y-%m-%d %H:%M UTC")
 
     return {
         "valid": True,
-        "bottom_price": bottom_price,
-        "current_price": current_price,
-        "distance_pct": distance_pct,
-        "bottom_time": bottom_time,
-        "three_rising": three_rising,
-        "latest_green": latest_green,
-        "near_bottom": near_bottom,
-        "bottom_before_last_three": bottom_before_last_three,
-        "reversal": reversal,
+        "price": current_price,
+        "monthly_bottom": bottom_price,
+        "bottom_time_utc": bottom_time,
+        "distance_from_bottom_pct": distance_pct,
+        "three_rising_candles": three_rising,
+        "latest_candle_green": last_green,
+        "near_monthly_bottom": near_bottom,
+        "volume_24h_usdt": volume_24h,
+        "volatility_24h_pct": volatility_24h_pct,
+        "atr_pct": atr_pct,
+        "rsi_14": (
+            float(month["rsi"].iloc[-1])
+            if pd.notna(month["rsi"].iloc[-1])
+            else np.nan
+        ),
+        "activity_score": activity_score,
+        "is_hyperactive": is_hyperactive,
+        "is_monthly_bottom_reversal": is_monthly_bottom_reversal,
         "signal": signal,
-        "bars": len(recent),
+        "candles_30d": len(month),
     }
 
 
 # =========================================================
-# SCAN ONE MARKET
+# SCAN
 # =========================================================
 
-def scan_market(market, ticker, max_distance_pct):
-    df = load_candles(market)
+def scan_one_market(market, ticker, max_bottom_distance):
+    df = load_30_day_candles(market["market_id"])
 
-    analysis = analyze_monthly_bottom(
+    analysis = analyze_market(
         df,
-        max_distance_pct=max_distance_pct,
-        require_three_rising=True,
+        ticker,
+        max_bottom_distance=max_bottom_distance,
     )
 
     if not analysis.get("valid"):
-        raise RuntimeError(analysis.get("reason", "Veri yetersiz."))
+        raise RuntimeError(analysis.get("reason", "Analiz yapılamadı."))
 
-    candle_price = float(analysis["current_price"])
-    ticker_price = float(ticker.get("price", 0.0))
+    candle_price = float(analysis["price"])
+    ticker_price = float(ticker["price"])
 
     if candle_price <= 0 or ticker_price <= 0:
-        raise RuntimeError("Geçersiz fiyat.")
+        raise RuntimeError("Geçersiz fiyat verisi.")
 
-    price_difference_pct = (
-        abs(ticker_price - candle_price)
-        / candle_price * 100
-    )
-
-    # If prices differ substantially, mark the result as unreliable.
-    # This can happen when markets move quickly or APIs update at
-    # slightly different times.
-    price_check = price_difference_pct <= 2.0
+    price_diff_pct = abs(
+        ticker_price - candle_price
+    ) / candle_price * 100
 
     return {
         "symbol": market["symbol"],
         "market_id": market["market_id"],
-        "provider": market["provider"],
-        "current_close_15m": candle_price,
+        "price": candle_price,
         "ticker_price": ticker_price,
-        "price_difference_pct": round(
-            price_difference_pct, 4
-        ),
-        "price_check_ok": price_check,
-        "volume_24h_usdt": ticker.get("volume", 0.0),
-        "change_24h_pct": ticker.get("change_24h", 0.0),
-        "monthly_bottom": analysis["bottom_price"],
-        "monthly_bottom_time_utc": analysis["bottom_time"],
-        "distance_from_bottom_pct": round(
-            analysis["distance_pct"], 4
-        ),
-        "three_rising_candles": analysis["three_rising"],
-        "latest_candle_green": analysis["latest_green"],
-        "near_monthly_bottom": analysis["near_bottom"],
-        "signal": analysis["signal"],
-        "is_monthly_reversal": analysis["reversal"],
-        "candles_30d": analysis["bars"],
+        "price_difference_pct": price_diff_pct,
+        "price_check_ok": price_diff_pct <= 2,
+        "change_24h_pct": ticker["change_24h"],
+        "ticker_quote_volume_24h": ticker["quote_volume"],
+        "trades_24h": ticker["trades_24h"],
+        **analysis,
     }
 
 
 # =========================================================
-# STREAMLIT UI
+# STREAMLIT ARAYÜZÜ
 # =========================================================
 
-st.title("📉 Aylık Dipten Dönüş Coin Tarayıcı")
+st.title("⚡ Hiperaktif Binance Spot Coin Tarayıcı")
 
 st.write(
-    "Aktif Spot USDT marketlerini tarar, son 30 günün en düşük "
-    "fiyatını bulur ve bu dipten yükselmeye başlayan coinleri "
-    "ayrı listeler. Otomatik işlem yapmaz."
+    "Yüksek hacimli ve oynak, son 30 günün dip seviyesine yakın "
+    "coinleri bulur. Son üç tamamlanmış 15 dakikalık mumun "
+    "kapanışları art arda yükseliyorsa dipten dönüş adayı olarak "
+    "işaretler. Emir göndermez."
 )
 
 st.warning(
-    "Aylık dipten dönüş sinyali fiyatın yükselmeye devam edeceğini "
-    "garanti etmez. Düşük hacimli coinlerde spread ve likidite "
-    "riskleri özellikle yüksek olabilir."
+    "Hiperaktiflik puanı bir getiri olasılığı değildir. Yüksek "
+    "oynaklık hem hızlı kazanç hem de hızlı kayıp anlamına gelebilir."
 )
 
 with st.sidebar:
     st.header("Tarama Ayarları")
 
-    max_distance_pct = st.slider(
+    max_bottom_distance = st.slider(
         "Aylık dipten maksimum uzaklık (%)",
         min_value=1.0,
-        max_value=30.0,
+        max_value=10.0,
         value=10.0,
         step=0.5,
     )
@@ -537,8 +437,16 @@ with st.sidebar:
     min_volume = st.number_input(
         "Minimum 24 saatlik hacim (USDT)",
         min_value=0,
-        value=10000,
-        step=10000,
+        value=100000,
+        step=50000,
+    )
+
+    min_volatility = st.number_input(
+        "Minimum 24 saatlik yıllıklandırılmamış oynaklık (%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=1.0,
+        step=0.5,
     )
 
     scan_count = st.number_input(
@@ -549,44 +457,24 @@ with st.sidebar:
         step=25,
     )
 
-    mode = st.selectbox(
-        "Market sıralaması",
-        ["En yüksek hacim", "API listesindeki sıra"],
-    )
-
-    start_scan = st.button(
-        "🔍 Taramayı Başlat",
+    scan_button = st.button(
+        "🔍 Binance Spot Tara",
         type="primary",
         use_container_width=True,
     )
 
 
-if "results" not in st.session_state:
-    st.session_state["results"] = None
+if "scan_results" not in st.session_state:
+    st.session_state["scan_results"] = None
 
 
-if start_scan:
+if scan_button:
     progress = st.progress(0)
-    status_box = st.empty()
+    status = st.empty()
 
     try:
-        # Prefer Binance. If unreachable, use Gate.io's own markets.
-        try:
-            markets = get_binance_markets()
-            tickers = get_binance_tickers()
-            provider = "Binance"
-
-        except Exception as binance_error:
-            st.warning(
-                "Binance API erişilemedi. Gate.io verileri deneniyor. "
-                "Gate.io marketleri Binance marketleriyle aynı kabul "
-                "edilmez. Binance hatası: "
-                f"{str(binance_error)[:200]}"
-            )
-
-            markets = get_gate_markets()
-            tickers = get_gate_tickers()
-            provider = "Gate.io"
+        markets = get_markets()
+        tickers = get_tickers()
 
         candidates = []
 
@@ -596,7 +484,7 @@ if start_scan:
             if ticker is None:
                 continue
 
-            if ticker.get("volume", 0.0) < min_volume:
+            if ticker["quote_volume"] < min_volume:
                 continue
 
             candidates.append({
@@ -604,186 +492,191 @@ if start_scan:
                 **ticker,
             })
 
-        if mode == "En yüksek hacim":
-            candidates.sort(
-                key=lambda item: item.get("volume", 0.0),
-                reverse=True,
-            )
+        candidates.sort(
+            key=lambda item: item["quote_volume"],
+            reverse=True,
+        )
 
         candidates = candidates[:int(scan_count)]
 
         if not candidates:
             raise RuntimeError(
-                "Filtrelerden geçen market yok. Minimum hacmi "
-                "düşürüp yeniden deneyin."
+                "Hacim filtresinden geçen aktif market bulunamadı."
             )
 
         st.info(
-            f"Kaynak: {provider} | "
-            f"Aktif market sayısı: {len(markets)} | "
-            f"Taranacak: {len(candidates)}"
+            f"Binance aktif Spot USDT marketi: {len(markets)} | "
+            f"Analiz edilecek: {len(candidates)}"
         )
 
         results = []
         errors = []
 
-        for index, market in enumerate(candidates):
-            status_box.write(
-                f"{index + 1}/{len(candidates)} — "
-                f"{market['symbol']} [{market['market_id']}]"
+        for i, market in enumerate(candidates):
+            status.write(
+                f"{i + 1}/{len(candidates)} — {market['symbol']}"
             )
 
             ticker = tickers[market["market_id"]]
 
             try:
-                result = scan_market(
+                result = scan_one_market(
                     market,
                     ticker,
-                    max_distance_pct,
+                    max_bottom_distance,
                 )
                 results.append(result)
 
-            except Exception as error:
+            except Exception as exc:
                 errors.append({
                     "symbol": market["symbol"],
                     "market_id": market["market_id"],
-                    "provider": market["provider"],
-                    "error": str(error)[:250],
+                    "error": str(exc)[:250],
                 })
 
-            progress.progress(
-                (index + 1) / len(candidates)
-            )
+            progress.progress((i + 1) / len(candidates))
+            time.sleep(0.05)
 
-            time.sleep(0.08)
-
-        st.session_state["results"] = pd.DataFrame(results)
-        st.session_state["errors"] = pd.DataFrame(errors)
-        st.session_state["provider"] = provider
+        st.session_state["scan_results"] = pd.DataFrame(results)
+        st.session_state["scan_errors"] = pd.DataFrame(errors)
         st.session_state["scan_time"] = datetime.now(
             timezone.utc
         ).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-        status_box.success(
-            f"Tarama tamamlandı: {len(results)} başarılı, "
-            f"{len(errors)} hatalı market."
+        status.success(
+            f"Tamamlandı: {len(results)} analiz, {len(errors)} hata."
         )
 
-    except Exception as error:
-        st.error(f"Tarama başlatılamadı: {error}")
+    except Exception as exc:
+        st.error(f"Tarama başarısız: {exc}")
 
 
 # =========================================================
-# DISPLAY RESULTS
+# RESULTS
 # =========================================================
 
-results = st.session_state.get("results")
+results = st.session_state.get("scan_results")
 
 if results is not None:
     if results.empty:
         st.warning(
-            "Analiz sonucu yok. Hata listesini inceleyin veya "
-            "tarama ayarlarını değiştirin."
+            "Sonuç yok. Hata listesini kontrol edin veya filtreleri azaltın."
         )
-
     else:
         st.caption(
-            f"Kaynak: {st.session_state.get('provider', '-')}"
-            f" | Son tarama: {st.session_state.get('scan_time', '-')}"
+            "Son tarama: "
+            + st.session_state.get("scan_time", "-")
         )
 
-        # Only trust results whose market price checks pass.
         verified = results[
             results["price_check_ok"] == True
         ].copy()
 
-        reversals = verified[
-            verified["is_monthly_reversal"] == True
+        # Apply BOTH activity filters: high volume and volatility.
+        hyperactive = verified[
+            (verified["ticker_quote_volume_24h"] >= min_volume)
+            & (verified["volatility_24h_pct"] >= min_volatility)
+            & (verified["is_hyperactive"] == True)
+        ].copy()
+
+        monthly_reversals = hyperactive[
+            hyperactive["is_monthly_bottom_reversal"] == True
         ].sort_values(
-            "distance_from_bottom_pct",
-            ascending=True,
+            "activity_score",
+            ascending=False,
         )
 
-        rising = verified[
-            (verified["three_rising_candles"] == True)
-            & (verified["latest_candle_green"] == True)
+        rising_near_bottom = hyperactive[
+            (hyperactive["near_monthly_bottom"] == True)
+            & (hyperactive["three_rising_candles"] == True)
+            & (hyperactive["latest_candle_green"] == True)
         ].sort_values(
-            "distance_from_bottom_pct",
-            ascending=True,
+            "activity_score",
+            ascending=False,
         )
 
         c1, c2, c3, c4 = st.columns(4)
-
         c1.metric("Analiz edilen", len(results))
-        c2.metric("Fiyat kontrolünden geçen", len(verified))
-        c3.metric("Aylık dipten dönüş", len(reversals))
-        c4.metric("Son 3 mumu yükselen", len(rising))
+        c2.metric("Fiyat kontrolü geçen", len(verified))
+        c3.metric("Hiperaktif", len(hyperactive))
+        c4.metric("Aylık dipten dönüş", len(monthly_reversals))
 
         columns = [
             "symbol",
             "market_id",
-            "provider",
-            "current_close_15m",
+            "price",
             "ticker_price",
             "price_difference_pct",
             "monthly_bottom",
-            "monthly_bottom_time_utc",
+            "bottom_time_utc",
             "distance_from_bottom_pct",
-            "three_rising_candles",
-            "latest_candle_green",
-            "signal",
             "volume_24h_usdt",
-            "change_24h_pct",
+            "volatility_24h_pct",
+            "atr_pct",
+            "rsi_14",
+            "trades_24h",
+            "activity_score",
+            "signal",
         ]
 
-        st.subheader("🎯 Aylık Dipten Dönüş Şartlarını Karşılayanlar")
+        st.subheader("🎯 Hiperaktif Aylık Dipten Dönüş Coinleri")
 
-        if reversals.empty:
+        if monthly_reversals.empty:
             st.info(
-                "Filtreleri karşılayan coin bulunamadı. Bu durum, "
-                "şartların aynı anda gerçekleşmemiş olmasından "
-                "kaynaklanabilir."
+                "Bu taramada bütün şartları karşılayan coin bulunamadı. "
+                "Hacim, oynaklık veya dip filtresi fazla katı olabilir."
             )
         else:
             st.dataframe(
-                reversals[columns],
+                monthly_reversals[columns],
                 use_container_width=True,
                 hide_index=True,
             )
 
             st.download_button(
-                "Aylık dipten dönüş CSV indir",
-                data=reversals.to_csv(
+                "Dipten dönüş CSV indir",
+                data=monthly_reversals.to_csv(
                     index=False
                 ).encode("utf-8-sig"),
-                file_name="aylik_dipten_donus.csv",
+                file_name="hiperaktif_aylik_dip_donus.csv",
                 mime="text/csv",
             )
 
-        st.subheader("📈 Son 3 Mumda Yükselen Coinler")
+        st.subheader("📈 Aylık Dibe Yakın ve Yükselenler")
 
         st.dataframe(
-            rising[columns],
+            rising_near_bottom[columns],
             use_container_width=True,
             hide_index=True,
         )
 
-        st.download_button(
-            "Yükselen coinler CSV indir",
-            data=rising.to_csv(
-                index=False
-            ).encode("utf-8-sig"),
-            file_name="son_uc_mum_yukselen_coinler.csv",
-            mime="text/csv",
-        )
+        st.subheader("⚡ Hiperaktif Coinlerin Tamamı")
+
+        if hyperactive.empty:
+            st.info("Hiperaktif filtrelerinden geçen coin yok.")
+        else:
+            st.dataframe(
+                hyperactive.sort_values(
+                    "activity_score",
+                    ascending=False,
+                )[columns],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            st.download_button(
+                "Hiperaktif coinleri CSV indir",
+                data=hyperactive.to_csv(
+                    index=False
+                ).encode("utf-8-sig"),
+                file_name="hiperaktif_binance_spot.csv",
+                mime="text/csv",
+            )
 
         st.subheader("📋 Tüm Analizler")
 
         st.dataframe(
-            results[columns + [
-                "price_check_ok",
-                "candles_30d",
-            ]],
+            results,
             use_container_width=True,
             hide_index=True,
         )
@@ -793,16 +686,14 @@ if results is not None:
             data=results.to_csv(
                 index=False
             ).encode("utf-8-sig"),
-            file_name="aylik_dip_tum_sonuclar.csv",
+            file_name="binance_spot_tum_analizler.csv",
             mime="text/csv",
         )
 
-        errors = st.session_state.get("errors")
+        errors = st.session_state.get("scan_errors")
 
         if errors is not None and not errors.empty:
-            with st.expander(
-                f"Veri hataları ({len(errors)})"
-            ):
+            with st.expander(f"Market hataları ({len(errors)})"):
                 st.dataframe(
                     errors,
                     use_container_width=True,
@@ -814,12 +705,11 @@ if results is not None:
                     data=errors.to_csv(
                         index=False
                     ).encode("utf-8-sig"),
-                    file_name="aylik_dip_hatalar.csv",
+                    file_name="binance_market_hatalari.csv",
                     mime="text/csv",
                 )
 
 else:
     st.info(
-        "Sol taraftaki ayarları belirleyip "
-        "'Taramayı Başlat' düğmesine basın."
+        "Tarama ayarlarını seçip 'Binance Spot Tara' düğmesine basın."
     )
