@@ -29,6 +29,19 @@ session = requests.Session()
 session.headers.update({"User-Agent": "HyperactiveSpotScanner/1.1"})
 
 
+def safe_dataframe(df):
+    """PyArrow/Streamlit için sütun adlarını benzersiz hale getirir."""
+    if df is None:
+        return pd.DataFrame()
+    out = df.copy()
+    out.columns = [
+        str(col) if list(out.columns).count(col) == 1
+        else f"{col}_{i}"
+        for i, col in enumerate(out.columns)
+    ]
+    return out
+
+
 def binance_json(path, params=None):
     errors = []
     for host in BINANCE_HOSTS:
@@ -624,47 +637,52 @@ if results is not None:
         st.subheader(
             "🎯 Doğrulanmış adaylar: sert düşüş + dip bölgesi + yükselen mumlar"
         )
-        st.dataframe(reversals[columns], use_container_width=True, hide_index=True)
+        st.dataframe(
+            safe_dataframe(reversals[columns]),
+            use_container_width=True,
+            hide_index=True,
+        )
         st.download_button(
             "Doğrulanmış adayları CSV indir",
-            reversals.to_csv(index=False).encode("utf-8-sig"),
+            safe_dataframe(reversals).to_csv(index=False).encode("utf-8-sig"),
             "90_percent_crash_bottom_reversals.csv",
             "text/csv",
         )
 
         st.subheader("📉 Zirvesinden gerileyen TÜM aktif coinler")
-        falling_columns = columns + [
+        falling_columns = list(dict.fromkeys(columns + [
             "candles_analyzed", "history_days_analyzed", "full_90d_history"
-        ]
+        ]))
         st.dataframe(
-            all_falling[falling_columns],
+            safe_dataframe(all_falling[falling_columns]),
             use_container_width=True,
             hide_index=True,
         )
         st.download_button(
             "Tüm düşen aktif coinleri CSV indir",
-            all_falling.to_csv(index=False).encode("utf-8-sig"),
+            safe_dataframe(all_falling).to_csv(index=False).encode("utf-8-sig"),
             "all_falling_active_spot_usdt_coins.csv",
             "text/csv",
         )
 
         st.subheader("🧊 Seçilen yüzde kadar düşen tüm coinler")
         st.dataframe(
-            crashed.sort_values(
+            safe_dataframe(crashed.sort_values(
                 "drop_from_90d_peak_pct", ascending=False
-            )[columns],
+            )[columns]),
             use_container_width=True,
             hide_index=True,
         )
         st.download_button(
             "90 günlük düşüş listesini CSV indir",
-            crashed.to_csv(index=False).encode("utf-8-sig"),
+            safe_dataframe(crashed).to_csv(index=False).encode("utf-8-sig"),
             "90_day_crash_list.csv",
             "text/csv",
         )
 
         st.subheader("📋 Tüm tarama sonuçları")
-        st.dataframe(results, use_container_width=True, hide_index=True)
+        results_display = safe_dataframe(results)
+        st.dataframe(results_display, use_container_width=True, hide_index=True)
         st.download_button(
             "Tüm sonuçları CSV indir",
             results_display.to_csv(index=False).encode("utf-8-sig"),
@@ -675,7 +693,11 @@ if results is not None:
         errors = st.session_state.get("errors")
         if errors is not None and not errors.empty:
             with st.expander(f"Piyasa hataları ({len(errors)})"):
-                st.dataframe(errors, use_container_width=True, hide_index=True)
+                st.dataframe(
+                    safe_dataframe(errors),
+                    use_container_width=True,
+                    hide_index=True,
+                )
                 st.download_button(
                     "Hata listesini CSV indir",
                     errors.to_csv(index=False).encode("utf-8-sig"),
