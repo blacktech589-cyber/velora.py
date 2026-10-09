@@ -6,49 +6,44 @@ import pandas as pd
 import streamlit as st
 
 # =========================================================
-# STREAMLIT
+# BINANCE USD-M FUTURES SCANNER
+# Public market data only. No orders are placed.
 # =========================================================
 
 st.set_page_config(
-    page_title="Binance All Coins Scanner",
-    page_icon="📊",
+    page_title="Binance Futures Scanner",
+    page_icon="📈",
     layout="wide"
 )
 
-st.title("📊 Binance All Coins BUY / SELL Scanner")
+st.title("📈 Binance USDⓈ-M Futures Scanner")
 st.caption(
-    "Binance Spot USDT | 15 dakika | 1.000 tamamlanmış mum | "
-    "Otomatik emir göndermez"
+    "USDT perpetual sözleşmeler | 15m | 1.000 tamamlanmış mum | "
+    "Sadece analiz, emir gönderilmez"
 )
-
-# =========================================================
-# AYARLAR
-# =========================================================
 
 INTERVAL = "15m"
 CANDLE_LIMIT = 1000
 EPOCHS = 350
 LEARNING_RATE = 0.05
 TEST_FRACTION = 0.20
-REQUEST_TIMEOUT = 15
+TIMEOUT = 15
 REQUEST_DELAY = 0.08
 
 BASE_URLS = [
-    "https://data-api.binance.vision",
-    "https://api.binance.com",
-    "https://api-gcp.binance.com",
-    "https://api1.binance.com",
-    "https://api2.binance.com",
-    "https://api3.binance.com",
-    "https://api4.binance.com",
+    "https://fapi.binance.com",
+    "https://fapi1.binance.com",
+    "https://fapi2.binance.com",
+    "https://fapi3.binance.com",
+    "https://fapi4.binance.com",
 ]
 
 session = requests.Session()
-session.headers.update({"User-Agent": "AllCoinsScanner/1.0"})
+session.headers.update({"User-Agent": "FuturesScanner/1.0"})
 
 
 # =========================================================
-# BINANCE API
+# API
 # =========================================================
 
 def api_get(path, params=None):
@@ -59,23 +54,20 @@ def api_get(path, params=None):
             response = session.get(
                 base + path,
                 params=params,
-                timeout=REQUEST_TIMEOUT
+                timeout=TIMEOUT
             )
 
             if response.status_code == 429:
                 time.sleep(2)
-                errors.append(f"{base}: HTTP 429")
+                errors.append(f"{base}: rate limit")
                 continue
 
             response.raise_for_status()
             data = response.json()
 
-            if isinstance(data, dict) and "code" in data:
-                if int(data.get("code", 0)) < 0:
-                    errors.append(
-                        f"{base}: {data.get('msg', 'Binance API hatası')}"
-                    )
-                    continue
+            if isinstance(data, dict) and int(data.get("code", 0)) < 0:
+                errors.append(str(data.get("msg", "API error")))
+                continue
 
             return data
 
@@ -83,48 +75,51 @@ def api_get(path, params=None):
             errors.append(f"{base}: {exc}")
 
     raise RuntimeError(
-        f"Binance API erişilemedi. Son hatalar: {' | '.join(errors[-3:])}"
+        f"Futures API erişilemedi: {' | '.join(errors[-3:])}"
     )
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def get_all_spot_usdt_symbols():
-    info = api_get("/api/v3/exchangeInfo")
-
+def get_futures_symbols():
+    info = api_get("/fapi/v1/exchangeInfo")
     symbols = []
 
     for item in info.get("symbols", []):
         if (
             item.get("status") == "TRADING"
             and item.get("quoteAsset") == "USDT"
-            and item.get("isSpotTradingAllowed", False)
+            and item.get("contractType") == "PERPETUAL"
         ):
             symbols.append(item["symbol"])
 
     if not symbols:
-        raise RuntimeError("İşlem yapılabilir Spot USDT paritesi bulunamadı.")
+        raise RuntimeError("İşlem yapılabilir USDT perpetual sözleşme bulunamadı.")
 
     return sorted(set(symbols))
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def get_all_24h_tickers():
-    return api_get("/api/v3/ticker/24hr")
+def get_futures_tickers():
+    return api_get("/fapi/v1/ticker/24hr")
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_all_funding_rates():
+    data = api_get("/fapi/v1/premiumIndex")
+    if isinstance(data, dict):
+        return [data]
+    return data
 
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_klines(symbol, interval="15m", limit=1000):
     raw = api_get(
-        "/api/v3/klines",
-        {
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit,
-        }
+        "/fapi/v1/klines",
+        {"symbol": symbol, "interval": interval, "limit": limit}
     )
 
     if not isinstance(raw, list) or len(raw) < 100:
-        raise ValueError("Yeterli mum verisi yok.")
+        raise ValueError("Yeterli Futures mum verisi yok.")
 
     columns = [
         "open_time", "open", "high", "low", "close", "volume",
@@ -151,12 +146,9 @@ def get_klines(symbol, interval="15m", limit=1000):
     df = df.dropna(
         subset=["open", "high", "low", "close", "volume"]
     )
-
-    # Yinelenen mumları kaldır.
     df = df.drop_duplicates(subset=["open_time"], keep="last")
     df = df.sort_values("open_time").reset_index(drop=True)
 
-    # Fiyat ve mum mantığı doğrulaması.
     valid = (
         (df["open"] > 0)
         & (df["high"] > 0)
@@ -167,28 +159,31 @@ def get_klines(symbol, interval="15m", limit=1000):
         & (df["high"] >= df[["open", "close"]].max(axis=1))
         & (df["low"] <= df[["open", "close"]].min(axis=1))
     )
-
     df = df.loc[valid].copy()
 
-    # Henüz kapanmamış son mumu çıkar.
+    # Henüz kapanmamış mumu kullanma.
     now = pd.Timestamp.now(tz="UTC")
     df = df[df["close_time"] <= now].copy()
     df = df.sort_values("open_time").reset_index(drop=True)
 
     if len(df) < 100:
-        raise ValueError("Doğrulamadan sonra yeterli mum kalmadı.")
+        raise ValueError("Doğrulama sonrası yeterli mum kalmadı.")
 
-    # 15 dakikalık aralıkta eksik mum kontrolü.
     gaps = df["open_time"].diff().dropna()
-    expected = pd.Timedelta(minutes=15)
-    gap_count = int((gaps != expected).sum())
+    df.attrs["gap_count"] = int(
+        (gaps != pd.Timedelta(minutes=15)).sum()
+    )
 
-    df.attrs["gap_count"] = gap_count
     return df
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def get_open_interest(symbol):
+    return api_get("/fapi/v1/openInterest", {"symbol": symbol})
+
+
 # =========================================================
-# GÖSTERGELER OLMADAN ÖZELLİK ÜRETİMİ
+# FEATURES
 # RSI, EMA, MACD VE BOLLINGER KULLANILMAZ.
 # =========================================================
 
@@ -201,7 +196,7 @@ def create_features(df):
 
     eps = 1e-12
 
-    returns = np.zeros(len(close), dtype=float)
+    returns = np.zeros(len(close))
     returns[1:] = close[1:] / np.maximum(close[:-1], eps) - 1
 
     ret = pd.Series(returns)
@@ -234,21 +229,21 @@ def create_features(df):
 
 
 # =========================================================
-# NUMPY LOJİSTİK REGRESYON
-# LSTM DEĞİLDİR; PYTORCH GEREKTİRMEZ.
+# NUMPY LOGISTIC REGRESSION
+# LSTM DEĞİLDİR.
 # =========================================================
 
 def sigmoid(z):
     return 1.0 / (1.0 + np.exp(-np.clip(z, -30, 30)))
 
 
-def train_logistic(X, y, epochs=EPOCHS, lr=LEARNING_RATE):
+def fit_model(X, y):
     n, p = X.shape
     weights = np.zeros(p)
     bias = 0.0
 
-    positives = max(np.sum(y == 1), 1)
-    negatives = max(np.sum(y == 0), 1)
+    positives = max(int(np.sum(y == 1)), 1)
+    negatives = max(int(np.sum(y == 0)), 1)
 
     sample_weights = np.where(
         y == 1,
@@ -256,33 +251,24 @@ def train_logistic(X, y, epochs=EPOCHS, lr=LEARNING_RATE):
         n / (2.0 * negatives)
     )
 
-    for _ in range(epochs):
+    for _ in range(EPOCHS):
         probs = sigmoid(X @ weights + bias)
         errors = (probs - y) * sample_weights
 
         grad_w = X.T @ errors / n + 0.001 * weights
         grad_b = float(np.mean(errors))
 
-        weights -= lr * grad_w
-        bias -= lr * grad_b
+        weights -= LEARNING_RATE * grad_w
+        bias -= LEARNING_RATE * grad_b
 
     return weights, bias
 
 
-def calculate_accuracy(y_true, probs):
-    preds = (probs >= 0.5).astype(int)
-    return float(np.mean(preds == y_true) * 100)
-
-
-# =========================================================
-# GEÇMİŞ TEST VE SON SİNYAL
-# =========================================================
-
-def analyze(df):
+def analyze_model(df):
     features = create_features(df)
     close = df["close"].to_numpy(dtype=float)
 
-    # Her mum için sonraki mumun yönü.
+    # Her mumun hedefi bir sonraki mumun yönüdür.
     future_returns = np.full(len(close), np.nan)
     future_returns[:-1] = (
         close[1:] - close[:-1]
@@ -292,7 +278,6 @@ def analyze(df):
 
     data = features.copy()
     data["target"] = targets
-    data["future_return"] = future_returns
     data = data.replace([np.inf, -np.inf], np.nan)
     data = data.dropna().reset_index(drop=True)
 
@@ -303,7 +288,7 @@ def analyze(df):
     X = data[feature_cols].to_numpy(dtype=float)
     y = data["target"].to_numpy(dtype=float)
 
-    # Zamana göre ayır: gelecek geçmiş eğitim verisine karışmaz.
+    # Zaman sıralı test: rastgele karıştırma yapılmaz.
     split = int(len(data) * (1 - TEST_FRACTION))
     split = max(100, min(split, len(data) - 25))
 
@@ -312,7 +297,7 @@ def analyze(df):
     X_test_raw = X[split:]
     y_test = y[split:]
 
-    # Ölçekleme parametreleri sadece eğitim bölümünden öğrenilir.
+    # Ölçekleme sadece eğitim verisinden öğrenilir.
     mean = X_train_raw.mean(axis=0)
     std = X_train_raw.std(axis=0)
     std[std < 1e-9] = 1.0
@@ -320,13 +305,14 @@ def analyze(df):
     X_train = np.clip((X_train_raw - mean) / std, -10, 10)
     X_test = np.clip((X_test_raw - mean) / std, -10, 10)
 
-    weights, bias = train_logistic(X_train, y_train)
+    weights, bias = fit_model(X_train, y_train)
 
     test_probs = sigmoid(X_test @ weights + bias)
-    accuracy = calculate_accuracy(y_test, test_probs)
+    test_preds = (test_probs >= 0.5).astype(int)
+    accuracy = float(np.mean(test_preds == y_test) * 100)
 
-    buy_mask = test_probs >= 0.5
-    sell_mask = ~buy_mask
+    buy_mask = test_preds == 1
+    sell_mask = test_preds == 0
 
     buy_accuracy = (
         float(np.mean(y_test[buy_mask] == 1) * 100)
@@ -337,20 +323,16 @@ def analyze(df):
         if sell_mask.any() else np.nan
     )
 
-    # Basit çoğunluk tahminiyle kıyaslama.
     baseline = float(
         max(np.mean(y_test == 0), np.mean(y_test == 1)) * 100
     )
 
-    # Son satırın özelliği için aynı ölçekleme.
-    last_raw = X[-1:]
-    last_x = np.clip((last_raw - mean) / std, -10, 10)
+    # Son tamamlanmış mum için sinyal.
+    last_x = np.clip((X[-1:] - mean) / std, -10, 10)
     up_prob = float(sigmoid(last_x @ weights + bias)[0])
 
-    signal = "BUY" if up_prob >= 0.5 else "SELL"
-
     return {
-        "signal": signal,
+        "signal": "BUY" if up_prob >= 0.5 else "SELL",
         "up_prob": up_prob,
         "down_prob": 1 - up_prob,
         "accuracy": accuracy,
@@ -358,17 +340,11 @@ def analyze(df):
         "sell_accuracy": sell_accuracy,
         "baseline": baseline,
         "test_count": len(y_test),
-        "dataset": data,
-        "weights": weights,
-        "bias": bias,
-        "mean": mean,
-        "std": std,
-        "feature_cols": feature_cols,
     }
 
 
 # =========================================================
-# KENAR ÇUBUĞU
+# SIDEBAR
 # =========================================================
 
 with st.sidebar:
@@ -378,12 +354,11 @@ with st.sidebar:
         "Minimum 24 saatlik hacim (USDT)",
         min_value=0.0,
         value=0.0,
-        step=1_000_000.0,
-        help="0 seçilirse hacim eşiği uygulanmaz."
+        step=1_000_000.0
     )
 
     max_coins = st.number_input(
-        "Maksimum coin sayısı (0 = tüm coinler)",
+        "Maksimum coin (0 = tümü)",
         min_value=0,
         max_value=2000,
         value=0,
@@ -391,29 +366,32 @@ with st.sidebar:
     )
 
     st.caption(
-        "Tüm coinleri taramak API sınırları nedeniyle uzun sürebilir."
+        "Tüm pariteleri taramak uzun sürebilir ve API limitlerine "
+        "takılabilir."
     )
 
-    scan_button = st.button(
-        "🔍 Tüm coinleri tara",
+    scan = st.button(
+        "🔍 Futures coinlerini tara",
         type="primary",
         use_container_width=True
     )
 
-    force_refresh = st.button(
-        "♻️ Önbelleği temizle",
+    clear_cache = st.button(
+        "♻️ Verileri yenile",
         use_container_width=True
     )
 
-if force_refresh:
-    get_all_spot_usdt_symbols.clear()
-    get_all_24h_tickers.clear()
+if clear_cache:
+    get_futures_symbols.clear()
+    get_futures_tickers.clear()
+    get_all_funding_rates.clear()
     get_klines.clear()
+    get_open_interest.clear()
     st.rerun()
 
 
 # =========================================================
-# TARAYICI
+# SCAN
 # =========================================================
 
 if "results" not in st.session_state:
@@ -425,7 +403,7 @@ if "errors" not in st.session_state:
 if "details" not in st.session_state:
     st.session_state.details = {}
 
-if scan_button:
+if scan:
     results = []
     errors = []
 
@@ -433,14 +411,21 @@ if scan_button:
     status = st.empty()
 
     try:
-        with st.spinner("Binance Spot USDT pariteleri alınıyor..."):
-            symbols = get_all_spot_usdt_symbols()
-            tickers = get_all_24h_tickers()
+        with st.spinner("Futures sözleşmeleri ve piyasa verileri alınıyor..."):
+            symbols = get_futures_symbols()
+            tickers = get_futures_tickers()
+            funding_data = get_all_funding_rates()
 
         ticker_map = {
-            t.get("symbol"): t
-            for t in tickers
-            if t.get("symbol")
+            item["symbol"]: item
+            for item in tickers
+            if item.get("symbol")
+        }
+
+        funding_map = {
+            item["symbol"]: item
+            for item in funding_data
+            if item.get("symbol")
         }
 
         candidates = []
@@ -467,23 +452,32 @@ if scan_button:
             candidates = candidates[:int(max_coins)]
 
         if not candidates:
-            raise RuntimeError("Tarama koşullarına uyan coin bulunamadı.")
+            raise RuntimeError("Tarama koşullarına uyan Futures coin bulunamadı.")
 
-        st.info(f"{len(candidates)} parite sıraya alındı.")
+        st.info(f"{len(candidates)} Futures paritesi taranacak.")
 
-        for i, (symbol, quote_volume, ticker_price) in enumerate(candidates):
+        for i, (symbol, volume, ticker_price) in enumerate(candidates):
             status.text(
                 f"{i + 1}/{len(candidates)} — {symbol} analiz ediliyor"
             )
 
             try:
                 df = get_klines(symbol, INTERVAL, CANDLE_LIMIT)
-                model = analyze(df)
+                model = analyze_model(df)
+
+                funding_item = funding_map.get(symbol, {})
+                funding_rate = float(
+                    funding_item.get("lastFundingRate", 0) or 0
+                )
+                mark_price = float(
+                    funding_item.get("markPrice", ticker_price) or ticker_price
+                )
 
                 results.append({
                     "Coin": symbol,
                     "Sinyal": model["signal"],
                     "Fiyat": float(df["close"].iloc[-1]),
+                    "Mark fiyatı": mark_price,
                     "Yükseliş %": model["up_prob"] * 100,
                     "Düşüş %": model["down_prob"] * 100,
                     "Sinyal gücü %": max(
@@ -493,16 +487,19 @@ if scan_button:
                     "BUY test doğruluğu %": model["buy_accuracy"],
                     "SELL test doğruluğu %": model["sell_accuracy"],
                     "Temel doğruluk %": model["baseline"],
+                    "Funding rate %": funding_rate * 100,
+                    "24s değişim %": float(
+                        ticker_map[symbol].get("priceChangePercent", 0)
+                    ),
+                    "24s hacim USDT": volume,
                     "Test örneği": model["test_count"],
                     "Mum sayısı": len(df),
                     "Eksik aralık": int(df.attrs.get("gap_count", 0)),
-                    "24s hacim USDT": quote_volume,
                 })
 
-                # Grafiği sonradan görüntülemek için detayları sakla.
                 st.session_state.details[symbol] = {
                     "df": df,
-                    "model": model
+                    "model": model,
                 }
 
             except Exception as exc:
@@ -513,22 +510,22 @@ if scan_button:
 
         st.session_state.results = results
         st.session_state.errors = errors
+
         status.success(
             f"Tarama tamamlandı: {len(results)} başarılı, "
-            f"{len(errors)} hatalı/atlanan parite."
+            f"{len(errors)} başarısız/atlanan parite."
         )
 
     except Exception as exc:
-        st.error(f"Tarama başlatılamadı: {exc}")
+        st.error(f"Tarama başarısız: {exc}")
 
 
 # =========================================================
-# SONUÇLAR
+# RESULTS
 # =========================================================
 
 if st.session_state.results:
     result_df = pd.DataFrame(st.session_state.results)
-
     result_df = result_df.sort_values(
         "Sinyal gücü %",
         ascending=False
@@ -536,17 +533,15 @@ if st.session_state.results:
 
     buys = int((result_df["Sinyal"] == "BUY").sum())
     sells = int((result_df["Sinyal"] == "SELL").sum())
+    avg_acc = float(result_df["Test doğruluğu %"].mean())
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Analiz edilen coin", len(result_df))
-    c2.metric("BUY", buys)
-    c3.metric("SELL", sells)
-    c4.metric(
-        "Ortalama test doğruluğu",
-        f'{result_df["Test doğruluğu %"].mean():.2f}%'
-    )
+    c2.metric("BUY / Long yönü", buys)
+    c3.metric("SELL / Short yönü", sells)
+    c4.metric("Ortalama test doğruluğu", f"{avg_acc:.2f}%")
 
-    st.subheader("🏆 Tüm coinlerin sinyal sıralaması")
+    st.subheader("🏆 Futures coin sıralaması")
 
     st.dataframe(
         result_df,
@@ -554,6 +549,7 @@ if st.session_state.results:
         hide_index=True,
         column_config={
             "Fiyat": st.column_config.NumberColumn(format="%.8f"),
+            "Mark fiyatı": st.column_config.NumberColumn(format="%.8f"),
             "Yükseliş %": st.column_config.NumberColumn(format="%.2f%%"),
             "Düşüş %": st.column_config.NumberColumn(format="%.2f%%"),
             "Sinyal gücü %": st.column_config.NumberColumn(format="%.2f%%"),
@@ -561,39 +557,51 @@ if st.session_state.results:
             "BUY test doğruluğu %": st.column_config.NumberColumn(format="%.2f%%"),
             "SELL test doğruluğu %": st.column_config.NumberColumn(format="%.2f%%"),
             "Temel doğruluk %": st.column_config.NumberColumn(format="%.2f%%"),
+            "Funding rate %": st.column_config.NumberColumn(format="%.5f%%"),
+            "24s değişim %": st.column_config.NumberColumn(format="%.2f%%"),
             "24s hacim USDT": st.column_config.NumberColumn(format="%.0f"),
         }
     )
 
     st.download_button(
-        "📥 Tüm sonuçları CSV indir",
+        "📥 Futures sonuçlarını CSV indir",
         data=result_df.to_csv(index=False).encode("utf-8-sig"),
-        file_name="binance_all_coins_buy_sell.csv",
+        file_name="binance_futures_buy_sell.csv",
         mime="text/csv"
     )
 
+    # -----------------------------------------------------
+    # SELECTED COIN DETAILS
+    # -----------------------------------------------------
+
     st.divider()
-    st.subheader("📈 Coin grafiği ve ayrıntıları")
+    st.subheader("📈 Coin detayları")
 
-    symbols_available = result_df["Coin"].tolist()
-
+    available_symbols = result_df["Coin"].tolist()
     selected_symbol = st.selectbox(
-        "Coin seç",
-        symbols_available
+        "Futures paritesi seç",
+        available_symbols
     )
 
-    if selected_symbol not in st.session_state.details:
-        if st.button("Seçilen coin için ayrıntı yükle"):
-            try:
-                with st.spinner(f"{selected_symbol} yükleniyor..."):
-                    df = get_klines(selected_symbol, INTERVAL, CANDLE_LIMIT)
-                    model = analyze(df)
-                    st.session_state.details[selected_symbol] = {
-                        "df": df,
-                        "model": model
-                    }
-            except Exception as exc:
-                st.error(str(exc))
+    detail = st.session_state.details.get(selected_symbol)
+
+    if st.button("Seçilen coin detaylarını yenile"):
+        try:
+            get_klines.clear()
+            get_open_interest.clear()
+
+            with st.spinner(f"{selected_symbol} güncelleniyor..."):
+                df = get_klines(selected_symbol, INTERVAL, CANDLE_LIMIT)
+                model = analyze_model(df)
+
+                st.session_state.details[selected_symbol] = {
+                    "df": df,
+                    "model": model
+                }
+                detail = st.session_state.details[selected_symbol]
+
+        except Exception as exc:
+            st.error(str(exc))
 
     detail = st.session_state.details.get(selected_symbol)
 
@@ -602,9 +610,9 @@ if st.session_state.results:
         model = detail["model"]
 
         if model["signal"] == "BUY":
-            st.success("Model sinyali: BUY")
+            st.success("Sinyal: BUY — yükseliş/long yönü")
         else:
-            st.error("Model sinyali: SELL")
+            st.error("Sinyal: SELL — düşüş/short yönü")
 
         a, b, c, d = st.columns(4)
         a.metric("Son kapanış", f'{df["close"].iloc[-1]:.8f}')
@@ -614,30 +622,43 @@ if st.session_state.results:
 
         e, f, g = st.columns(3)
         e.metric(
-            "BUY tahminlerinin isabeti",
+            "BUY test isabeti",
             "N/A" if np.isnan(model["buy_accuracy"])
             else f'{model["buy_accuracy"]:.2f}%'
         )
         f.metric(
-            "SELL tahminlerinin isabeti",
+            "SELL test isabeti",
             "N/A" if np.isnan(model["sell_accuracy"])
             else f'{model["sell_accuracy"]:.2f}%'
         )
         g.metric(
-            "Basit tahmin karşılaştırması",
+            "Basit temel doğruluk",
             f'{model["baseline"]:.2f}%'
         )
+
+        try:
+            with st.spinner("Open interest alınıyor..."):
+                oi = get_open_interest(selected_symbol)
+
+            st.metric(
+                "Güncel open interest",
+                f'{float(oi.get("openInterest", 0)):,.4f}'
+            )
+
+        except Exception as exc:
+            st.caption(f"Open interest alınamadı: {exc}")
 
         chart = df[["close_time", "close"]].tail(200).copy()
         chart = chart.set_index("close_time")
         chart.columns = ["Kapanış fiyatı"]
+
+        st.subheader(f"{selected_symbol} — 15 dakikalık grafik")
         st.line_chart(chart, use_container_width=True)
 
         st.caption(
-            f"Son {len(df)} tamamlanmış mum kullanıldı. "
-            f"Veri aralığı sorunu sayısı: "
-            f"{df.attrs.get('gap_count', 0)}. "
-            "Eksik aralıklar tespit edilir ancak otomatik doldurulmaz."
+            f"Tamamlanmış mum sayısı: {len(df)} | "
+            f"Bulunan eksik zaman aralıkları: "
+            f"{df.attrs.get('gap_count', 0)}"
         )
 
         st.subheader("Son 20 mum")
@@ -651,24 +672,21 @@ if st.session_state.results:
 
     if st.session_state.errors:
         with st.expander(
-            f"Analiz edilemeyen coinler ({len(st.session_state.errors)})"
+            f"Atlanan/başarısız coinler ({len(st.session_state.errors)})"
         ):
-            st.write(
-                "Bir coin atlandığında bunun sebebi API erişimi, "
-                "yetersiz geçmiş veri veya veri doğrulama hatası olabilir."
-            )
             for error in st.session_state.errors:
                 st.write("- " + error)
 
 else:
     st.info(
-        "Tüm uygun coinleri taramak için sol menüden "
-        "'Tüm coinleri tara' düğmesine bas."
+        "Sol menüden 'Futures coinlerini tara' düğmesine basarak başla."
     )
 
 st.divider()
 st.warning(
-    "Önemli: BUY/SELL sinyali garanti değildir. Olasılıklar model "
-    "çıktısıdır; gerçek piyasa olasılığı veya kesin kâr tahmini değildir. "
-    "Test doğruluğu geçmiş örneklerde ölçülür. Bu uygulama emir göndermez."
+    "Bu uygulama yalnızca herkese açık piyasa verilerini okur; "
+    "emir göndermez. BUY/SELL sinyalleri kesin tahmin değildir. "
+    "Modelin olasılıkları kalibre edilmiş gerçek piyasa olasılıkları "
+    "olmayabilir. Kaldıraç, likidasyon ve işlem ücretleri gerçek "
+    "sonuçları önemli ölçüde etkiler."
 )
