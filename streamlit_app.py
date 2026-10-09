@@ -16,9 +16,9 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 
-# =====================================================
-# SETTINGS
-# =====================================================
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 st.set_page_config(
     page_title="LSTM Crypto Scanner",
@@ -26,7 +26,16 @@ st.set_page_config(
     layout="wide"
 )
 
-BASE_URL = "https://api.binance.com"
+API_BASES = [
+    "https://data-api.binance.vision",
+    "https://api.binance.com",
+    "https://api-gcp.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://api4.binance.com",
+]
+
 INTERVAL = "15m"
 CANDLE_LIMIT = 1000
 LOOKBACK = 48
@@ -36,33 +45,12 @@ MAX_WORKERS = 3
 BUY_THRESHOLD = 0.60
 SELL_THRESHOLD = 0.40
 
-
-# =====================================================
-# HEADER
-# =====================================================
-
-st.title("🧠 LSTM Crypto Scanner")
-
-st.write(
-    "Binance Spot USDT piyasaları için derin öğrenme "
-    "analiz ve sinyal paneli."
-)
-
-st.info(
-    "Uygulama halka açık Binance piyasa verilerini okur. "
-    "API anahtarı kullanmaz, işlem açmaz ve emir göndermez. "
-    "RSI, EMA, MACD veya Bollinger Bands kullanılmaz."
-)
-
-st.warning(
-    "BUY / SELL / HOLD model tahminleridir. "
-    "Yatırım tavsiyesi veya kâr garantisi değildir."
-)
+REQUEST_TIMEOUT = 15
 
 
-# =====================================================
+# ============================================================
 # HTTP SESSION
-# =====================================================
+# ============================================================
 
 @st.cache_resource
 def get_session():
@@ -74,18 +62,33 @@ def get_session():
 
 
 def api_get(endpoint, params=None):
-    response = get_session().get(
-        BASE_URL + endpoint,
-        params=params,
-        timeout=25
+    errors = []
+
+    for base_url in API_BASES:
+        try:
+            response = get_session().get(
+                base_url + endpoint,
+                params=params,
+                timeout=REQUEST_TIMEOUT
+            )
+
+            response.raise_for_status()
+            return response.json()
+
+        except requests.RequestException as exc:
+            errors.append(
+                f"{base_url}: {str(exc)[:150]}"
+            )
+
+    raise RuntimeError(
+        "Binance veri adreslerinin tümü başarısız oldu:\n"
+        + "\n".join(errors)
     )
-    response.raise_for_status()
-    return response.json()
 
 
-# =====================================================
-# BINANCE SPOT SYMBOLS
-# =====================================================
+# ============================================================
+# BINANCE SPOT MARKETS
+# ============================================================
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_spot_symbols():
@@ -102,10 +105,6 @@ def get_spot_symbols():
 
     return sorted(set(symbols))
 
-
-# =====================================================
-# MARKET TICKERS
-# =====================================================
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_tickers():
@@ -128,18 +127,17 @@ def get_tickers():
     return pd.DataFrame(rows)
 
 
-# =====================================================
-# LAST 1000 COMPLETED CANDLES
-# =====================================================
+# ============================================================
+# CANDLE DATA
+# ============================================================
 
 @st.cache_data(ttl=120, show_spinner=False)
 def get_candles(symbol, count=1000):
     interval_ms = 15 * 60 * 1000
     now_ms = int(time.time() * 1000)
 
-    # End at the most recent completed candle.
+    # Most recent completed 15-minute candle.
     end_ms = (now_ms // interval_ms) * interval_ms - 1
-
     rows = []
 
     while len(rows) < count:
@@ -167,13 +165,24 @@ def get_candles(symbol, count=1000):
         if len(rows) >= count:
             break
 
+        time.sleep(0.05)
+
     if not rows:
         return pd.DataFrame()
 
     columns = [
-        "open_time", "open", "high", "low", "close",
-        "volume", "close_time", "quote_volume",
-        "trades", "taker_base", "taker_quote", "ignore"
+        "open_time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "close_time",
+        "quote_volume",
+        "trades",
+        "taker_base",
+        "taker_quote",
+        "ignore"
     ]
 
     df = pd.DataFrame(rows, columns=columns)
@@ -189,24 +198,28 @@ def get_candles(symbol, count=1000):
         errors="coerce"
     )
 
-    for col in [
-        "open", "high", "low", "close",
-        "volume", "quote_volume"
-    ]:
-        df[col] = pd.to_numeric(
-            df[col],
+    numeric_columns = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "quote_volume"
+    ]
+
+    for column in numeric_columns:
+        df[column] = pd.to_numeric(
+            df[column],
             errors="coerce"
         )
 
-    # Remove any candle that is still forming.
+    # Exclude any candle that has not closed yet.
     df = df[df["close_time"] < now_ms]
 
     df = (
         df.drop_duplicates(subset=["open_time"])
         .sort_values("open_time")
-        .dropna(
-            subset=["open", "high", "low", "close", "volume"]
-        )
+        .dropna(subset=numeric_columns)
         .tail(count)
         .reset_index(drop=True)
     )
@@ -214,10 +227,11 @@ def get_candles(symbol, count=1000):
     return df
 
 
-# =====================================================
-# RAW OHLCV FEATURES
-# No technical indicators.
-# =====================================================
+# ============================================================
+# FEATURE ENGINEERING
+# Raw candle and volume data only.
+# No RSI, EMA, MACD, or Bollinger Bands.
+# ============================================================
 
 def make_features(df):
     close = df["close"].to_numpy(dtype=np.float64)
@@ -277,20 +291,25 @@ def make_features(df):
     ).astype(np.float32)
 
 
-# =====================================================
+# ============================================================
 # LSTM MODEL
-# =====================================================
+# ============================================================
 
 if TORCH_AVAILABLE:
 
     class LSTMModel(nn.Module):
-        def __init__(self, input_size=7, hidden_size=48):
+        def __init__(
+            self,
+            input_size=7,
+            hidden_size=48,
+            num_layers=2
+        ):
             super().__init__()
 
             self.lstm = nn.LSTM(
                 input_size=input_size,
                 hidden_size=hidden_size,
-                num_layers=2,
+                num_layers=num_layers,
                 batch_first=True,
                 dropout=0.2
             )
@@ -307,9 +326,9 @@ if TORCH_AVAILABLE:
             return self.classifier(output[:, -1, :])
 
 
-# =====================================================
+# ============================================================
 # TRAIN AND PREDICT
-# =====================================================
+# ============================================================
 
 def train_model(df, epochs=DEFAULT_EPOCHS):
     if not TORCH_AVAILABLE:
@@ -318,14 +337,16 @@ def train_model(df, epochs=DEFAULT_EPOCHS):
         )
 
     if len(df) < 200:
-        raise ValueError("En az 200 tamamlanmış mum gerekli.")
+        raise ValueError(
+            "En az 200 tamamlanmış mum gerekli."
+        )
 
     features = make_features(df)
     closes = df["close"].to_numpy(dtype=np.float64)
 
     split = int(len(features) * 0.80)
 
-    # Fit normalization on training data only.
+    # Fit normalization using training data only.
     mean = features[:split].mean(axis=0)
     std = features[:split].std(axis=0)
     std[std < 1e-8] = 1.0
@@ -343,10 +364,12 @@ def train_model(df, epochs=DEFAULT_EPOCHS):
     y = []
     target_positions = []
 
+    # Use the previous 48 candles to predict the next candle direction.
     for target_i in range(LOOKBACK, len(df)):
-        X.append(scaled[target_i - LOOKBACK:target_i])
+        X.append(
+            scaled[target_i - LOOKBACK:target_i]
+        )
 
-        # Target: whether the target candle closes higher.
         y.append(
             1 if closes[target_i] > closes[target_i - 1] else 0
         )
@@ -362,17 +385,22 @@ def train_model(df, epochs=DEFAULT_EPOCHS):
 
     X_train = X[train_mask]
     y_train = y[train_mask]
+
     X_val = X[validation_mask]
     y_val = y[validation_mask]
 
     if len(X_train) < 50 or len(X_val) < 10:
-        raise ValueError("Eğitim veya doğrulama verisi yetersiz.")
+        raise ValueError(
+            "Eğitim veya doğrulama verisi yetersiz."
+        )
 
     torch.manual_seed(42)
     np.random.seed(42)
     torch.set_num_threads(1)
 
-    model = LSTMModel(input_size=features.shape[1])
+    model = LSTMModel(
+        input_size=features.shape[1]
+    )
 
     counts = np.bincount(
         y_train,
@@ -428,41 +456,42 @@ def train_model(df, epochs=DEFAULT_EPOCHS):
     model.eval()
 
     with torch.no_grad():
-        validation_logits = model(
+        val_logits = model(
             torch.tensor(X_val, dtype=torch.float32)
         )
 
-        validation_probabilities = torch.softmax(
-            validation_logits,
+        val_probabilities = torch.softmax(
+            val_logits,
             dim=1
         ).numpy()
 
-        validation_predictions = np.argmax(
-            validation_probabilities,
+        val_predictions = np.argmax(
+            val_probabilities,
             axis=1
         )
 
         accuracy = float(
-            np.mean(validation_predictions == y_val)
+            np.mean(val_predictions == y_val)
         )
 
-        recalls = []
+        class_recalls = []
 
         for class_id in (0, 1):
             mask = y_val == class_id
 
             if mask.any():
-                recalls.append(
+                class_recalls.append(
                     float(
                         np.mean(
-                            validation_predictions[mask] == class_id
+                            val_predictions[mask] == class_id
                         )
                     )
                 )
 
         balanced_accuracy = (
-            float(np.mean(recalls))
-            if recalls else float("nan")
+            float(np.mean(class_recalls))
+            if class_recalls
+            else float("nan")
         )
 
         latest_sequence = torch.tensor(
@@ -496,16 +525,18 @@ def train_model(df, epochs=DEFAULT_EPOCHS):
     }
 
 
-# =====================================================
-# ANALYZE ONE COIN
-# =====================================================
+# ============================================================
+# ANALYZE ONE SYMBOL
+# ============================================================
 
 def analyze_symbol(symbol, epochs):
     try:
         df = get_candles(symbol, CANDLE_LIMIT)
 
         if df.empty or len(df) < 200:
-            raise ValueError("Yeterli tamamlanmış mum bulunamadı.")
+            raise ValueError(
+                "Yeterli tamamlanmış mum bulunamadı."
+            )
 
         prediction = train_model(df, epochs)
 
@@ -526,13 +557,13 @@ def analyze_symbol(symbol, epochs):
     except Exception as exc:
         return {
             "symbol": symbol,
-            "error": str(exc)[:250]
+            "error": str(exc)[:500]
         }
 
 
-# =====================================================
-# SIDEBAR SETTINGS
-# =====================================================
+# ============================================================
+# SIDEBAR
+# ============================================================
 
 st.sidebar.header("Tarama ayarları")
 
@@ -576,9 +607,9 @@ if st.sidebar.button("Önbelleği temizle"):
     st.rerun()
 
 
-# =====================================================
+# ============================================================
 # LOAD MARKET DATA
-# =====================================================
+# ============================================================
 
 try:
     with st.spinner("Binance Spot verileri alınıyor..."):
@@ -587,9 +618,18 @@ try:
 
 except Exception as exc:
     st.error(
-        "Binance verileri alınamadı. Bağlantıyı veya erişimi kontrol et. "
-        f"Ayrıntı: {exc}"
+        "Binance verileri alınamadı. Alternatif adresler de başarısız oldu."
     )
+
+    st.code(str(exc))
+
+    st.write(
+        "Bu durum Streamlit Cloud sunucusunun Binance'a erişememesi, "
+        "HTTP 451 bölgesel kısıtlaması, ağ sorunu veya geçici API "
+        "hatasından kaynaklanabilir. Alternatif adresler de aynı "
+        "kısıtlamaya tabi olabilir."
+    )
+
     st.stop()
 
 if tickers.empty:
@@ -610,7 +650,9 @@ tickers = tickers.sort_values(
 )
 
 if scan_mode == "En yüksek hacimli pariteler":
-    symbols_to_scan = tickers.head(coin_count)["symbol"].tolist()
+    symbols_to_scan = (
+        tickers.head(coin_count)["symbol"].tolist()
+    )
 else:
     symbols_to_scan = tickers["symbol"].tolist()
 
@@ -622,13 +664,13 @@ if not symbols_to_scan:
 
 st.caption(
     f"Tarama listesi: {len(symbols_to_scan)} parite | "
-    "15 dakikalık mumlar | Hedef: 1.000 tamamlanmış mum"
+    "Zaman dilimi: 15 dakika | Hedef: 1.000 tamamlanmış mum"
 )
 
 
-# =====================================================
+# ============================================================
 # RUN SCAN
-# =====================================================
+# ============================================================
 
 if "results" not in st.session_state:
     st.session_state["results"] = []
@@ -642,7 +684,10 @@ if st.button(
     progress = st.progress(0)
     status = st.empty()
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ThreadPoolExecutor(
+        max_workers=MAX_WORKERS
+    ) as executor:
+
         futures = {
             executor.submit(
                 analyze_symbol,
@@ -654,7 +699,10 @@ if st.button(
 
         total = len(futures)
 
-        for i, future in enumerate(as_completed(futures), start=1):
+        for i, future in enumerate(
+            as_completed(futures),
+            start=1
+        ):
             symbol = futures[future]
 
             try:
@@ -662,7 +710,7 @@ if st.button(
             except Exception as exc:
                 results.append({
                     "symbol": symbol,
-                    "error": str(exc)[:250]
+                    "error": str(exc)[:500]
                 })
 
             progress.progress(i / total)
@@ -679,9 +727,9 @@ if st.button(
     st.rerun()
 
 
-# =====================================================
-# DISPLAY RESULTS
-# =====================================================
+# ============================================================
+# RESULTS
+# ============================================================
 
 results = st.session_state["results"]
 
@@ -727,18 +775,24 @@ if results:
             successful["balanced_accuracy"] * 100
         ).round(2)
 
-        c1, c2, c3, c4 = st.columns(4)
+        col1, col2, col3, col4 = st.columns(4)
 
-        c1.metric("Başarılı analiz", len(successful))
-        c2.metric(
+        col1.metric(
+            "Başarılı analiz",
+            len(successful)
+        )
+
+        col2.metric(
             "BUY",
             int((successful["signal"] == "BUY").sum())
         )
-        c3.metric(
+
+        col3.metric(
             "SELL",
             int((successful["signal"] == "SELL").sum())
         )
-        c4.metric(
+
+        col4.metric(
             "HOLD",
             int((successful["signal"] == "HOLD").sum())
         )
@@ -790,10 +844,10 @@ if results:
             mime="text/csv"
         )
 
-        st.subheader("🔎 Parite grafiği")
+        st.subheader("🔎 Parite detayı")
 
         selected_symbol = st.selectbox(
-            "Grafiğini görüntülemek istediğin parite",
+            "Grafiğini görmek istediğin parite",
             successful["symbol"].tolist()
         )
 
@@ -803,15 +857,21 @@ if results:
 
         a, b, c, d = st.columns(4)
 
-        a.metric("Model sinyali", selected["signal"])
+        a.metric(
+            "Model sinyali",
+            selected["signal"]
+        )
+
         b.metric(
             "Yükseliş olasılığı",
             f'{selected["up_probability"] * 100:.2f}%'
         )
+
         c.metric(
             "Düşüş olasılığı",
             f'{selected["down_probability"] * 100:.2f}%'
         )
+
         d.metric(
             "Doğrulama doğruluğu",
             f'{selected["accuracy"] * 100:.2f}%'
@@ -823,44 +883,44 @@ if results:
                 CANDLE_LIMIT
             )
 
-            # Built-in Streamlit chart: no Plotly dependency.
-            chart = chart_df[
-                ["open_time", "open", "high", "low", "close"]
-            ].copy()
+            if not chart_df.empty:
+                chart = chart_df.set_index("open_time")
 
-            chart = chart.set_index("open_time")
-
-            st.subheader(
-                f"{selected_symbol} — kapanış fiyatı"
-            )
-
-            st.line_chart(
-                chart[["close"]],
-                height=350
-            )
-
-            st.subheader("Mum fiyat aralığı")
-
-            st.area_chart(
-                chart[["low", "high"]],
-                height=250
-            )
-
-            with st.expander("Son 100 mum verisi"):
-                st.dataframe(
-                    chart_df.tail(100).sort_values(
-                        "open_time",
-                        ascending=False
-                    ),
-                    use_container_width=True,
-                    hide_index=True
+                st.subheader(
+                    f"{selected_symbol} — kapanış fiyatı"
                 )
 
+                st.line_chart(
+                    chart[["close"]],
+                    height=350
+                )
+
+                st.subheader("Mumların yüksek/düşük aralığı")
+
+                st.area_chart(
+                    chart[["low", "high"]],
+                    height=250
+                )
+
+                with st.expander("Son 100 mum verisi"):
+                    st.dataframe(
+                        chart_df.tail(100).sort_values(
+                            "open_time",
+                            ascending=False
+                        ),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
         except Exception as exc:
-            st.warning(f"Grafik verisi alınamadı: {exc}")
+            st.warning(
+                f"Grafik verisi alınamadı: {exc}"
+            )
 
     else:
-        st.warning("Başarılı analiz bulunamadı.")
+        st.warning(
+            "Başarılı analiz bulunamadı. Hata tablosunu kontrol et."
+        )
 
     if show_errors and not failed.empty:
         st.subheader("⚠️ Analiz hataları")
@@ -873,14 +933,14 @@ if results:
 
 else:
     st.write(
-        "Tarama henüz yapılmadı. Sol taraftan ayarları seç ve "
+        "Tarama henüz yapılmadı. Sol taraftaki ayarları seç ve "
         "'LSTM taramasını başlat' düğmesine bas."
     )
 
 
-# =====================================================
+# ============================================================
 # FOOTER
-# =====================================================
+# ============================================================
 
 st.divider()
 
@@ -890,7 +950,7 @@ st.caption(
 )
 
 st.caption(
-    "Emir gönderme veya otomatik alım satım özelliği bulunmaz. "
+    "Uygulama emir göndermez ve otomatik alım satım yapmaz. "
     "UTC zamanı: "
     + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 )
