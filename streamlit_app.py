@@ -200,8 +200,6 @@ def analyze_coin(symbol, ticker, min_drop_pct, low_tolerance_pct):
         return None, "no_price"
 
     candles = get_last_365d_candles(symbol)
-
-    # If there isn't nearly a full year of daily history, don't mislabel a new listing as a 12M low.
     if len(candles) < 360:
         return None, "insufficient_history"
 
@@ -217,45 +215,52 @@ def analyze_coin(symbol, ticker, min_drop_pct, low_tolerance_pct):
     drop_from_high_pct = (1.0 - current_price / high_365d) * 100.0
     distance_from_low_pct = (current_price / low_365d - 1.0) * 100.0
 
-    # Both conditions are mandatory:
-    # 1) at least the specified % below 365d high;
-    # 2) current price at or below the chosen distance above the 365d low.
+    # Only coins down at least the selected percentage are candidates.
     if drop_from_high_pct < min_drop_pct:
         return None, "not_down_enough"
-    if distance_from_low_pct > low_tolerance_pct:
-        return None, "not_near_low"
 
-    # Optional 15m confirmation: do not discard an otherwise qualified coin if this extra request fails.
+    # Keep near-misses so the app can show them instead of an empty screen.
+    matches_both = distance_from_low_pct <= low_tolerance_pct
+
     previous_close = None
     last_close = None
     rising_15m = False
-    try:
-        payload = api_get(
-            "/api/v5/market/candles",
-            {"instId": symbol, "bar": "15m", "limit": "6"},
-        )
-        candles_15m = confirmed_candles(payload.get("data", []))
-        candles_15m.sort(key=lambda row: int(row[0]))
-        if len(candles_15m) >= 2:
-            previous_close = float(candles_15m[-2][4])
-            last_close = float(candles_15m[-1][4])
-            rising_15m = last_close > previous_close
-    except MarketAPIError:
-        pass
+    # Request 15m data only for coins that pass both price filters.
+    if matches_both:
+        try:
+            payload = api_get(
+                "/api/v5/market/candles",
+                {"instId": symbol, "bar": "15m", "limit": "6"},
+            )
+            candles_15m = confirmed_candles(payload.get("data", []))
+            candles_15m.sort(key=lambda row: int(row[0]))
+            if len(candles_15m) >= 2:
+                previous_close = float(candles_15m[-2][4])
+                last_close = float(candles_15m[-1][4])
+                rising_15m = last_close > previous_close
+        except MarketAPIError:
+            pass
 
-    open_24h = float((ticker or {}).get("open24h", 0) or 0)
-    volume_24h = float((ticker or {}).get("volCcy24h", 0) or 0)
+    try:
+        open_24h = float((ticker or {}).get("open24h", 0) or 0)
+        volume_24h = float((ticker or {}).get("volCcy24h", 0) or 0)
+    except (ValueError, TypeError):
+        open_24h = 0.0
+        volume_24h = 0.0
     change_24h = (current_price / open_24h - 1) * 100 if open_24h > 0 else 0.0
 
     if distance_from_low_pct < 0:
         low_status = "YENİ 365G DİBİNİN ALTINDA"
     elif distance_from_low_pct <= 0.1:
         low_status = "365G DİBİNDE"
-    else:
+    elif matches_both:
         low_status = "365G DİBİNE YAKIN"
+    else:
+        low_status = "ADAY — DİPTEN TOLERANSTAN UZAK"
 
-    return {
+    result = {
         "Coin": symbol,
+        "Filtre Durumu": "İKİ KOŞUL DA TAMAM" if matches_both else "%50+ DÜŞÜŞ VAR; DİBE UZAK",
         "Dip Durumu": low_status,
         "Güncel Fiyat": current_price,
         "365G En Yüksek": high_365d,
@@ -268,8 +273,9 @@ def analyze_coin(symbol, ticker, min_drop_pct, low_tolerance_pct):
         "15D Son Kapanış": last_close,
         "15D Yükseliş Teyidi": rising_15m,
         "Kullanılan Günlük Mum": len(candles),
-    }, "match"
-
+        "Tam Filtreye Uygun": matches_both,
+    }
+    return result, "match" if matches_both else "not_near_low"
 
 st.sidebar.header("Filtreler")
 min_drop_pct = st.sidebar.slider(
@@ -316,8 +322,9 @@ except MarketAPIError as exc:
 
 st.write(f"**OKX'te aktif görünen Spot USDT pariteleri:** {len(symbols)}")
 st.caption(
-    "Bir coin ancak iki ölçütü de karşılarsa listelenir: son 365 günlük zirveden "
-    f"en az %{min_drop_pct:.0f} düşüş ve son 365 günlük dibe en fazla %{low_tolerance_pct:.1f} uzaklık."
+    "Ana sonuç listesi iki koşulu da karşılayan coinleri gösterir. Ayrıca, "
+    f"son 365 günlük zirvesinden en az %{min_drop_pct:.0f} düşmüş ama dip toleransını "
+    "karşılamayan coinler de yakın adaylar tablosunda gösterilir."
 )
 
 results = []
@@ -376,47 +383,56 @@ if fatal_error:
         f"Tarama {idx}/{len(symbols)} paritede durdu. Bulunan sonuçlar aşağıda gösterilebilir."
     )
 
+st.caption(
+    f"Aktif parite: {len(symbols)} | Ticker olmayan: {no_ticker_count} | "
+    f"365 günlük geçmişi yetersiz: {short_history_count} | Veri/API hatası: {error_count}"
+)
+
 if not results:
     st.warning(
-        "Filtreleri karşılayan coin bulunamadı veya yeterli veri alınamadı. "
-        "Dip toleransını artırabilir ya da API erişimini kontrol edebilirsiniz."
-    )
-    st.caption(
-        f"Aktif parite: {len(symbols)} | Ticker olmayan: {no_ticker_count} | "
-        f"12 aylık veri yetersiz: {short_history_count} | Hatalar: {error_count}"
+        f"Son 365 günlük zirvesinden en az %{min_drop_pct:.0f} düşmüş coin bulunamadı. "
+        "Bu durumda dibe yakınlık filtresi değil, minimum düşüş koşulu sonuçları sınırlıyor olabilir."
     )
     st.stop()
 
 results_df = pd.DataFrame(results).sort_values(
     "Dibe Uzaklık (%)", ascending=True
 ).reset_index(drop=True)
-
-new_lows = results_df[results_df["Dibe Uzaklık (%)"] < 0].copy()
-rising_15m = results_df[results_df["15D Yükseliş Teyidi"]].copy()
+strict_df = results_df[results_df["Tam Filtreye Uygun"]].copy()
+near_misses = results_df[~results_df["Tam Filtreye Uygun"]].copy()
+new_lows = strict_df[strict_df["Dibe Uzaklık (%)"] < 0].copy()
+rising_15m = strict_df[strict_df["15D Yükseliş Teyidi"]].copy()
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Aktif parite", len(symbols))
-c2.metric("İki koşula uyan", len(results_df))
-c3.metric("365G dip altında", len(new_lows))
+c2.metric("İki koşula uyan", len(strict_df))
+c3.metric("%50+ düşmüş aday", len(results_df))
 c4.metric("15D yükseliş teyidi", len(rising_15m))
 
-st.caption(
-    f"Ticker olmayan: {no_ticker_count} | 365 günlük geçmişi yetersiz: "
-    f"{short_history_count} | Veri/API hatası: {error_count}"
-)
-
 st.subheader("İki koşulu da karşılayan coinler")
-st.dataframe(results_df, use_container_width=True, hide_index=True)
+if strict_df.empty:
+    st.warning(
+        "Hiçbir coin aynı anda hem %50+ düşüş hem de dip toleransı koşulunu karşılamadı. "
+        "Aşağıdaki adaylar %50+ düşmüş coinlerdir; ancak seçilen dip toleransının dışındadır."
+    )
+else:
+    st.dataframe(strict_df, use_container_width=True, hide_index=True)
 
-st.subheader("Önceki 365 günlük dip fiyatının altına inenler")
+st.subheader("Yakın adaylar — %50+ düşmüş, fakat dip toleransının dışında")
+if near_misses.empty:
+    st.info("Dip toleransının dışında kalan aday yok.")
+else:
+    st.dataframe(near_misses, use_container_width=True, hide_index=True)
+
+st.subheader("Önceki 365 günlük dip fiyatının altına inen, tam filtreye uyanlar")
 if new_lows.empty:
-    st.info("Geçmiş 365 günlük dip seviyesinin altında coin bulunamadı.")
+    st.info("Tam filtreye uyan coinler arasında geçmiş 365 günlük dip seviyesinin altında olan yok.")
 else:
     st.dataframe(new_lows, use_container_width=True, hide_index=True)
 
-st.subheader("Son iki tamamlanmış 15 dakikalık kapanışı yükselenler")
+st.subheader("Tam filtreye uyup son iki tamamlanmış 15 dakikalık kapanışı yükselenler")
 if rising_15m.empty:
-    st.info("15 dakikalık yükseliş teyidi olan coin bulunamadı.")
+    st.info("Tam filtreye uyan coinler arasında 15 dakikalık yükseliş teyidi olan yok.")
 else:
     st.dataframe(rising_15m, use_container_width=True, hide_index=True)
 
