@@ -1,4 +1,4 @@
-```python
+
 import time
 import requests
 import pandas as pd
@@ -9,15 +9,15 @@ BASE_URL = "https://api.binance.com"
 TIMEOUT = 15
 
 st.set_page_config(
-    page_title="Binance Spot %50+ Düşüş Tarayıcı",
+    page_title="Binance Spot - %50+ Düşüş Tarayıcı",
     page_icon="📉",
     layout="wide",
 )
 
-st.title("Binance Spot — Son 12 Ayda %50+ Düşen Coinler")
+st.title("Binance Spot — %50+ Düşen Coin Tarayıcı")
 st.caption(
     "Aktif USDT Spot pariteleri | Son 12 tamamlanmış aylık mum "
-    "| 15 dakika teyidi | Otomatik emir göndermez"
+    "| 15 dakikalık kapanış teyidi | Otomatik emir yok"
 )
 
 session = requests.Session()
@@ -28,7 +28,7 @@ class APIError(Exception):
     pass
 
 
-def api_get(path, params=None, retries=4):
+def api_get(path, params=None, retries=3):
     for attempt in range(retries + 1):
         try:
             response = session.get(
@@ -39,14 +39,13 @@ def api_get(path, params=None, retries=4):
 
             if response.status_code == 451:
                 raise APIError(
-                    "Binance API bu bağlantı konumundan erişime kapalı (451). "
-                    "Bölgesel kısıtlamaları aşmaya çalışmadan tarama durduruldu."
+                    "Binance API bu bağlantı konumundan erişilemiyor (451). "
+                    "Bölgesel erişim kısıtlamalarını aşmaya çalışmadan durduruldu."
                 )
 
             if response.status_code in (418, 429):
                 if attempt < retries:
-                    wait = min(2 ** (attempt + 1), 30)
-                    time.sleep(wait)
+                    time.sleep(min(2 ** (attempt + 1), 20))
                     continue
                 raise APIError(
                     f"Binance istek sınırı hatası: HTTP {response.status_code}"
@@ -54,22 +53,20 @@ def api_get(path, params=None, retries=4):
 
             if not response.ok:
                 raise APIError(
-                    f"HTTP {response.status_code}: {response.text[:200]}"
+                    f"HTTP {response.status_code}: {response.text[:250]}"
                 )
 
             data = response.json()
 
             if isinstance(data, dict) and "code" in data:
-                if data["code"] < 0:
-                    raise APIError(
-                        f"Binance API hatası: {data.get('msg', '')}"
-                    )
+                if isinstance(data["code"], int) and data["code"] < 0:
+                    raise APIError(data.get("msg", "Binance API hatası"))
 
             return data
 
         except requests.RequestException as exc:
             if attempt < retries:
-                time.sleep(min(2 ** (attempt + 1), 20))
+                time.sleep(min(2 ** (attempt + 1), 15))
                 continue
             raise APIError(f"Bağlantı hatası: {exc}") from exc
 
@@ -86,7 +83,6 @@ def get_active_symbols():
         if item.get("status") == "TRADING"
         and item.get("quoteAsset") == "USDT"
         and item.get("isSpotTradingAllowed", False)
-        and item.get("isMarginTradingAllowed") is not None
         and item.get("baseAsset") != "USDT"
     }
 
@@ -94,7 +90,11 @@ def get_active_symbols():
 @st.cache_data(ttl=120, show_spinner=False)
 def get_tickers():
     data = api_get("/api/v3/ticker/24hr")
-    return {item["symbol"]: item for item in data}
+    return {
+        item["symbol"]: item
+        for item in data
+        if item.get("symbol")
+    }
 
 
 def get_klines(symbol, interval, limit=15):
@@ -111,21 +111,22 @@ def get_klines(symbol, interval, limit=15):
 def analyze_coin(symbol, ticker, min_drop, max_drop):
     try:
         current = float(ticker["lastPrice"])
-        high24 = float(ticker["openPrice"])
-        quote_volume = float(ticker["quoteVolume"])
+        open24 = float(ticker["openPrice"])
+        volume = float(ticker["quoteVolume"])
 
         if current <= 0:
             return None
 
         change24 = (
-            (current / high24 - 1) * 100
-            if high24 > 0 else 0.0
+            (current / open24 - 1) * 100
+            if open24 > 0
+            else 0.0
         )
 
-        # 14 aylık mum al; devam eden ayı dışarıda bırak.
-        monthly = get_klines(symbol, "1M", 14)
         now_ms = int(time.time() * 1000)
 
+        # Son 12 tamamlanmış aylık mum.
+        monthly = get_klines(symbol, "1M", 14)
         monthly = [
             candle for candle in monthly
             if int(candle[6]) < now_ms
@@ -144,27 +145,26 @@ def analyze_coin(symbol, ticker, min_drop, max_drop):
 
         drop_pct = (1 - current / high12) * 100
 
-        if not (min_drop <= drop_pct <= max_drop):
+        if drop_pct < min_drop or drop_pct > max_drop:
             return None
 
         # Son iki tamamlanmış 15 dakikalık mum.
         candles = get_klines(symbol, "15m", 5)
-
         candles = [
             candle for candle in candles
             if int(candle[6]) < now_ms
         ]
 
-        if len(candles) >= 2:
-            previous_close = float(candles[-2][4])
-            last_close = float(candles[-1][4])
-            rising = last_close > previous_close
-            signal = "BUY" if rising else "SELL"
-        else:
+        if len(candles) < 2:
             previous_close = None
             last_close = None
             rising = False
             signal = "YETERSİZ VERİ"
+        else:
+            previous_close = float(candles[-2][4])
+            last_close = float(candles[-1][4])
+            rising = last_close > previous_close
+            signal = "BUY" if rising else "SELL"
 
         return {
             "Coin": symbol,
@@ -174,7 +174,7 @@ def analyze_coin(symbol, ticker, min_drop, max_drop):
             "12A Dip": low12,
             "Zirveden Düşüş (%)": round(drop_pct, 2),
             "24S Değişim (%)": round(change24, 2),
-            "24S Hacim (USDT)": round(quote_volume, 2),
+            "24S Hacim (USDT)": round(volume, 2),
             "Önceki 15D Kapanış": previous_close,
             "Son 15D Kapanış": last_close,
             "15D Yükseliyor": rising,
@@ -205,7 +205,7 @@ max_drop = st.sidebar.slider(
 )
 
 max_coins = st.sidebar.select_slider(
-    "Taranacak en yüksek hacimli coin sayısı",
+    "Taranacak coin sayısı (hacme göre)",
     options=[50, 100, 150, 200, 300, 500],
     value=150,
 )
@@ -217,19 +217,19 @@ min_volume = st.sidebar.number_input(
     step=50000,
 )
 
-if min_drop > max_drop:
-    st.sidebar.error("Minimum düşüş maksimum düşüşü aşamaz.")
-
 if st.sidebar.button("Önbelleği temizle"):
     get_active_symbols.clear()
     get_tickers.clear()
     st.rerun()
 
+if min_drop > max_drop:
+    st.sidebar.error("Minimum düşüş maksimum düşüşü aşamaz.")
+
 if st.button("Taramayı Başlat", type="primary"):
     st.session_state["run_scan"] = True
 
 if not st.session_state.get("run_scan", False):
-    st.info("Ayarları seçip Taramayı Başlat düğmesine bas.")
+    st.info("Ayarları seç ve Taramayı Başlat düğmesine bas.")
     st.stop()
 
 if min_drop > max_drop:
@@ -237,7 +237,7 @@ if min_drop > max_drop:
     st.stop()
 
 try:
-    with st.spinner("Binance Spot piyasası kontrol ediliyor..."):
+    with st.spinner("Binance Spot pariteleri alınıyor..."):
         symbols = get_active_symbols()
         tickers = get_tickers()
 
@@ -250,7 +250,7 @@ universe = []
 for symbol in symbols:
     ticker = tickers.get(symbol)
 
-    if not ticker:
+    if ticker is None:
         continue
 
     try:
@@ -263,14 +263,17 @@ for symbol in symbols:
     except (ValueError, TypeError, KeyError):
         continue
 
-universe.sort(key=lambda x: x[2], reverse=True)
+universe.sort(key=lambda item: item[2], reverse=True)
 universe = universe[:max_coins]
 
 st.write(f"**Aktif USDT Spot pariteleri:** {len(symbols)}")
-st.write(f"**Taranacak coin:** {len(universe)}")
+st.write(f"**Taranacak parite:** {len(universe)}")
 
 if not universe:
-    st.warning("Hacim filtresine uygun coin bulunamadı.")
+    st.warning(
+        "Hacim filtresine uygun aktif parite bulunamadı. "
+        "Minimum hacmi azaltmayı dene."
+    )
     st.stop()
 
 results = []
@@ -280,11 +283,14 @@ fatal_error = None
 progress = st.progress(0)
 status = st.empty()
 
-# Düşük eşzamanlılık, API yükünü sınırlamaya yardımcı olur.
 with ThreadPoolExecutor(max_workers=3) as executor:
     futures = {
         executor.submit(
-            analyze_coin, symbol, ticker, min_drop, max_drop
+            analyze_coin,
+            symbol,
+            ticker,
+            min_drop,
+            max_drop,
         ): symbol
         for symbol, ticker, _ in universe
     }
@@ -322,7 +328,7 @@ if fatal_error:
 if not results:
     st.warning(
         "Seçilen düşüş aralığına uygun coin bulunamadı. "
-        "Hacim filtresini azaltabilir veya taranan coin sayısını artırabilirsin."
+        "Taranan coin sayısını artırabilir veya hacim filtresini azaltabilirsin."
     )
     st.stop()
 
@@ -340,23 +346,21 @@ b.metric("BUY etiketi", len(buys))
 c.metric("SELL etiketi", len(sells))
 d.metric("Veri alınamayan", errors)
 
-st.subheader("Düşüş koşuluna uyan aktif Spot coinler")
+st.subheader("Zirvesinden seçilen oranda düşmüş aktif coinler")
 st.dataframe(df, use_container_width=True, hide_index=True)
 
-st.subheader("BUY — Son tamamlanmış 15 dakikalık kapanış yükselmiş")
+st.subheader("BUY — Son 15 dakikalık kapanış yükselmiş")
 st.dataframe(buys, use_container_width=True, hide_index=True)
 
 with st.expander("SELL — Son kapanış yükselmemiş"):
     st.dataframe(sells, use_container_width=True, hide_index=True)
 
 st.subheader("15 dakikalık fiyat grafiği")
-
 selected = st.selectbox("Coin seç", df["Coin"].tolist())
 
 try:
-    candles = get_klines(selected, "15m", 100)
     now_ms = int(time.time() * 1000)
-
+    candles = get_klines(selected, "15m", 100)
     candles = [
         candle for candle in candles
         if int(candle[6]) < now_ms
@@ -386,11 +390,9 @@ st.download_button(
 )
 
 st.caption(
-    "Düşüş, son 12 tamamlanmış aylık mumun en yüksek fiyatına göre hesaplanır. "
-    "Güncel fiyat bu zirveyle karşılaştırılır. Bu yöntem kayan 365 günlük "
-    "zirveyle birebir aynı değildir. BUY/SELL etiketleri yalnızca basit "
-    "15 dakikalık kapanış karşılaştırmasıdır; alım satım tavsiyesi değildir. "
-    "API erişimi ülkeye veya ağ koşullarına göre kısıtlanabilir. "
+    "Düşüş, son 12 tamamlanmış aylık mumun en yüksek fiyatına göre "
+    "hesaplanır; kayan 365 günlük zirveyle birebir aynı değildir. "
+    "BUY/SELL etiketleri yalnızca son iki tamamlanmış 15 dakikalık "
+    "kapanışın karşılaştırmasıdır ve kâr garantisi vermez. "
     "Tarayıcı otomatik emir göndermez."
 )
-```
