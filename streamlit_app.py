@@ -1,622 +1,484 @@
-
+```python
 import time
 import requests
-import numpy as np
 import pandas as pd
 import streamlit as st
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# =========================================================
+# BINANCE SPOT DIP SCANNER
+# Public market data only — NO order execution
+# =========================================================
+
+BASE_URL = "https://api.binance.com"
+TIMEOUT = 12
 
 st.set_page_config(
-    page_title="Smart Futures AI Scanner",
-    page_icon="📈",
-    layout="wide",
+    page_title="Binance Spot Dip Scanner",
+    page_icon="📉",
+    layout="wide"
 )
 
-BASE_URL = "https://www.okx.com"
-TIMEOUT = 20
-INTERVAL = "15m"
+st.title("Binance Spot Dip Scanner")
+st.caption(
+    "30-day low detection | Completed 15-minute candles | "
+    "BUY / SELL signals only | No order execution"
+)
 
 session = requests.Session()
-session.headers.update({
-    "User-Agent": "SmartFuturesScanner/2.0",
-    "Accept": "application/json",
-})
+session.headers.update({"User-Agent": "Spot-Dip-Scanner/1.0"})
 
 
-# ---------------- API ----------------
+class BinanceAPIError(Exception):
+    pass
+
 
 def api_get(path, params=None):
-    response = session.get(
-        BASE_URL + path,
-        params=params,
-        timeout=TIMEOUT,
-    )
-    response.raise_for_status()
-    result = response.json()
+    """Call Binance public REST API without bypassing restrictions."""
+    url = BASE_URL + path
 
-    if str(result.get("code", "0")) != "0":
-        raise RuntimeError(
-            result.get("msg", "API request failed")
+    try:
+        response = session.get(
+            url,
+            params=params,
+            timeout=TIMEOUT
+        )
+    except requests.RequestException as exc:
+        raise BinanceAPIError(
+            f"Binance bağlantı hatası: {exc}"
+        ) from exc
+
+    if response.status_code == 451:
+        raise BinanceAPIError(
+            "HTTP 451: Binance bu bağlantı konumundan erişimi "
+            "kısıtlıyor. Kısıtlamayı aşma girişimi yapılmadı."
         )
 
-    return result.get("data", [])
+    if response.status_code == 429:
+        raise BinanceAPIError(
+            "HTTP 429: Binance istek sınırına ulaşıldı. "
+            "Bir süre bekleyip yeniden deneyin."
+        )
+
+    if response.status_code in (418,):
+        raise BinanceAPIError(
+            "Binance IP geçici olarak engellenmiş olabilir (HTTP 418)."
+        )
+
+    if not response.ok:
+        raise BinanceAPIError(
+            f"Binance HTTP {response.status_code}: "
+            f"{response.text[:250]}"
+        )
+
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise BinanceAPIError(
+            "Binance geçerli JSON yanıtı döndürmedi."
+        ) from exc
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_instruments():
-    data = api_get(
-        "/api/v5/public/instruments",
-        {"instType": "SWAP"},
-    )
+def get_exchange_symbols():
+    """Get active Binance Spot USDT trading pairs."""
+    data = api_get("/api/v3/exchangeInfo")
 
-    return [
-        item["instId"]
-        for item in data
-        if item.get("state") == "live"
-        and item.get("settleCcy") == "USDT"
-        and item.get("ctType") == "linear"
-    ]
+    symbols = []
+    for item in data.get("symbols", []):
+        if (
+            item.get("status") == "TRADING"
+            and item.get("quoteAsset") == "USDT"
+            and item.get("isSpotTradingAllowed", True)
+            and item.get("symbol", "").endswith("USDT")
+        ):
+            symbols.append(item["symbol"])
+
+    return symbols
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def get_tickers():
-    return api_get(
-        "/api/v5/market/tickers",
-        {"instType": "SWAP"},
-    )
-
-
-def build_market_table(symbols, tickers, min_volume):
-    symbol_set = set(symbols)
-    rows = []
-
-    for item in tickers:
-        symbol = item.get("instId")
-
-        if symbol not in symbol_set:
-            continue
-
-        try:
-            last = float(item.get("last", 0))
-            open24 = float(item.get("open24h", 0))
-            high24 = float(item.get("high24h", 0))
-            low24 = float(item.get("low24h", 0))
-            volume = float(item.get("vol24h", 0))
-        except (TypeError, ValueError):
-            continue
-
-        if last <= 0 or open24 <= 0 or volume < min_volume:
-            continue
-
-        rows.append({
-            "Symbol": symbol,
-            "24h change (%)": (last / open24 - 1) * 100,
-            "Last price": last,
-            "24h high": high24,
-            "24h low": low24,
-            "24h volume (contracts)": volume,
-        })
-
-    df = pd.DataFrame(rows)
-
-    if df.empty:
-        return df
-
-    df = df.sort_values(
-        "24h change (%)",
-        ascending=False,
-    ).reset_index(drop=True)
-
-    df.insert(0, "Rank", np.arange(1, len(df) + 1))
-    return df
-
-
-# ---------------- CANDLES ----------------
-
-def parse_candles(data):
-    if not data:
-        raise RuntimeError("No candle data returned.")
-
-    df = pd.DataFrame(
-        data,
-        columns=[
-            "timestamp", "open", "high", "low", "close",
-            "volume", "volume_currency", "volume_quote", "confirm",
-        ],
-    )
-
-    for col in [
-        "timestamp", "open", "high", "low",
-        "close", "volume", "volume_quote",
-    ]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df = df[df["confirm"].astype(str) == "1"].copy()
-    df = df.dropna(
-        subset=["timestamp", "open", "high", "low", "close", "volume"]
-    )
-    df = df.drop_duplicates("timestamp")
-    df = df.sort_values("timestamp").reset_index(drop=True)
-
-    df["datetime"] = pd.to_datetime(
-        df["timestamp"], unit="ms", utc=True
-    )
-
-    return df
-
-
-def get_candles(symbol, target=500):
-    frames = []
-    seen = set()
-
-    latest = parse_candles(
-        api_get(
-            "/api/v5/market/candles",
-            {
-                "instId": symbol,
-                "bar": INTERVAL,
-                "limit": str(min(target, 300)),
-            },
-        )
-    )
-
-    frames.append(latest)
-    seen.update(latest["timestamp"].astype(int).tolist())
-    before = int(latest["timestamp"].min())
-
-    for _ in range(12):
-        combined = pd.concat(frames, ignore_index=True)
-        combined = combined.drop_duplicates("timestamp")
-
-        if len(combined) >= target:
-            break
-
-        page = api_get(
-            "/api/v5/market/history-candles",
-            {
-                "instId": symbol,
-                "bar": INTERVAL,
-                "limit": "100",
-                "after": str(before),
-            },
-        )
-
-        older = parse_candles(page)
-        new_rows = older[
-            ~older["timestamp"].astype(int).isin(seen)
-        ].copy()
-
-        if new_rows.empty:
-            break
-
-        seen.update(new_rows["timestamp"].astype(int).tolist())
-        frames.append(new_rows)
-
-        new_before = int(new_rows["timestamp"].min())
-        if new_before >= before:
-            break
-
-        before = new_before
-        time.sleep(0.12)
-
-    result = pd.concat(frames, ignore_index=True)
-    result = result.drop_duplicates("timestamp")
-    result = result.sort_values("timestamp").tail(target)
-    result = result.reset_index(drop=True)
-
-    if len(result) < 150:
-        raise RuntimeError("Not enough completed candles.")
-
-    return result
-
-
-# ---------------- MODEL ----------------
-
-def make_features(df):
-    close = df["close"].replace(0, np.nan)
-    open_price = df["open"].replace(0, np.nan)
-    high = df["high"]
-    low = df["low"]
-    volume = df["volume"].replace(0, np.nan)
-
-    f = pd.DataFrame(index=df.index)
-
-    for lag in [1, 2, 3, 4, 8, 12, 24, 48, 96]:
-        f[f"return_{lag}"] = close.pct_change(lag)
-
-    f["body"] = (df["close"] - df["open"]) / open_price
-    f["range"] = (high - low) / close
-
-    candle_range = (high - low).replace(0, np.nan)
-    f["close_position"] = (df["close"] - low) / candle_range
-
-    f["upper_wick"] = (
-        high - df[["open", "close"]].max(axis=1)
-    ) / close
-
-    f["lower_wick"] = (
-        df[["open", "close"]].min(axis=1) - low
-    ) / close
-
-    returns = close.pct_change()
-
-    for window in [4, 8, 16, 32, 64]:
-        f[f"mean_return_{window}"] = returns.rolling(window).mean()
-        f[f"volatility_{window}"] = returns.rolling(window).std()
-        f[f"range_mean_{window}"] = f["range"].rolling(window).mean()
-
-    for lag in [1, 2, 4, 8]:
-        f[f"volume_change_{lag}"] = volume / volume.shift(lag) - 1
-
-    f["relative_volume_24"] = volume / volume.rolling(24).mean() - 1
-    f["relative_volume_48"] = volume / volume.rolling(48).mean() - 1
-
-    return f.replace([np.inf, -np.inf], np.nan)
-
-
-def sigmoid(z):
-    return 1 / (1 + np.exp(-np.clip(z, -35, 35)))
-
-
-def train_model(X, y, epochs=400, learning_rate=0.04):
-    n, p = X.shape
-    weights = np.zeros(p)
-    bias = 0.0
-
-    for epoch in range(epochs):
-        pred = sigmoid(X @ weights + bias)
-        error = pred - y
-
-        grad_w = X.T @ error / n + 0.005 * weights
-        grad_b = error.mean()
-        lr = learning_rate / (1 + epoch / 200)
-
-        weights -= lr * grad_w
-        bias -= lr * grad_b
-
-    return weights, bias
-
-
-def analyze_model(df):
-    features = make_features(df)
-    future_return = df["close"].shift(-4) / df["close"] - 1
-
-    valid = features.notna().all(axis=1) & future_return.notna()
-    X = features.loc[valid].to_numpy(dtype=float)
-    y = (future_return.loc[valid].to_numpy() > 0).astype(float)
-
-    if len(X) < 180:
-        raise RuntimeError("Not enough training data.")
-
-    split = int(len(X) * 0.8)
-    split = max(60, min(split, len(X) - 30))
-
-    X_train_raw = X[:split]
-    X_test_raw = X[split:]
-    y_train = y[:split]
-    y_test = y[split:]
-
-    mean_train = X_train_raw.mean(axis=0)
-    std_train = X_train_raw.std(axis=0)
-    std_train[std_train < 1e-9] = 1.0
-
-    X_train = (X_train_raw - mean_train) / std_train
-    X_test = (X_test_raw - mean_train) / std_train
-
-    weights, bias = train_model(X_train, y_train)
-
-    test_pred = (
-        sigmoid(X_test @ weights + bias) >= 0.5
-    ).astype(float)
-
-    accuracy = float((test_pred == y_test).mean() * 100)
-
-    class_scores = []
-    for label in [0.0, 1.0]:
-        mask = y_test == label
-        if mask.any():
-            class_scores.append(
-                float((test_pred[mask] == y_test[mask]).mean())
-            )
-
-    balanced_accuracy = (
-        float(np.mean(class_scores) * 100)
-        if class_scores else accuracy
-    )
-
-    mean_all = X.mean(axis=0)
-    std_all = X.std(axis=0)
-    std_all[std_all < 1e-9] = 1.0
-
-    X_all = (X - mean_all) / std_all
-    weights, bias = train_model(X_all, y)
-
-    latest = features.iloc[[-1]].to_numpy(dtype=float)
-
-    if not np.isfinite(latest).all():
-        raise RuntimeError("Invalid latest candle features.")
-
-    p_up = float(
-        sigmoid(((latest - mean_all) / std_all) @ weights + bias)[0]
-    )
-
+    """Retrieve current 24-hour ticker statistics."""
+    data = api_get("/api/v3/ticker/24hr")
     return {
-        "Signal": "BUY" if p_up >= 0.5 else "SELL",
-        "BUY probability (%)": round(p_up * 100, 2),
-        "SELL probability (%)": round((1 - p_up) * 100, 2),
-        "Test accuracy (%)": round(accuracy, 2),
-        "Balanced accuracy (%)": round(balanced_accuracy, 2),
-        "Test samples": len(X_test),
+        item["symbol"]: item
+        for item in data
+        if "symbol" in item
     }
 
 
-# ---------------- MARKET REFRESH FRAGMENT ----------------
-
-@st.fragment(run_every="1h")
-def market_panel():
-    st.subheader("Live Futures Market")
-
-    min_volume = st.number_input(
-        "Minimum 24h volume (contracts)",
-        min_value=0.0,
-        value=0.0,
-        step=1000.0,
-        key="min_volume",
+def get_klines(symbol, interval, limit):
+    return api_get(
+        "/api/v3/klines",
+        {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit
+        }
     )
 
-    if st.button("Refresh market now", key="refresh_market"):
-        get_instruments.clear()
-        get_tickers.clear()
 
+def analyze_symbol(symbol, ticker, proximity_pct):
+    """
+    Dip:
+      Current price is within proximity_pct of the lowest daily
+      low over the last 30 completed daily candles.
+
+    Confirmation:
+      The last two completed 15m candles have rising closes.
+
+    BUY when both conditions hold; otherwise SELL.
+    This is a simple screening rule, not a prediction guarantee.
+    """
     try:
-        symbols = get_instruments()
-        tickers = get_tickers()
-        market = build_market_table(symbols, tickers, min_volume)
+        price = float(ticker["lastPrice"])
+        change_24h = float(ticker["priceChangePercent"])
+        quote_volume = float(ticker["quoteVolume"])
 
-        if market.empty:
-            st.warning("No contracts returned by the API.")
-            return
+        # 31 candles allow exclusion of the current incomplete day.
+        daily = get_klines(symbol, "1d", 31)
+        if len(daily) < 30:
+            return None
 
-        top = market.iloc[0]
-        rising = int((market["24h change (%)"] > 0).sum())
-        falling = int((market["24h change (%)"] < 0).sum())
+        # Exclude the latest potentially incomplete daily candle.
+        completed_daily = daily[:-1][-30:]
+        lows = [float(candle[3]) for candle in completed_daily]
+        low_30d = min(lows)
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("USDT perpetual contracts", len(market))
-        c2.metric("Rising", rising)
-        c3.metric("Falling", falling)
-        c4.metric(
-            "Top 24h mover",
-            f"{top['Symbol']} {top['24h change (%)']:+.2f}%"
+        if low_30d <= 0:
+            return None
+
+        distance_pct = ((price / low_30d) - 1) * 100
+        near_low = distance_pct <= proximity_pct
+
+        # Binance returns the latest candle too; exclude it because
+        # the current 15m candle may still be forming.
+        candles_15m = get_klines(symbol, "15m", 5)
+        if len(candles_15m) < 4:
+            return None
+
+        completed_15m = candles_15m[:-1]
+        last_two = completed_15m[-2:]
+
+        previous_close = float(last_two[0][4])
+        last_close = float(last_two[1][4])
+
+        rising_confirmation = last_close > previous_close
+
+        # No HOLD category: every successfully analyzed coin is BUY or SELL.
+        signal = (
+            "BUY"
+            if near_low and rising_confirmation
+            else "SELL"
         )
 
-        st.caption(
-            "Last market refresh (UTC): "
-            + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        )
-
-        st.dataframe(
-            market.head(20),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        with st.expander(f"All contracts ({len(market)})"):
-            st.dataframe(
-                market,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        st.download_button(
-            "Download market CSV",
-            data=market.to_csv(index=False).encode("utf-8-sig"),
-            file_name="futures_market.csv",
-            mime="text/csv",
-            key="download_market",
-        )
-
-    except Exception as exc:
-        st.error("Market data request failed.")
-        st.code(str(exc))
-
-
-# ---------------- MAIN APP ----------------
-
-st.title("📈 Smart Futures AI Scanner")
-st.caption(
-    "OKX public USDT perpetual data | Hourly market refresh | BUY / SELL"
-)
-
-market_panel()
-
-st.divider()
-st.subheader("🤖 BUY / SELL Model Scan")
-
-scan_count = st.selectbox(
-    "How many contracts should the model analyze?",
-    ["TOP 20", "TOP 50", "TOP 100", "ALL CONTRACTS"],
-)
-
-candle_count = st.selectbox(
-    "Historical 15-minute candles per contract",
-    [200, 300, 500, 800, 1000],
-    index=2,
-)
-
-min_probability = st.slider(
-    "Minimum BUY/SELL probability (%)",
-    50, 95, 60,
-)
-
-min_accuracy = st.slider(
-    "Minimum balanced test accuracy (%)",
-    0, 90, 50,
-)
-
-signal_filter = st.selectbox(
-    "Signal filter",
-    ["ALL", "BUY", "SELL"],
-)
-
-if "model_results" not in st.session_state:
-    st.session_state["model_results"] = []
-
-
-if st.button("START MODEL SCAN"):
-    try:
-        with st.spinner("Loading market list..."):
-            symbols = get_instruments()
-            tickers = get_tickers()
-            market = build_market_table(symbols, tickers, 0)
-
-        if market.empty:
-            st.error("No market contracts found.")
-            st.stop()
-
-        if scan_count == "TOP 20":
-            selected_market = market.head(20)
-        elif scan_count == "TOP 50":
-            selected_market = market.head(50)
-        elif scan_count == "TOP 100":
-            selected_market = market.head(100)
+        reasons = []
+        if near_low:
+            reasons.append("30 günlük dibe yakın")
         else:
-            selected_market = market
+            reasons.append("Dip bölgesinin dışında")
 
-        results = []
-        progress = st.progress(0)
-        status = st.empty()
+        if rising_confirmation:
+            reasons.append("15 dk kapanışları yükseliyor")
+        else:
+            reasons.append("15 dk yükseliş teyidi yok")
 
-        for i, row in enumerate(selected_market.to_dict("records")):
-            symbol = row["Symbol"]
-            status.write(
-                f"Analyzing {symbol} ({i + 1}/{len(selected_market)})"
-            )
+        return {
+            "Symbol": symbol,
+            "Signal": signal,
+            "Price": price,
+            "30D Low": low_30d,
+            "Distance from 30D Low (%)": round(distance_pct, 2),
+            "24h Change (%)": round(change_24h, 2),
+            "24h Volume (USDT)": quote_volume,
+            "15m Previous Close": previous_close,
+            "15m Last Completed Close": last_close,
+            "Near 30D Low": "Yes" if near_low else "No",
+            "15m Rising": "Yes" if rising_confirmation else "No",
+            "Reason": " | ".join(reasons)
+        }
 
-            try:
-                candles = get_candles(symbol, candle_count)
-                prediction = analyze_model(candles)
-
-                results.append({
-                    "Symbol": symbol,
-                    "24h change (%)": row["24h change (%)"],
-                    "Signal": prediction["Signal"],
-                    "BUY probability (%)": prediction["BUY probability (%)"],
-                    "SELL probability (%)": prediction["SELL probability (%)"],
-                    "Test accuracy (%)": prediction["Test accuracy (%)"],
-                    "Balanced accuracy (%)": prediction["Balanced accuracy (%)"],
-                    "Last price": row["Last price"],
-                    "Test samples": prediction["Test samples"],
-                    "_candles": candles,
-                    "_error": "",
-                })
-
-            except Exception as exc:
-                results.append({
-                    "Symbol": symbol,
-                    "24h change (%)": row["24h change (%)"],
-                    "Signal": "DATA ERROR",
-                    "BUY probability (%)": np.nan,
-                    "SELL probability (%)": np.nan,
-                    "Test accuracy (%)": np.nan,
-                    "Balanced accuracy (%)": np.nan,
-                    "Last price": row["Last price"],
-                    "Test samples": 0,
-                    "_candles": None,
-                    "_error": str(exc),
-                })
-
-            progress.progress((i + 1) / len(selected_market))
-            time.sleep(0.15)
-
-        st.session_state["model_results"] = results
-        status.success("Model scan completed.")
-
-    except Exception as exc:
-        st.error("Could not start model scan.")
-        st.code(str(exc))
+    except BinanceAPIError:
+        raise
+    except (KeyError, TypeError, ValueError, IndexError):
+        return None
 
 
-results = st.session_state["model_results"]
+def fmt_price(value):
+    if pd.isna(value):
+        return "-"
+    return f"{value:.10g}"
 
-if results:
-    errors = [r for r in results if r["Signal"] == "DATA ERROR"]
-    good = [r for r in results if r["Signal"] in ("BUY", "SELL")]
 
-    if errors:
-        with st.expander(f"Data errors ({len(errors)})"):
-            for row in errors:
-                st.write(f"{row['Symbol']}: {row['_error']}")
+# ---------------- Sidebar settings ----------------
 
-    if good:
-        result_df = pd.DataFrame(good).sort_values(
-            "24h change (%)", ascending=False
-        )
+st.sidebar.header("Scanner Settings")
 
-        filtered = result_df[
-            (
-                (result_df["BUY probability (%)"] >= min_probability)
-                | (result_df["SELL probability (%)"] >= min_probability)
-            )
-            & (
-                result_df["Balanced accuracy (%)"] >= min_accuracy
-            )
-        ].copy()
+proximity_pct = st.sidebar.slider(
+    "30 günlük dipten maksimum uzaklık (%)",
+    min_value=0.5,
+    max_value=10.0,
+    value=3.0,
+    step=0.5
+)
 
-        if signal_filter != "ALL":
-            filtered = filtered[filtered["Signal"] == signal_filter]
+max_coins = st.sidebar.slider(
+    "Taranacak coin sayısı",
+    min_value=10,
+    max_value=150,
+    value=50,
+    step=10
+)
 
-        columns = [
-            "Symbol",
-            "24h change (%)",
-            "Signal",
-            "BUY probability (%)",
-            "SELL probability (%)",
-            "Test accuracy (%)",
-            "Balanced accuracy (%)",
-            "Last price",
-            "Test samples",
-        ]
+min_volume = st.sidebar.number_input(
+    "Minimum 24 saatlik hacim (USDT)",
+    min_value=0,
+    value=100000,
+    step=100000
+)
 
-        st.subheader("Model results — highest 24h change first")
-        st.dataframe(
-            filtered[columns],
-            use_container_width=True,
-            hide_index=True,
-        )
+auto_refresh = st.sidebar.checkbox(
+    "Her 5 dakikada bir yenile",
+    value=False
+)
 
-        st.download_button(
-            "Download model results CSV",
-            data=filtered[columns].to_csv(index=False).encode("utf-8-sig"),
-            file_name="smart_futures_results.csv",
-            mime="text/csv",
-        )
+if st.sidebar.button("Önbelleği temizle ve yenile"):
+    get_exchange_symbols.clear()
+    get_tickers.clear()
+    st.rerun()
 
-        chart_symbol = st.selectbox(
-            "Select contract for chart",
-            [r["Symbol"] for r in good],
-        )
 
-        selected = next(
-            r for r in good if r["Symbol"] == chart_symbol
-        )
+# ---------------- API access test ----------------
 
-        candles = selected["_candles"].set_index("datetime")
-        st.line_chart(
-            candles[["close"]],
-            y="close",
-            use_container_width=True,
-        )
+try:
+    with st.spinner("Binance Spot API erişimi test ediliyor..."):
+        # A lightweight public endpoint to test connectivity.
+        server_time = api_get("/api/v3/time")
+        symbols = get_exchange_symbols()
+        tickers = get_tickers()
 
-        a, b, c, d = st.columns(4)
-        a.metric("Signal", selected["Signal"])
-        b.metric("24h change", f"{selected['24h change (%)']:+.2f}%")
-        c.metric("BUY probability", f"{selected['BUY probability (%)']:.2f}%")
-        d.metric("SELL probability", f"{selected['SELL probability (%)']:.2f}%")
+except BinanceAPIError as exc:
+    st.error(str(exc))
+    st.info(
+        "API erişimi sağlanamadığı için tarama durduruldu. "
+        "Bölgesel erişim kısıtlamaları aşılmaya çalışılmaz."
+    )
+    st.stop()
+
+st.success(
+    f"Binance Spot API erişilebilir. "
+    f"Spot pariteleri: {len(symbols):,}"
+)
+
+# ---------------- Build scan universe ----------------
+
+ticker_rows = []
+
+for symbol in symbols:
+    ticker = tickers.get(symbol)
+    if not ticker:
+        continue
+
+    try:
+        volume = float(ticker.get("quoteVolume", 0))
+        price = float(ticker.get("lastPrice", 0))
+
+        if volume >= min_volume and price > 0:
+            ticker_rows.append({
+                "symbol": symbol,
+                "ticker": ticker,
+                "volume": volume,
+                "change": float(ticker.get("priceChangePercent", 0))
+            })
+    except (TypeError, ValueError):
+        continue
+
+# Scan liquid pairs first.
+ticker_rows.sort(key=lambda row: row["volume"], reverse=True)
+universe = ticker_rows[:max_coins]
+
+st.write(
+    f"**Taranacak coin sayısı:** {len(universe)} "
+    f"| **Dip eşiği:** %{proximity_pct:.1f} "
+    f"| **Zaman dilimi:** 15 dakika"
+)
+
+if not universe:
+    st.warning(
+        "Filtrelere uyan coin bulunamadı. Minimum hacim değerini azaltın."
+    )
+    st.stop()
+
+# ---------------- Scan ----------------
+
+results = []
+errors = 0
+progress = st.progress(0)
+status = st.empty()
+
+# Small worker pool helps limit concurrent API requests.
+with ThreadPoolExecutor(max_workers=3) as executor:
+    futures = {
+        executor.submit(
+            analyze_symbol,
+            row["symbol"],
+            row["ticker"],
+            proximity_pct
+        ): row["symbol"]
+        for row in universe
+    }
+
+    total = len(futures)
+
+    for index, future in enumerate(as_completed(futures), start=1):
+        symbol = futures[future]
+        try:
+            result = future.result()
+            if result:
+                results.append(result)
+            else:
+                errors += 1
+        except BinanceAPIError as exc:
+            st.error(str(exc))
+            st.stop()
+        except Exception:
+            errors += 1
+
+        progress.progress(index / total)
+        status.text(f"Taranıyor: {index}/{total} — {symbol}")
+
+progress.empty()
+status.empty()
+
+if not results:
+    st.warning(
+        "Analiz edilebilir sonuç alınamadı. Daha sonra tekrar deneyin."
+    )
+    st.stop()
+
+df = pd.DataFrame(results)
+df = df.sort_values(
+    by=["Signal", "Distance from 30D Low (%)"],
+    ascending=[True, True]
+).reset_index(drop=True)
+
+buy_df = df[df["Signal"] == "BUY"].copy()
+sell_df = df[df["Signal"] == "SELL"].copy()
+
+# ---------------- Summary ----------------
+
+col1, col2, col3, col4 = st.columns(4)
+
+col1.metric("Taranan", len(df))
+col2.metric("BUY sinyali", len(buy_df))
+col3.metric("SELL sinyali", len(sell_df))
+col4.metric("Analiz edilemeyen", errors)
 
 st.divider()
+
+# ---------------- BUY opportunities ----------------
+
+st.subheader("BUY — Dip ve yükseliş teyidi")
 st.caption(
-    "Market data refreshes every hour while the app is active. "
-    "Model predictions do not automatically rerun every hour. "
-    "This uses OKX data, not Binance data, and places no orders."
+    "BUY yalnızca fiyat 30 günlük dip eşiğinin içindeyse "
+    "ve son iki tamamlanmış 15 dakikalık mumun kapanışları yükseliyorsa verilir."
 )
+
+if buy_df.empty:
+    st.info("Şu anda tanımlanan iki koşulu birden karşılayan coin yok.")
+else:
+    st.dataframe(
+        buy_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Price": st.column_config.NumberColumn(format="%.8g"),
+            "30D Low": st.column_config.NumberColumn(format="%.8g"),
+            "Distance from 30D Low (%)": st.column_config.NumberColumn(
+                format="%.2f%%"
+            ),
+            "24h Change (%)": st.column_config.NumberColumn(
+                format="%.2f%%"
+            ),
+            "24h Volume (USDT)": st.column_config.NumberColumn(
+                format="%.0f"
+            )
+        }
+    )
+
+# ---------------- SELL signals ----------------
+
+with st.expander("SELL sinyalleri ve diğer taranan coinler"):
+    st.dataframe(
+        sell_df,
+        use_container_width=True,
+        hide_index=True
+    )
+
+# ---------------- Selected coin chart ----------------
+
+st.subheader("15 dakikalık mum grafiği")
+
+available_symbols = sorted(df["Symbol"].tolist())
+selected_symbol = st.selectbox(
+    "Grafiğini görmek istediğin coin",
+    available_symbols
+)
+
+try:
+    chart_candles = get_klines(selected_symbol, "15m", 100)
+    # Exclude the currently forming candle.
+    chart_candles = chart_candles[:-1]
+
+    chart_df = pd.DataFrame(
+        {
+            "Open time": pd.to_datetime(
+                [int(candle[0]) for candle in chart_candles],
+                unit="ms",
+                utc=True
+            ),
+            "Open": [float(candle[1]) for candle in chart_candles],
+            "High": [float(candle[2]) for candle in chart_candles],
+            "Low": [float(candle[3]) for candle in chart_candles],
+            "Close": [float(candle[4]) for candle in chart_candles],
+            "Volume": [float(candle[5]) for candle in chart_candles]
+        }
+    )
+
+    chart_df = chart_df.set_index("Open time")
+    st.line_chart(chart_df[["Close"]], use_container_width=True)
+
+    with st.expander("Son tamamlanmış mumların verileri"):
+        st.dataframe(
+            chart_df.tail(20),
+            use_container_width=True
+        )
+
+except BinanceAPIError as exc:
+    st.warning(str(exc))
+
+# ---------------- Download ----------------
+
+csv_data = df.to_csv(index=False).encode("utf-8-sig")
+
+st.download_button(
+    "Sonuçları CSV olarak indir",
+    data=csv_data,
+    file_name="binance_spot_dip_signals.csv",
+    mime="text/csv"
+)
+
+st.caption(
+    "Veriler Binance halka açık piyasa uç noktalarından alınır. "
+    "Bu uygulama emir göndermez, yatırım tavsiyesi vermez ve "
+    "kâr garantisi sunmaz. BUY/SELL etiketleri basit kurallara dayanır."
+)
+
+# Optional refresh. Requires a Streamlit version supporting fragments.
+if auto_refresh:
+    st.info(
+        "Otomatik yenileme için sayfayı 5 dakikada bir yeniden çalıştırın. "
+        "Bu sürümde otomatik yenileme zamanlayıcısı etkin değildir."
+    )
+```
