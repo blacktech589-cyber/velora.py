@@ -9,23 +9,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 BASE_URL = "https://www.okx.com"
 TIMEOUT = 15
 QUOTE_CURRENCY = "USDT"
-DAILY_LOOKBACK = 90
-MIN_SECONDS_BETWEEN_REQUESTS = 0.15
+MONTHS_LOOKBACK = 12
+MIN_SECONDS_BETWEEN_REQUESTS = 0.20
 
 st.set_page_config(
-    page_title="OKX Spot 90-Day Low Scanner",
+    page_title="OKX Spot 12-Month Low Scanner",
     page_icon="📉",
     layout="wide",
 )
 
-st.title("OKX Spot - 3 Aylık Dip Tarayıcı")
+st.title("OKX Spot - Son 12 Ayın Dip Tarayıcısı")
 st.caption(
-    "Aktif Spot USDT pariteleri | Son 90 tamamlanmış günlük mumun dibi | "
-    "15 dakikalık yükseliş teyidi | Emir gönderilmez"
+    "Aktif Spot USDT pariteleri | Son 12 tamamlanmış aylık mumun en düşüğü | "
+    "Tamamlanmış 15 dakikalık yükseliş teyidi | Emir gönderilmez"
 )
 
 session = requests.Session()
-session.headers.update({"User-Agent": "Spot-Dip-Scanner/1.1"})
+session.headers.update({"User-Agent": "Spot-Dip-Scanner/1.2"})
 
 _rate_lock = threading.Lock()
 _last_request_time = 0.0
@@ -36,10 +36,7 @@ class MarketAPIError(Exception):
 
 
 def api_get(path, params=None, retries=4):
-    """Rate-limited public API call with backoff for HTTP 429."""
     global _last_request_time
-
-    url = BASE_URL + path
 
     for attempt in range(retries + 1):
         with _rate_lock:
@@ -51,10 +48,14 @@ def api_get(path, params=None, retries=4):
             _last_request_time = time.monotonic()
 
         try:
-            response = session.get(url, params=params, timeout=TIMEOUT)
+            response = session.get(
+                BASE_URL + path,
+                params=params,
+                timeout=TIMEOUT,
+            )
         except requests.RequestException as exc:
             if attempt < retries:
-                time.sleep(min(2 ** attempt, 10))
+                time.sleep(min(2 ** (attempt + 1), 20))
                 continue
             raise MarketAPIError(f"Bağlantı hatası: {exc}") from exc
 
@@ -74,8 +75,8 @@ def api_get(path, params=None, retries=4):
                 time.sleep(min(max(delay, 2), 30))
                 continue
             raise MarketAPIError(
-                "HTTP 429: Tekrarlanan beklemelere rağmen istek sınırı aşıldı. "
-                "Tarama durduruldu. Daha az coin seçip sonra yeniden deneyin."
+                "HTTP 429: İstek sınırı tekrarlandı. Tarama durduruldu. "
+                "Daha az coin seçip bir süre sonra yeniden deneyin."
             )
 
         if not response.ok:
@@ -139,8 +140,11 @@ def get_candles(inst_id, bar, limit):
 
 
 def confirmed_candles(candles):
-    """OKX candle field 8: '1' means confirmed; '0' means incomplete."""
-    return [candle for candle in candles if len(candle) > 8 and candle[8] == "1"]
+    # OKX candle field 8: "1" means confirmed, "0" means incomplete.
+    return [
+        candle for candle in candles
+        if len(candle) > 8 and str(candle[8]) == "1"
+    ]
 
 
 def analyze_coin(inst_id, ticker, max_distance):
@@ -151,37 +155,37 @@ def analyze_coin(inst_id, ticker, max_distance):
     open24 = float(ticker.get("open24h", 0) or 0)
     change24 = (price / open24 - 1) * 100 if open24 > 0 else 0.0
 
-    # 91 requested to allow for an incomplete current candle;
-    # then use the last 90 confirmed daily candles.
-    daily_raw = get_candles(inst_id, "1D", 91)
-    daily = confirmed_candles(daily_raw)
-    if len(daily) < DAILY_LOOKBACK:
+    # One monthly candle contains that month's lowest traded price.
+    # Exclude the current, potentially incomplete month; then use the
+    # last 12 confirmed monthly candles to estimate the 12-month low.
+    monthly_raw = get_candles(inst_id, "1M", 14)
+    monthly = confirmed_candles(monthly_raw)
+    monthly = sorted(monthly, key=lambda candle: int(candle[0]), reverse=True)
+
+    if len(monthly) < MONTHS_LOOKBACK:
         return None
 
-    # OKX returns newest first. Keep 90 most recent confirmed candles.
-    daily_90 = daily[:DAILY_LOOKBACK]
-    low90 = min(float(candle[3]) for candle in daily_90)
-    if low90 <= 0:
+    last12_months = monthly[:MONTHS_LOOKBACK]
+    low12 = min(float(candle[3]) for candle in last12_months)
+    if low12 <= 0:
         return None
 
-    distance = (price / low90 - 1) * 100
+    distance = (price / low12 - 1) * 100
     near_low = distance <= max_distance
 
-    # Only make the second request for coins near their 90-day low.
-    # This greatly reduces calls and helps avoid HTTP 429.
     previous_close = None
     last_close = None
     rising = False
 
+    # Only query 15m candles when the coin is near its 12-month low.
     if near_low:
         raw15 = get_candles(inst_id, "15m", 6)
-        candles15 = confirmed_candles(raw15)
+        completed15 = confirmed_candles(raw15)
+        completed15 = sorted(completed15, key=lambda candle: int(candle[0]))
 
-        # Sort by timestamp ascending and compare the last two completed bars.
-        candles15 = sorted(candles15, key=lambda candle: int(candle[0]))
-        if len(candles15) >= 2:
-            previous_close = float(candles15[-2][4])
-            last_close = float(candles15[-1][4])
+        if len(completed15) >= 2:
+            previous_close = float(completed15[-2][4])
+            last_close = float(completed15[-1][4])
             rising = last_close > previous_close
 
     signal = "BUY" if near_low and rising else "SELL"
@@ -190,10 +194,10 @@ def analyze_coin(inst_id, ticker, max_distance):
         "Coin": inst_id,
         "Signal": signal,
         "Current Price": price,
-        "90D Lowest Price": low90,
-        "Distance From 90D Low (%)": round(distance, 3),
+        "12M Lowest Price": low12,
+        "Distance From 12M Low (%)": round(distance, 3),
         "24H Change (%)": round(change24, 2),
-        "Near 90D Low": near_low,
+        "Near 12M Low": near_low,
         "15M Previous Close": previous_close,
         "15M Last Completed Close": last_close,
         "15M Rising": rising,
@@ -203,19 +207,19 @@ def analyze_coin(inst_id, ticker, max_distance):
 st.sidebar.header("Ayarlar")
 
 max_distance = st.sidebar.slider(
-    "90 günlük dip seviyesine maksimum uzaklık (%)",
-    min_value=0.5,
+    "12 aylık dip seviyesine maksimum uzaklık (%)",
+    min_value=0.1,
     max_value=15.0,
-    value=3.0,
-    step=0.5,
+    value=1.0,
+    step=0.1,
 )
 
 max_coins = st.sidebar.slider(
     "Taranacak coin sayısı",
-    min_value=20,
-    max_value=300,
-    value=100,
-    step=20,
+    min_value=10,
+    max_value=200,
+    value=50,
+    step=10,
 )
 
 min_volume = st.sidebar.number_input(
@@ -234,7 +238,7 @@ if st.button("Taramayı başlat", type="primary"):
     st.session_state["run_scan"] = True
 
 if not st.session_state.get("run_scan", False):
-    st.info("Ayarları seçin ve 'Taramayı başlat' düğmesine basın.")
+    st.info("Ayarları belirleyip 'Taramayı başlat' düğmesine basın.")
     st.stop()
 
 try:
@@ -255,26 +259,25 @@ for inst_id in symbols:
         continue
     try:
         price = float(ticker.get("last", 0))
-        # volCcy24h is a quote-currency volume field on OKX Spot tickers.
         volume = float(ticker.get("volCcy24h", 0) or 0)
         if price > 0 and volume >= min_volume:
             universe.append((inst_id, ticker, volume))
     except (ValueError, TypeError):
         continue
 
-# Rank by 24h quote volume and cap scan size to reduce API pressure.
+# Limit scan size to reduce public API rate-limit pressure.
 universe.sort(key=lambda row: row[2], reverse=True)
 universe = universe[:max_coins]
 
 st.write(f"**Taranacak parite:** {len(universe)}")
 st.info(
-    "Tarama, son 90 tamamlanmış günlük mumun en düşük fiyatını kullanır. "
-    "15 dakikalık mum isteği yalnızca 90 günlük dip eşiğine yakın coinler "
-    "için gönderilir; bu, API isteklerini azaltır."
+    "12 aylık dip, son 12 tamamlanmış aylık mumun en düşük seviyesinden "
+    "hesaplanır. 15 dakikalık mumlar yalnızca dip eşiğine yakın coinler "
+    "için istenir."
 )
 
 if not universe:
-    st.warning("Filtreye uyan parite bulunamadı. Hacim eşiğini düşürün.")
+    st.warning("Filtreye uygun parite bulunamadı. Hacim eşiğini düşürün.")
     st.stop()
 
 results = []
@@ -283,7 +286,6 @@ fatal_error = None
 progress = st.progress(0)
 status = st.empty()
 
-# Keep concurrency low; api_get also rate-limits requests globally.
 with ThreadPoolExecutor(max_workers=2) as executor:
     futures = {
         executor.submit(analyze_coin, inst_id, ticker, max_distance): inst_id
@@ -303,7 +305,7 @@ with ThreadPoolExecutor(max_workers=2) as executor:
             for pending in futures:
                 pending.cancel()
             break
-        except Exception:
+        except (ValueError, TypeError, KeyError, IndexError):
             failures += 1
 
         progress.progress(index / max(total, 1))
@@ -315,17 +317,16 @@ status.empty()
 if fatal_error:
     st.error(fatal_error)
     st.info(
-        "İstek sınırı nedeniyle tarama durduysa taranacak coin sayısını "
-        "azaltıp bir süre sonra yeniden deneyin."
+        "HTTP 429 devam ederse coin sayısını azaltıp daha sonra tekrar deneyin."
     )
     st.stop()
 
 if not results:
-    st.warning("Analiz sonucu bulunamadı. Hacim filtresini kontrol edin.")
+    st.warning("Analiz sonucu alınamadı. Hacim filtresini kontrol edin.")
     st.stop()
 
 df = pd.DataFrame(results).sort_values(
-    "Distance From 90D Low (%)",
+    "Distance From 12M Low (%)",
     ascending=True,
 ).reset_index(drop=True)
 
@@ -338,7 +339,7 @@ c2.metric("BUY sinyali", len(buys))
 c3.metric("SELL sinyali", len(sells))
 c4.metric("Analiz edilemeyen", failures)
 
-st.subheader("90 günlük dip seviyesine en yakın coinler")
+st.subheader("Son 12 aylık dip seviyesine en yakın coinler")
 st.dataframe(df, use_container_width=True, hide_index=True)
 
 st.subheader("BUY - Dip ve yükseliş teyidi")
@@ -354,17 +355,17 @@ st.subheader("15 dakikalık kapanış grafiği")
 selected = st.selectbox("Coin seçin", df["Coin"].tolist())
 
 try:
-    raw = get_candles(selected, "15m", 100)
-    completed = confirmed_candles(raw)
-    completed = sorted(completed, key=lambda candle: int(candle[0]))
+    raw15 = get_candles(selected, "15m", 100)
+    completed15 = confirmed_candles(raw15)
+    completed15 = sorted(completed15, key=lambda candle: int(candle[0]))
 
     chart = pd.DataFrame({
         "Time": pd.to_datetime(
-            [int(candle[0]) for candle in completed],
+            [int(candle[0]) for candle in completed15],
             unit="ms",
             utc=True,
         ),
-        "Close": [float(candle[4]) for candle in completed],
+        "Close": [float(candle[4]) for candle in completed15],
     }).set_index("Time")
 
     st.line_chart(chart["Close"], use_container_width=True)
@@ -374,12 +375,13 @@ except MarketAPIError as exc:
 st.download_button(
     "CSV indir",
     data=df.to_csv(index=False).encode("utf-8-sig"),
-    file_name="okx_spot_90d_dip_scanner.csv",
+    file_name="okx_spot_12m_dip_scanner.csv",
     mime="text/csv",
 )
 
 st.caption(
-    "OKX halka açık Spot verileri kullanılır; Binance verisi değildir. "
-    "Emir gönderilmez. BUY/SELL yalnızca tarama etiketleridir ve kâr garantisi "
-    "vermez. SELL, otomatik satış emri anlamına gelmez."
+    "Veri kaynağı OKX Spot'tur; Binance verisi değildir. Emir gönderilmez. "
+    "12 aylık dip, son 12 tamamlanmış aylık mumun en düşük fiyatıdır; "
+    "bu takvim ayları bazlı bir yaklaşımdır. BUY/SELL yalnızca tarama "
+    "etiketleridir ve kâr garantisi vermez."
 )
