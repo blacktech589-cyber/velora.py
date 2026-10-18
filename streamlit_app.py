@@ -7,23 +7,24 @@ import streamlit as st
 BASE_URL = "https://www.okx.com"
 TIMEOUT = 20
 MIN_REQUEST_INTERVAL = 0.45
-LOOKBACK_DAYS = 365
+LOOKBACK_DAYS = 30
 DAY_MS = 24 * 60 * 60 * 1000
+MIN_HISTORY_CANDLES = 20
 
 st.set_page_config(
-    page_title="OKX 12-Month Low Scanner",
+    page_title="OKX 30-Day Low Scanner",
     page_icon="📉",
     layout="wide",
 )
 
-st.title("📉 12 Aylık Dipteki ve Zirvesinden %50+ Düşmüş Coinler")
+st.title("📉 Son 30 Günün Dibine En Yakın Coinler")
 st.caption(
-    "OKX Spot USDT | Son 365 günlük günlük mumlar | Aktif pariteler | "
-    "Tüm uygun aktif pariteler taranır | Otomatik emir yok"
+    "OKX Spot USDT | Son 30 günlük tamamlanmış günlük mumlar | "
+    "Yalnızca aktif pariteler | Otomatik emir yok"
 )
 
 session = requests.Session()
-session.headers.update({"User-Agent": "OKX-365D-Low-Scanner/2.0"})
+session.headers.update({"User-Agent": "OKX-30D-Low-Scanner/3.0"})
 rate_lock = threading.Lock()
 last_request_time = 0.0
 
@@ -61,7 +62,7 @@ def api_get(path, params=None, retries=5):
         if response.status_code == 451:
             raise RestrictedError(
                 "HTTP 451: OKX API bu bağlantı konumundan erişimi kısıtlıyor. "
-                "Kısıtlama aşılmaya çalışılmadan tarama durduruldu."
+                "Tarama durduruldu; bölgesel kısıtlamayı aşmaya çalışılmadı."
             )
 
         if response.status_code == 429:
@@ -74,8 +75,7 @@ def api_get(path, params=None, retries=5):
                 time.sleep(min(max(delay, 2), 60))
                 continue
             raise RateLimitError(
-                "HTTP 429: OKX istek sınırı aşıldı. Tarama güvenli şekilde durduruldu. "
-                "Bir süre sonra yeniden deneyin."
+                "HTTP 429: OKX istek sınırı aşıldı. Bir süre sonra yeniden deneyin."
             )
 
         if not response.ok:
@@ -95,9 +95,10 @@ def api_get(path, params=None, retries=5):
     raise MarketAPIError("API isteği tamamlanamadı.")
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def get_active_symbols():
     payload = api_get("/api/v5/public/instruments", {"instType": "SPOT"})
+    # OKX instrument listesinde state='live' olan aktif Spot USDT çiftlerini al.
     return sorted({
         item["instId"]
         for item in payload.get("data", [])
@@ -107,7 +108,7 @@ def get_active_symbols():
     })
 
 
-@st.cache_data(ttl=180, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def get_tickers():
     payload = api_get("/api/v5/market/tickers", {"instType": "SPOT"})
     return {
@@ -129,61 +130,19 @@ def confirmed_candles(rows):
     return valid
 
 
-def get_candles_page(symbol, after=None, limit=300):
-    params = {
-        "instId": symbol,
-        "bar": "1Dutc",
-        "limit": str(limit),
-    }
-    if after is not None:
-        params["after"] = str(after)
-    payload = api_get("/api/v5/market/candles", params)
-    return payload.get("data", [])
-
-
-def get_last_365d_candles(symbol):
-    """Fetch enough daily candles to cover the last 365 days, paging older if needed."""
+def get_last_30d_candles(symbol):
+    """Fetch confirmed daily candles covering the most recent 30 days."""
     now_ms = int(time.time() * 1000)
     cutoff_ms = now_ms - LOOKBACK_DAYS * DAY_MS
 
-    all_rows = get_candles_page(symbol, limit=300)
-    if not all_rows:
-        return []
+    payload = api_get(
+        "/api/v5/market/candles",
+        {"instId": symbol, "bar": "1Dutc", "limit": "100"},
+    )
+    rows = confirmed_candles(payload.get("data", []))
 
-    # Usually two requests cover 365 days (API returns max 300 per request).
-    for _ in range(3):
-        try:
-            oldest_ts = min(int(row[0]) for row in all_rows)
-        except (ValueError, TypeError, IndexError):
-            break
-
-        if oldest_ts <= cutoff_ms:
-            break
-
-        older_rows = get_candles_page(symbol, after=oldest_ts, limit=300)
-        if not older_rows:
-            break
-
-        existing_timestamps = {
-            int(row[0]) for row in all_rows
-            if row and str(row[0]).isdigit()
-        }
-        new_rows = []
-        for row in older_rows:
-            try:
-                ts = int(row[0])
-                if ts < oldest_ts and ts not in existing_timestamps:
-                    new_rows.append(row)
-            except (ValueError, TypeError, IndexError):
-                continue
-
-        if not new_rows:
-            break
-        all_rows.extend(new_rows)
-
-    candles = confirmed_candles(all_rows)
     unique = {}
-    for row in candles:
+    for row in rows:
         try:
             ts = int(row[0])
             if cutoff_ms <= ts <= now_ms:
@@ -194,109 +153,71 @@ def get_last_365d_candles(symbol):
     return [unique[ts] for ts in sorted(unique)]
 
 
-def analyze_coin(symbol, ticker, min_drop_pct, low_tolerance_pct):
-    current_price = float((ticker or {}).get("last", 0) or 0)
-    if current_price <= 0:
-        return None, "no_price"
-
-    candles = get_last_365d_candles(symbol)
-    if len(candles) < 360:
-        return None, "insufficient_history"
-
+def analyze_coin(symbol, ticker, low_tolerance_pct):
     try:
-        high_365d = max(float(row[2]) for row in candles)
-        low_365d = min(float(row[3]) for row in candles)
-    except (ValueError, TypeError, IndexError):
-        return None, "bad_candle_data"
-
-    if high_365d <= 0 or low_365d <= 0:
-        return None, "bad_candle_data"
-
-    drop_from_high_pct = (1.0 - current_price / high_365d) * 100.0
-    distance_from_low_pct = (current_price / low_365d - 1.0) * 100.0
-
-    # Only coins down at least the selected percentage are candidates.
-    if drop_from_high_pct < min_drop_pct:
-        return None, "not_down_enough"
-
-    # Keep near-misses so the app can show them instead of an empty screen.
-    matches_both = distance_from_low_pct <= low_tolerance_pct
-
-    previous_close = None
-    last_close = None
-    rising_15m = False
-    # Request 15m data only for coins that pass both price filters.
-    if matches_both:
-        try:
-            payload = api_get(
-                "/api/v5/market/candles",
-                {"instId": symbol, "bar": "15m", "limit": "6"},
-            )
-            candles_15m = confirmed_candles(payload.get("data", []))
-            candles_15m.sort(key=lambda row: int(row[0]))
-            if len(candles_15m) >= 2:
-                previous_close = float(candles_15m[-2][4])
-                last_close = float(candles_15m[-1][4])
-                rising_15m = last_close > previous_close
-        except MarketAPIError:
-            pass
-
-    try:
+        current_price = float((ticker or {}).get("last", 0) or 0)
         open_24h = float((ticker or {}).get("open24h", 0) or 0)
         volume_24h = float((ticker or {}).get("volCcy24h", 0) or 0)
     except (ValueError, TypeError):
-        open_24h = 0.0
-        volume_24h = 0.0
-    change_24h = (current_price / open_24h - 1) * 100 if open_24h > 0 else 0.0
+        return None, "bad_ticker"
+
+    if current_price <= 0:
+        return None, "no_price"
+
+    candles = get_last_30d_candles(symbol)
+    if len(candles) < MIN_HISTORY_CANDLES:
+        return None, "insufficient_history"
+
+    try:
+        high_30d = max(float(row[2]) for row in candles)
+        low_30d = min(float(row[3]) for row in candles)
+    except (ValueError, TypeError, IndexError):
+        return None, "bad_candle_data"
+
+    if high_30d <= 0 or low_30d <= 0:
+        return None, "bad_candle_data"
+
+    drop_from_high_pct = (1.0 - current_price / high_30d) * 100.0
+    distance_from_low_pct = (current_price / low_30d - 1.0) * 100.0
+    change_24h = (current_price / open_24h - 1.0) * 100.0 if open_24h > 0 else 0.0
 
     if distance_from_low_pct < 0:
-        low_status = "YENİ 365G DİBİNİN ALTINDA"
+        low_status = "YENİ 30G DİBİNİN ALTINDA"
     elif distance_from_low_pct <= 0.1:
-        low_status = "365G DİBİNDE"
-    elif matches_both:
-        low_status = "365G DİBİNE YAKIN"
+        low_status = "30G DİBİNDE"
+    elif distance_from_low_pct <= low_tolerance_pct:
+        low_status = "30G DİBİNE YAKIN"
     else:
-        low_status = "ADAY — DİPTEN TOLERANSTAN UZAK"
+        low_status = "30G DİBİNDEN UZAK"
 
-    result = {
+    return {
         "Coin": symbol,
-        "Filtre Durumu": "İKİ KOŞUL DA TAMAM" if matches_both else "%50+ DÜŞÜŞ VAR; DİBE UZAK",
         "Dip Durumu": low_status,
         "Güncel Fiyat": current_price,
-        "365G En Yüksek": high_365d,
-        "365G En Düşük": low_365d,
+        "30G En Yüksek": high_30d,
+        "30G En Düşük": low_30d,
         "Zirveden Düşüş (%)": round(drop_from_high_pct, 2),
         "Dibe Uzaklık (%)": round(distance_from_low_pct, 3),
         "24S Değişim (%)": round(change_24h, 2),
         "24S Hacim (USDT)": round(volume_24h, 2),
-        "15D Önceki Kapanış": previous_close,
-        "15D Son Kapanış": last_close,
-        "15D Yükseliş Teyidi": rising_15m,
-        "Kullanılan Günlük Mum": len(candles),
-        "Tam Filtreye Uygun": matches_both,
-    }
-    return result, "match" if matches_both else "not_near_low"
+        "Tamamlanmış Günlük Mum": len(candles),
+        "Dip Toleransında": distance_from_low_pct <= low_tolerance_pct,
+    }, "ok"
+
 
 st.sidebar.header("Filtreler")
-min_drop_pct = st.sidebar.slider(
-    "365 günlük zirveden minimum düşüş (%)",
-    min_value=50.0,
-    max_value=95.0,
-    value=50.0,
-    step=5.0,
-)
 low_tolerance_pct = st.sidebar.slider(
-    "365 günlük en düşük fiyattan maksimum uzaklık (%)",
+    "30 günlük dibin üstünde izin verilen uzaklık (%)",
     min_value=0.0,
-    max_value=5.0,
-    value=1.0,
-    step=0.1,
-    help="0% = fiyat geçmiş dip seviyesinde veya altında olmalı. Örneğin 1% = en fazla %1 üzerinde olabilir.",
+    max_value=10.0,
+    value=2.0,
+    step=0.25,
+    help="0% = fiyat 30 günlük dipte veya altında olmalı. 2% = dip fiyatının en fazla %2 üzerinde olabilir.",
 )
 
 st.sidebar.info(
-    "Coin sayısı ve hacim filtresi yoktur. Aktif Spot USDT pariteleri sırayla taranır. "
-    "Tüm coinler taranırken birkaç dakika sürebilir."
+    "Tüm aktif Spot USDT pariteleri taranır. Yeni listelenen ve yeterli 30 günlük "
+    "geçmişi olmayan pariteler dışarıda bırakılır. Tarama birkaç dakika sürebilir."
 )
 
 if st.sidebar.button("Önbelleği temizle"):
@@ -312,7 +233,7 @@ if not st.session_state.get("run_scan", False):
     st.stop()
 
 try:
-    with st.spinner("Aktif pariteler ve güncel fiyatlar alınıyor..."):
+    with st.spinner("Aktif Spot pariteler ve güncel fiyatlar alınıyor..."):
         api_get("/api/v5/public/time")
         symbols = get_active_symbols()
         tickers = get_tickers()
@@ -320,11 +241,11 @@ except MarketAPIError as exc:
     st.error(str(exc))
     st.stop()
 
-st.write(f"**OKX'te aktif görünen Spot USDT pariteleri:** {len(symbols)}")
+st.write(f"**Aktif OKX Spot USDT paritesi:** {len(symbols)}")
 st.caption(
-    "Ana sonuç listesi iki koşulu da karşılayan coinleri gösterir. Ayrıca, "
-    f"son 365 günlük zirvesinden en az %{min_drop_pct:.0f} düşmüş ama dip toleransını "
-    "karşılamayan coinler de yakın adaylar tablosunda gösterilir."
+    "Son 30 gündeki tamamlanmış günlük mumların en düşük fiyatı hesaplanır. "
+    "Sonuçlar güncel fiyatın bu dip seviyesine uzaklığına göre sıralanır. "
+    "Sadece OKX'te şu anda `live` görünen pariteler taranır."
 )
 
 results = []
@@ -334,7 +255,6 @@ short_history_count = 0
 fatal_error = None
 progress = st.progress(0)
 status = st.empty()
-match_status = st.empty()
 
 for idx, symbol in enumerate(symbols, start=1):
     ticker = tickers.get(symbol)
@@ -345,17 +265,13 @@ for idx, symbol in enumerate(symbols, start=1):
         continue
 
     try:
-        result, reason = analyze_coin(
-            symbol,
-            ticker,
-            min_drop_pct,
-            low_tolerance_pct,
-        )
+        result, reason = analyze_coin(symbol, ticker, low_tolerance_pct)
         if result is not None:
             results.append(result)
         elif reason == "insufficient_history":
             short_history_count += 1
-
+        else:
+            error_count += 1
     except RestrictedError as exc:
         fatal_error = str(exc)
         break
@@ -370,84 +286,62 @@ for idx, symbol in enumerate(symbols, start=1):
         error_count += 1
 
     progress.progress(idx / max(len(symbols), 1))
-    status.text(f"Taranıyor: {idx}/{len(symbols)} — {symbol}")
-    match_status.caption(f"Şu ana kadarki sonuç: {len(results)} coin")
+    status.text(f"Taranıyor: {idx}/{len(symbols)} — {symbol} | Bulunan: {len(results)}")
 
 progress.empty()
 status.empty()
-match_status.empty()
 
 if fatal_error:
     st.error(fatal_error)
-    st.warning(
-        f"Tarama {idx}/{len(symbols)} paritede durdu. Bulunan sonuçlar aşağıda gösterilebilir."
-    )
+    st.warning(f"Tarama {idx}/{len(symbols)} paritede durdu. Bulunan sonuçlar aşağıda gösterilebilir.")
 
 st.caption(
     f"Aktif parite: {len(symbols)} | Ticker olmayan: {no_ticker_count} | "
-    f"365 günlük geçmişi yetersiz: {short_history_count} | Veri/API hatası: {error_count}"
+    f"30 günlük geçmişi yetersiz: {short_history_count} | Veri/API hatası: {error_count}"
 )
 
 if not results:
     st.warning(
-        f"Son 365 günlük zirvesinden en az %{min_drop_pct:.0f} düşmüş coin bulunamadı. "
-        "Bu durumda dibe yakınlık filtresi değil, minimum düşüş koşulu sonuçları sınırlıyor olabilir."
+        "Sonuç bulunamadı. API erişimini, aktif pariteleri veya yeterli geçmiş veriyi kontrol edin."
     )
     st.stop()
 
 results_df = pd.DataFrame(results).sort_values(
-    "Dibe Uzaklık (%)", ascending=True
+    ["Dibe Uzaklık (%)", "Zirveden Düşüş (%)"],
+    ascending=[True, False],
 ).reset_index(drop=True)
-strict_df = results_df[results_df["Tam Filtreye Uygun"]].copy()
-near_misses = results_df[~results_df["Tam Filtreye Uygun"]].copy()
-new_lows = strict_df[strict_df["Dibe Uzaklık (%)"] < 0].copy()
-rising_15m = strict_df[strict_df["15D Yükseliş Teyidi"]].copy()
+
+near_low_df = results_df[results_df["Dip Toleransında"]].copy()
+new_lows = results_df[results_df["Dibe Uzaklık (%)"] < 0].copy()
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Aktif parite", len(symbols))
-c2.metric("İki koşula uyan", len(strict_df))
-c3.metric("%50+ düşmüş aday", len(results_df))
-c4.metric("15D yükseliş teyidi", len(rising_15m))
+c2.metric("Yeterli geçmişi olan", len(results_df))
+c3.metric("Seçilen dip toleransında", len(near_low_df))
+c4.metric("Yeni 30G dibi yapan", len(new_lows))
 
-st.subheader("İki koşulu da karşılayan coinler")
-if strict_df.empty:
-    st.warning(
-        "Hiçbir coin aynı anda hem %50+ düşüş hem de dip toleransı koşulunu karşılamadı. "
-        "Aşağıdaki adaylar %50+ düşmüş coinlerdir; ancak seçilen dip toleransının dışındadır."
-    )
+st.subheader("30 günlük kendi dibine en yakın coinler")
+st.dataframe(results_df, use_container_width=True, hide_index=True)
+
+st.subheader(f"30 günlük dibin en fazla %{low_tolerance_pct:g} üzerinde olanlar")
+if near_low_df.empty:
+    st.info("Seçilen toleransta coin bulunamadı. Toleransı artırabilir veya tüm sonuçları inceleyebilirsiniz.")
 else:
-    st.dataframe(strict_df, use_container_width=True, hide_index=True)
+    st.dataframe(near_low_df, use_container_width=True, hide_index=True)
 
-st.subheader("Yakın adaylar — %50+ düşmüş, fakat dip toleransının dışında")
-if near_misses.empty:
-    st.info("Dip toleransının dışında kalan aday yok.")
-else:
-    st.dataframe(near_misses, use_container_width=True, hide_index=True)
-
-st.subheader("Önceki 365 günlük dip fiyatının altına inen, tam filtreye uyanlar")
+st.subheader("Son 30 günlük dip seviyesinin altındaki coinler")
 if new_lows.empty:
-    st.info("Tam filtreye uyan coinler arasında geçmiş 365 günlük dip seviyesinin altında olan yok.")
+    st.info("Güncel fiyatı hesaplanan 30 günlük en düşük seviyenin altında olan coin yok.")
 else:
     st.dataframe(new_lows, use_container_width=True, hide_index=True)
 
-st.subheader("Tam filtreye uyup son iki tamamlanmış 15 dakikalık kapanışı yükselenler")
-if rising_15m.empty:
-    st.info("Tam filtreye uyan coinler arasında 15 dakikalık yükseliş teyidi olan yok.")
-else:
-    st.dataframe(rising_15m, use_container_width=True, hide_index=True)
-
-st.subheader("15 dakikalık fiyat grafiği")
+st.subheader("30 günlük fiyat grafiği")
 selected = st.selectbox("Coin seçin", results_df["Coin"].tolist())
 try:
-    payload = api_get(
-        "/api/v5/market/candles",
-        {"instId": selected, "bar": "15m", "limit": "100"},
-    )
-    candles = confirmed_candles(payload.get("data", []))
-    candles.sort(key=lambda row: int(row[0]))
+    chart_rows = get_last_30d_candles(selected)
     chart = pd.DataFrame({
-        "Zaman (UTC)": pd.to_datetime([int(row[0]) for row in candles], unit="ms", utc=True),
-        "Kapanış": [float(row[4]) for row in candles],
+        "Zaman (UTC)": pd.to_datetime([int(row[0]) for row in chart_rows], unit="ms", utc=True),
+        "Kapanış": [float(row[4]) for row in chart_rows],
     })
     if not chart.empty:
         st.line_chart(chart.set_index("Zaman (UTC)")["Kapanış"], use_container_width=True)
@@ -457,14 +351,14 @@ except MarketAPIError as exc:
 st.download_button(
     "CSV indir",
     data=results_df.to_csv(index=False).encode("utf-8-sig"),
-    file_name="okx_all_active_365d_lows_down_50pct.csv",
+    file_name="okx_active_spot_usdt_30d_lows.csv",
     mime="text/csv",
 )
 
 st.caption(
-    "Yalnızca OKX'te state='live' olan Spot USDT pariteleri taranır. "
-    "Her coin için son 365 günün tamamlanmış UTC günlük mumları kullanılır; "
-    "365 güne yakın geçmişi olmayan yeni listelenmiş coinler dışlanır. "
-    "Canlı fiyat günlük mumun son kapanışından farklı olabilir. Aktif görünmek, "
-    "bir coinin geçmişte hiç delist edilmediğini garanti etmez. BUY/SELL emri verilmez."
+    "Yalnızca OKX'te tarama anında `state='live'` olan Spot USDT pariteleri dahil edilir. "
+    "Bu filtre şu anda aktif olmayan/delist edilmiş pariteleri dışarıda bırakır; "
+    "geçmişte hiç delist edilip yeniden listelenmediğini garanti etmez. "
+    "Hesaplamada son 30 günlük tamamlanmış UTC günlük mumlar kullanılır. "
+    "Bu araç otomatik BUY/SELL emri vermez; dipte olmak fiyatın yükselmesini garanti etmez."
 )
