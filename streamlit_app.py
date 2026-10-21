@@ -4,1070 +4,648 @@ import os
 import sqlite3
 import tempfile
 import time
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
-TITLE = "Velora — EMA 15 + Bollinger Bands"
-TARGET = 100_000
-LIMIT = 1_000
-TIMEOUT = 15
+# ============================================================
+# VELORA — 3-CANDLE REVERSAL SCANNER
+# BUY: swing low, then 3 consecutive rising/green candles.
+# SELL: swing high, then 3 consecutive falling/red candles.
+# Auto-scan refresh interval: 40 seconds. No trade execution.
+# ============================================================
+
+APP_VERSION = "velora-reversal-40s-v1"
+REFRESH_MS = 40_000
+DEFAULT_HISTORY = 1_000
+TARGET_HISTORY = 100_000
+REQUEST_TIMEOUT = 15
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 VeloraScanner/3.0",
-    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0 (compatible; VeloraScanner/4.0)",
+    "Accept": "application/json,text/plain,*/*",
 }
-
-BINANCE = [
+BINANCE_ENDPOINTS = [
     "https://data-api.binance.vision",
     "https://api.binance.com",
     "https://api1.binance.com",
     "https://api2.binance.com",
 ]
 
-ASSETS = [
-    {"name": "Bitcoin", "symbol": "BTCUSDT", "category": "Crypto", "kind": "crypto"},
-    {"name": "Ethereum", "symbol": "ETHUSDT", "category": "Crypto", "kind": "crypto"},
-    {"name": "Solana", "symbol": "SOLUSDT", "category": "Crypto", "kind": "crypto"},
-    {"name": "XRP", "symbol": "XRPUSDT", "category": "Crypto", "kind": "crypto"},
-    {"name": "Dogecoin", "symbol": "DOGEUSDT", "category": "Crypto", "kind": "crypto"},
-    {"name": "Cardano", "symbol": "ADAUSDT", "category": "Crypto", "kind": "crypto"},
-    {"name": "Avalanche", "symbol": "AVAXUSDT", "category": "Crypto", "kind": "crypto"},
-    {"name": "Chainlink", "symbol": "LINKUSDT", "category": "Crypto", "kind": "crypto"},
-    {"name": "EUR/USD", "symbol": "EURUSD=X", "category": "Forex", "kind": "yahoo"},
-    {"name": "GBP/USD", "symbol": "GBPUSD=X", "category": "Forex", "kind": "yahoo"},
-    {"name": "USD/JPY", "symbol": "JPY=X", "category": "Forex", "kind": "yahoo"},
-    {"name": "AUD/USD", "symbol": "AUDUSD=X", "category": "Forex", "kind": "yahoo"},
-    {"name": "USD/CAD", "symbol": "CAD=X", "category": "Forex", "kind": "yahoo"},
-    {"name": "USD/CHF", "symbol": "CHF=X", "category": "Forex", "kind": "yahoo"},
-    {"name": "NZD/USD", "symbol": "NZDUSD=X", "category": "Forex", "kind": "yahoo"},
-    {"name": "EUR/GBP", "symbol": "EURGBP=X", "category": "Forex", "kind": "yahoo"},
-    {"name": "Gold futures", "symbol": "GC=F", "category": "Other", "kind": "yahoo"},
-    {"name": "Apple", "symbol": "AAPL", "category": "Other", "kind": "yahoo"},
-    {"name": "Microsoft", "symbol": "MSFT", "category": "Other", "kind": "yahoo"},
-    {"name": "NVIDIA", "symbol": "NVDA", "category": "Other", "kind": "yahoo"},
+# Labels/payouts transcribed from the user's provided asset list.
+# Real market data providers do NOT provide Binomo's private OTC quotes.
+# Crypto symbols use public exchange Spot data as a clearly labelled proxy.
+RAW_ASSETS = [
+    ("Crypto IDX", "Crypto", "index", "CRYPTO_IDX", 82, 84),
+    ("Bitcoin (OTC)", "Crypto", "crypto", "BTCUSDT", 80, 82),
+    ("Ethereum (OTC)", "Crypto", "crypto", "ETHUSDT", 80, 82),
+    ("Solana (OTC)", "Crypto", "crypto", "SOLUSDT", 80, 82),
+    ("EUR/USD", "Forex", "fx", "EUR/USD", 80, 82),
+    ("EUR/HUF", "Forex", "fx", "EUR/HUF", 80, 82),
+    ("GBP/NOK", "Forex", "fx", "GBP/NOK", 80, 82),
+    ("CAD/JPY", "Forex", "fx", "CAD/JPY", 80, 82),
+    ("FC Barcelona Token (OTC)", "Crypto", "crypto", "BARUSDT", 80, 82),
+    ("AUD/ZAR", "Forex", "fx", "AUD/ZAR", 80, 82),
+    ("CAD/DKK", "Forex", "fx", "CAD/DKK", 80, 82),
+    ("EUR/ILS", "Forex", "fx", "EUR/ILS", 80, 82),
+    ("GBP/SGD", "Forex", "fx", "GBP/SGD", 80, 82),
+    ("USD/MXN", "Forex", "fx", "USD/MXN", 80, 82),
+    ("Cardano (OTC)", "Crypto", "crypto", "ADAUSDT", 80, 82),
+    ("EUR/ZAR", "Forex", "fx", "EUR/ZAR", 80, 82),
+    ("AUD/USD", "Forex", "fx", "AUD/USD", 80, 82),
+    ("GBP/HKD", "Forex", "fx", "GBP/HKD", 80, 82),
+    ("CAD/MXN", "Forex", "fx", "CAD/MXN", 80, 82),
+    ("EUR/NOK", "Forex", "fx", "EUR/NOK", 80, 82),
+    ("EUR/MXN", "Forex", "fx", "EUR/MXN", 80, 82),
+    ("CHF/JPY", "Forex", "fx", "CHF/JPY", 80, 82),
+    ("USD/ILS", "Forex", "fx", "USD/ILS", 80, 82),
+    ("USD/SEK", "Forex", "fx", "USD/SEK", 80, 82),
+    ("CAD/NOK", "Forex", "fx", "CAD/NOK", 80, 82),
+    ("CAD/SEK", "Forex", "fx", "CAD/SEK", 80, 82),
+    ("USD/PLN", "Forex", "fx", "USD/PLN", 80, 82),
+    ("AUD/JPY", "Forex", "fx", "AUD/JPY", 80, 82),
+    ("EUR/SEK", "Forex", "fx", "EUR/SEK", 80, 82),
+    ("AUD/SGD", "Forex", "fx", "AUD/SGD", 80, 82),
+    ("Chainlink (OTC)", "Crypto", "crypto", "LINKUSDT", 80, 82),
+    ("GBP/MXN", "Forex", "fx", "GBP/MXN", 80, 82),
+    ("CAD/SGD", "Forex", "fx", "CAD/SGD", 80, 82),
+    ("AUD/DKK", "Forex", "fx", "AUD/DKK", 80, 82),
+    ("EUR/SGD", "Forex", "fx", "EUR/SGD", 80, 82),
+    ("CHF/DKK", "Forex", "fx", "CHF/DKK", 80, 82),
+    ("GBP/PLN", "Forex", "fx", "GBP/PLN", 80, 82),
+    ("GBP/CZK", "Forex", "fx", "GBP/CZK", 80, 82),
+    ("EUR/NZD", "Forex", "fx", "EUR/NZD", 80, 82),
+    ("AUD/HUF", "Forex", "fx", "AUD/HUF", 80, 82),
+    ("EUR/JPY", "Forex", "fx", "EUR/JPY", 80, 82),
+    ("USD/HUF", "Forex", "fx", "USD/HUF", 80, 82),
+    ("GBP/DKK", "Forex", "fx", "GBP/DKK", 80, 82),
+    ("AUD/NOK", "Forex", "fx", "AUD/NOK", 80, 82),
+    ("NZD/JPY", "Forex", "fx", "NZD/JPY", 80, 82),
+    ("CHF/NOK", "Forex", "fx", "CHF/NOK", 80, 82),
+    ("USD/JPY", "Forex", "fx", "USD/JPY", 80, 82),
+    ("CHF/PLN", "Forex", "fx", "CHF/PLN", 80, 82),
+    ("GBP/TRY", "Forex", "fx", "GBP/TRY", 80, 82),
+    ("USD/CAD", "Forex", "fx", "USD/CAD", 80, 82),
+    ("AUD/SEK", "Forex", "fx", "AUD/SEK", 80, 82),
+    ("CHF/SEK", "Forex", "fx", "CHF/SEK", 80, 82),
+    ("CHF/SGD", "Forex", "fx", "CHF/SGD", 80, 82),
+    ("NOK/JPY", "Forex", "fx", "NOK/JPY", 80, 82),
+    ("NOK/SEK", "Forex", "fx", "NOK/SEK", 80, 82),
+    ("NZD/CAD", "Forex", "fx", "NZD/CAD", 80, 82),
+    ("NZD/DKK", "Forex", "fx", "NZD/DKK", 80, 82),
+    ("GBP/NZD", "Forex", "fx", "GBP/NZD", 80, 82),
+    ("NZD/USD", "Forex", "fx", "NZD/USD", 80, 82),
+    ("NZD/HUF", "Forex", "fx", "NZD/HUF", 80, 82),
+    ("NZD/NOK", "Forex", "fx", "NZD/NOK", 80, 82),
+    ("NZD/SEK", "Forex", "fx", "NZD/SEK", 80, 82),
+    ("NZD/SGD", "Forex", "fx", "NZD/SGD", 80, 82),
+    ("SEK/JPY", "Forex", "fx", "SEK/JPY", 80, 82),
+    ("SGD/JPY", "Forex", "fx", "SGD/JPY", 80, 82),
+    ("SGD/HKD", "Forex", "fx", "SGD/HKD", 80, 82),
+    ("USD/CHF", "Forex", "fx", "USD/CHF", 80, 82),
+    ("AUD/CAD", "Forex", "fx", "AUD/CAD", 80, 82),
+    ("USD/CZK", "Forex", "fx", "USD/CZK", 80, 82),
+    ("Bitcoin Cash (OTC)", "Crypto", "crypto", "BCHUSDT", 80, 82),
+    ("Kusama (OTC)", "Crypto", "crypto", "KSMUSDT", 80, 82),
+    ("Aave (OTC)", "Crypto", "crypto", "AAVEUSDT", 80, 82),
+    ("Pancake Swap (OTC)", "Crypto", "crypto", "CAKEUSDT", 80, 82),
+    ("Uniswap (OTC)", "Crypto", "crypto", "UNIUSDT", 80, 82),
+    ("NZD/CHF", "Forex", "fx", "NZD/CHF", 80, 82),
+    ("GBP/CAD", "Forex", "fx", "GBP/CAD", 80, 82),
+    ("AUD/NZD", "Forex", "fx", "AUD/NZD", 80, 82),
+    ("USD/ZAR", "Forex", "fx", "USD/ZAR", 80, 82),
+    ("AUD/CHF", "Forex", "fx", "AUD/CHF", 80, 82),
+    ("GBP/USD", "Forex", "fx", "GBP/USD", 70, 72),
+    ("Gold", "Other", "yahoo", "GC=F", 60, 62),
+    ("GBP/HUF", "Forex", "fx", "GBP/HUF", 50, 52),
+    ("EUR/PLN", "Forex", "fx", "EUR/PLN", 50, 52),
+    ("ZAR/JPY", "Forex", "fx", "ZAR/JPY", 50, 52),
+    ("CHF/HUF", "Forex", "fx", "CHF/HUF", 50, 52),
 ]
 
+# Yahoo quote conventions for common USD-base pairs.
+YAHOO_USD_QUOTE = {
+    "USD/JPY": "JPY=X", "USD/CAD": "CAD=X", "USD/CHF": "CHF=X",
+    "USD/ZAR": "ZAR=X", "USD/SEK": "SEK=X", "USD/PLN": "PLN=X",
+    "USD/MXN": "MXN=X", "USD/ILS": "ILS=X", "USD/HUF": "HUF=X",
+    "USD/CZK": "CZK=X",
+}
+
+ASSETS: list[dict[str, Any]] = []
+for name, category, kind, symbol, payout, vip_payout in RAW_ASSETS:
+    data_symbol = symbol
+    if kind == "fx":
+        data_symbol = YAHOO_USD_QUOTE.get(
+            symbol,
+            symbol.replace("/", "") + "=X",
+        )
+    ASSETS.append({
+        "name": name,
+        "symbol": symbol,
+        "data_symbol": data_symbol,
+        "category": category,
+        "kind": kind,
+        "payout": payout,
+        "vip_payout": vip_payout,
+    })
+
 COINBASE = {
-    "BTCUSDT": "BTC-USD",
-    "ETHUSDT": "ETH-USD",
-    "SOLUSDT": "SOL-USD",
-    "XRPUSDT": "XRP-USD",
-    "DOGEUSDT": "DOGE-USD",
-    "ADAUSDT": "ADA-USD",
-    "AVAXUSDT": "AVAX-USD",
-    "LINKUSDT": "LINK-USD",
+    "BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD", "SOLUSDT": "SOL-USD",
+    "XRPUSDT": "XRP-USD", "DOGEUSDT": "DOGE-USD", "ADAUSDT": "ADA-USD",
+    "AVAXUSDT": "AVAX-USD", "LINKUSDT": "LINK-USD", "BCHUSDT": "BCH-USD",
+    "KSMUSDT": "KSM-USD", "AAVEUSDT": "AAVE-USD", "CAKEUSDT": "CAKE-USD",
+    "UNIUSDT": "UNI-USD",
 }
 
 
-# ============================================================
-# GENERAL HELPERS
-# ============================================================
-
-def now_utc():
+def now_utc() -> pd.Timestamp:
     return pd.Timestamp.now(tz="UTC")
 
 
-def minute_now():
+def current_minute() -> pd.Timestamp:
     return now_utc().floor("min")
 
 
-def get(url, params=None):
-    return requests.get(
-        url,
-        params=params,
-        headers=HEADERS,
-        timeout=TIMEOUT,
-    )
+def http_get(url: str, params: dict | None = None) -> requests.Response:
+    return requests.get(url, params=params, headers=HEADERS, timeout=REQUEST_TIMEOUT)
 
 
-def data_dir():
-    requested = os.environ.get("VELORA_DATA_DIR")
-
-    candidates = (
-        [Path(requested)]
-        if requested
-        else [Path.cwd(), Path("/tmp/velora_data")]
-    )
-
-    for folder in candidates:
+def get_data_dir() -> Path:
+    choices = [Path(os.environ["VELORA_DATA_DIR"])] if os.environ.get("VELORA_DATA_DIR") else [Path.cwd(), Path("/tmp/velora_data")]
+    for folder in choices:
         try:
             folder.mkdir(parents=True, exist_ok=True)
-            test_file = folder / ".write_test"
-            test_file.write_text("ok", encoding="utf-8")
-            test_file.unlink()
+            probe = folder / ".velora_write_test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
             return folder
         except Exception:
-            pass
-
-    folder = Path(tempfile.gettempdir()) / "velora_data"
-    folder.mkdir(parents=True, exist_ok=True)
-    return folder
-
-
-DATA_DIR = data_dir()
-DB = DATA_DIR / "velora_history.sqlite3"
-XLSX = DATA_DIR / "velora_scan_history.xlsx"
+            continue
+    fallback = Path(tempfile.gettempdir()) / "velora_data"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
 
 
-# ============================================================
-# SQLITE DATABASE AND OLD DATABASE MIGRATION
-# ============================================================
+DATA_DIR = get_data_dir()
+DB_PATH = DATA_DIR / "velora_history.sqlite3"
+EXCEL_PATH = DATA_DIR / "velora_scan_history.xlsx"
 
-def init_db():
-    """Create the current schema and migrate older database schemas."""
-    with sqlite3.connect(DB, timeout=30) as connection:
-        exists = connection.execute(
-            "SELECT name FROM sqlite_master "
-            "WHERE type='table' AND name='candles'"
+
+def init_db() -> None:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='candles'"
         ).fetchone() is not None
-
-        required = {
-            "symbol", "time", "open", "high", "low", "close", "volume"
-        }
-
-        columns = (
-            {
-                row[1]
-                for row in connection.execute(
-                    "PRAGMA table_info(candles)"
-                ).fetchall()
-            }
-            if exists
-            else set()
-        )
-
-        if exists and not required.issubset(columns):
-            connection.execute("DROP INDEX IF EXISTS idx_symbol_time")
-            connection.execute("ALTER TABLE candles RENAME TO candles_legacy")
-
-            old_columns = {
-                row[1]
-                for row in connection.execute(
-                    "PRAGMA table_info(candles_legacy)"
-                ).fetchall()
-            }
-
-            connection.execute(
-                """
-                CREATE TABLE candles (
-                    symbol TEXT NOT NULL,
-                    time TEXT NOT NULL,
-                    open REAL NOT NULL,
-                    high REAL NOT NULL,
-                    low REAL NOT NULL,
-                    close REAL NOT NULL,
-                    volume REAL DEFAULT 0,
-                    PRIMARY KEY(symbol, time)
-                )
-                """
+        required = {"symbol", "time", "open", "high", "low", "close", "volume"}
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(candles)")} if exists else set()
+        if exists and not required.issubset(cols):
+            conn.execute("DROP INDEX IF EXISTS idx_symbol_time")
+            conn.execute("ALTER TABLE candles RENAME TO candles_old")
+            old_cols = {row[1] for row in conn.execute("PRAGMA table_info(candles_old)")}
+            conn.execute(
+                "CREATE TABLE candles (symbol TEXT NOT NULL,time TEXT NOT NULL,open REAL NOT NULL,"
+                "high REAL NOT NULL,low REAL NOT NULL,close REAL NOT NULL,volume REAL DEFAULT 0,"
+                "PRIMARY KEY(symbol,time))"
             )
-
-            time_column = next(
-                (
-                    name
-                    for name in ("time", "candle_time", "timestamp")
-                    if name in old_columns
-                ),
-                None,
-            )
-
-            needed = {"symbol", "open", "high", "low", "close"}
-
-            if time_column and needed.issubset(old_columns):
-                volume_expr = (
-                    "volume" if "volume" in old_columns else "0"
+            time_col = next((x for x in ("time", "candle_time", "timestamp") if x in old_cols), None)
+            if time_col and {"symbol", "open", "high", "low", "close"}.issubset(old_cols):
+                volume_expr = "volume" if "volume" in old_cols else "0"
+                conn.execute(
+                    f"INSERT OR REPLACE INTO candles(symbol,time,open,high,low,close,volume) "
+                    f"SELECT symbol,{time_col},open,high,low,close,{volume_expr} FROM candles_old "
+                    f"WHERE symbol IS NOT NULL AND {time_col} IS NOT NULL"
                 )
-
-                connection.execute(
-                    "INSERT OR REPLACE INTO candles "
-                    "(symbol,time,open,high,low,close,volume) "
-                    f"SELECT symbol,{time_column},open,high,low,close,"
-                    f"{volume_expr} FROM candles_legacy "
-                    f"WHERE symbol IS NOT NULL "
-                    f"AND {time_column} IS NOT NULL"
-                )
-
-            connection.execute("DROP TABLE candles_legacy")
-
+            conn.execute("DROP TABLE candles_old")
         elif not exists:
-            connection.execute(
-                """
-                CREATE TABLE candles (
-                    symbol TEXT NOT NULL,
-                    time TEXT NOT NULL,
-                    open REAL NOT NULL,
-                    high REAL NOT NULL,
-                    low REAL NOT NULL,
-                    close REAL NOT NULL,
-                    volume REAL DEFAULT 0,
-                    PRIMARY KEY(symbol, time)
-                )
-                """
+            conn.execute(
+                "CREATE TABLE candles (symbol TEXT NOT NULL,time TEXT NOT NULL,open REAL NOT NULL,"
+                "high REAL NOT NULL,low REAL NOT NULL,close REAL NOT NULL,volume REAL DEFAULT 0,"
+                "PRIMARY KEY(symbol,time))"
             )
-
-        connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_symbol_time "
-            "ON candles(symbol,time)"
-        )
-        connection.commit()
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_symbol_time ON candles(symbol,time)")
+        conn.commit()
 
 
-def normalize(df):
-    columns = ["time", "open", "high", "low", "close", "volume"]
-
+def normalize_candles(df: pd.DataFrame | None) -> pd.DataFrame:
+    cols = ["time", "open", "high", "low", "close", "volume"]
     if df is None or df.empty:
-        return pd.DataFrame(columns=columns)
-
-    data = df.copy()
-
-    for column in columns:
-        if column not in data.columns:
-            data[column] = (
-                0.0 if column == "volume" else np.nan
-            )
-
-    data["time"] = pd.to_datetime(
-        data["time"], utc=True, errors="coerce"
-    )
-
-    for column in ["open", "high", "low", "close", "volume"]:
-        data[column] = pd.to_numeric(
-            data[column], errors="coerce"
-        )
-
-    data["volume"] = data["volume"].fillna(0)
-
-    data = data.dropna(
-        subset=["time", "open", "high", "low", "close"]
-    )
-
-    data = data[
-        (data["open"] > 0)
-        & (data["high"] > 0)
-        & (data["low"] > 0)
-        & (data["close"] > 0)
-        & (data["time"] < minute_now())
-    ]
-
-    return (
-        data.drop_duplicates("time", keep="last")
-        .sort_values("time")
-        .reset_index(drop=True)[columns]
-    )
+        return pd.DataFrame(columns=cols)
+    d = df.copy()
+    for col in cols:
+        if col not in d.columns:
+            d[col] = 0.0 if col == "volume" else np.nan
+    d["time"] = pd.to_datetime(d["time"], utc=True, errors="coerce")
+    for col in ["open", "high", "low", "close", "volume"]:
+        d[col] = pd.to_numeric(d[col], errors="coerce")
+    d["volume"] = d["volume"].fillna(0)
+    d = d.dropna(subset=["time", "open", "high", "low", "close"])
+    d = d[(d["open"] > 0) & (d["high"] > 0) & (d["low"] > 0) & (d["close"] > 0)]
+    # Only completed one-minute candles are used for signals.
+    d = d[d["time"] < current_minute()]
+    return d.drop_duplicates("time", keep="last").sort_values("time").reset_index(drop=True)[cols]
 
 
-def save_cache(symbol, df):
-    data = normalize(df)
-
-    if data.empty:
+def save_cache(symbol: str, df: pd.DataFrame) -> None:
+    d = normalize_candles(df)
+    if d.empty:
         return
-
     rows = []
-
-    for row in data.itertuples(index=False):
-        timestamp = (
-            pd.Timestamp(row.time)
-            .tz_convert("UTC")
-            .strftime("%Y-%m-%d %H:%M:%S")
-        )
-
-        rows.append(
-            (
-                symbol,
-                timestamp,
-                float(row.open),
-                float(row.high),
-                float(row.low),
-                float(row.close),
-                float(row.volume or 0),
-            )
-        )
-
+    for row in d.itertuples(index=False):
+        rows.append((symbol, pd.Timestamp(row.time).tz_convert("UTC").strftime("%Y-%m-%d %H:%M:%S"),
+                     float(row.open), float(row.high), float(row.low), float(row.close), float(row.volume or 0)))
     init_db()
-
-    with sqlite3.connect(DB, timeout=30) as connection:
-        connection.executemany(
-            "INSERT OR REPLACE INTO candles "
-            "VALUES (?,?,?,?,?,?,?)",
-            rows,
-        )
-        connection.commit()
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.executemany("INSERT OR REPLACE INTO candles VALUES (?,?,?,?,?,?,?)", rows)
+        conn.commit()
 
 
-def load_cache(symbol):
+def load_cache(symbol: str) -> pd.DataFrame:
     init_db()
-
-    with sqlite3.connect(DB, timeout=30) as connection:
-        data = pd.read_sql_query(
-            """
-            SELECT time,open,high,low,close,volume
-            FROM candles
-            WHERE symbol=?
-            ORDER BY time
-            """,
-            connection,
-            params=(symbol,),
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        d = pd.read_sql_query(
+            "SELECT time,open,high,low,close,volume FROM candles WHERE symbol=? ORDER BY time",
+            conn, params=(symbol,)
         )
-
-    return normalize(data)
-
-
-# ============================================================
-# BINANCE PUBLIC CANDLES
-# ============================================================
-
-def parse_binance(rows):
-    columns = [
-        "stamp", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "trades",
-        "taker_base", "taker_quote", "ignore",
-    ]
-
-    data = pd.DataFrame(rows, columns=columns)
-
-    data["time"] = pd.to_datetime(
-        data["stamp"], unit="ms", utc=True, errors="coerce"
-    )
-
-    return normalize(
-        data[["time", "open", "high", "low", "close", "volume"]]
-    )
+    return normalize_candles(d)
 
 
-def fetch_binance(symbol, target):
+def parse_binance(rows: list) -> pd.DataFrame:
+    labels = ["stamp", "open", "high", "low", "close", "volume", "close_time", "qv", "trades", "tb", "tq", "ignore"]
+    d = pd.DataFrame(rows, columns=labels)
+    d["time"] = pd.to_datetime(d["stamp"], unit="ms", utc=True, errors="coerce")
+    return normalize_candles(d[["time", "open", "high", "low", "close", "volume"]])
+
+
+def fetch_binance(symbol: str, target: int) -> tuple[pd.DataFrame, str, str | None]:
     errors = []
-
-    for base in BINANCE:
+    for base in BINANCE_ENDPOINTS:
         try:
             pages = []
             end_time = None
-
             while True:
-                current_count = (
-                    len(pd.concat(pages, ignore_index=True))
-                    if pages
-                    else 0
-                )
-
+                current_count = len(normalize_candles(pd.concat(pages, ignore_index=True))) if pages else 0
                 limit = min(1000, max(1, target - current_count))
-
-                params = {
-                    "symbol": symbol,
-                    "interval": "1m",
-                    "limit": limit,
-                }
-
+                params = {"symbol": symbol, "interval": "1m", "limit": limit}
                 if end_time is not None:
                     params["endTime"] = end_time
-
-                response = get(base + "/api/v3/klines", params)
-
+                response = http_get(base + "/api/v3/klines", params)
                 if response.status_code in (403, 451):
-                    raise RuntimeError(
-                        f"HTTP {response.status_code}: endpoint blocked"
-                    )
-
+                    raise RuntimeError(f"HTTP {response.status_code}: Binance endpoint blocked")
                 if response.status_code == 429:
-                    raise RuntimeError("HTTP 429: rate limited")
-
+                    raise RuntimeError("HTTP 429: Binance rate limit")
                 response.raise_for_status()
                 rows = response.json()
-
                 if not isinstance(rows, list) or not rows:
-                    raise RuntimeError(
-                        f"No candles returned: {str(rows)[:150]}"
-                    )
-
+                    raise RuntimeError(f"No Binance candles returned: {str(rows)[:160]}")
                 pages.append(parse_binance(rows))
-
-                combined = normalize(
-                    pd.concat(pages, ignore_index=True)
-                )
-
+                combined = normalize_candles(pd.concat(pages, ignore_index=True))
                 if len(combined) >= target or target <= 1000:
                     break
-
-                oldest = combined["time"].min()
-                next_end = int(oldest.timestamp() * 1000) - 1
-
+                next_end = int(combined["time"].min().timestamp() * 1000) - 1
                 if end_time is not None and next_end >= end_time:
                     break
-
                 end_time = next_end
                 time.sleep(0.05)
-
                 if len(pages) >= 110:
                     break
-
-            combined = (
-                normalize(pd.concat(pages, ignore_index=True))
-                .tail(target)
-                .reset_index(drop=True)
-            )
-
-            return combined, base, None
-
-        except Exception as error:
-            errors.append(
-                f"{base}: {type(error).__name__}: {error}"
-            )
-
+            return normalize_candles(pd.concat(pages, ignore_index=True)).tail(target).reset_index(drop=True), base, None
+        except Exception as exc:
+            errors.append(f"{base}: {type(exc).__name__}: {exc}")
     raise RuntimeError("Binance failed: " + " | ".join(errors))
 
 
-# ============================================================
-# BYBIT PUBLIC CANDLES
-# ============================================================
-
-def fetch_bybit(symbol, target):
-    if not symbol.endswith("USDT"):
-        raise RuntimeError("Unsupported Bybit symbol")
-
-    pages = []
-    end_time = None
-    warning = None
-
+def fetch_bybit(symbol: str, target: int) -> tuple[pd.DataFrame, str, str | None]:
+    pages, end_time, warning = [], None, None
     while True:
-        current_count = (
-            len(pd.concat(pages, ignore_index=True))
-            if pages
-            else 0
-        )
-
-        params = {
-            "category": "spot",
-            "symbol": symbol,
-            "interval": "1",
-            "limit": min(1000, max(40, target - current_count)),
-        }
-
+        have = len(normalize_candles(pd.concat(pages, ignore_index=True))) if pages else 0
+        params = {"category": "spot", "symbol": symbol, "interval": "1", "limit": min(1000, max(40, target - have))}
         if end_time is not None:
             params["end"] = end_time
-
-        response = get(
-            "https://api.bybit.com/v5/market/kline",
-            params,
-        )
+        response = http_get("https://api.bybit.com/v5/market/kline", params)
         response.raise_for_status()
-        payload = response.json()
-
-        if payload.get("retCode") != 0:
-            raise RuntimeError(
-                f"Bybit {payload.get('retCode')}: "
-                f"{payload.get('retMsg')}"
-            )
-
-        rows = (payload.get("result") or {}).get("list") or []
-
+        obj = response.json()
+        if obj.get("retCode") != 0:
+            raise RuntimeError(f"Bybit {obj.get('retCode')}: {obj.get('retMsg')}")
+        rows = (obj.get("result") or {}).get("list") or []
         if not rows:
             break
-
-        data = pd.DataFrame(
-            rows,
-            columns=[
-                "stamp", "open", "high", "low",
-                "close", "volume", "turnover",
-            ],
-        )
-
-        data["time"] = pd.to_datetime(
-            pd.to_numeric(data["stamp"], errors="coerce"),
-            unit="ms",
-            utc=True,
-        )
-
-        pages.append(
-            normalize(
-                data[
-                    ["time", "open", "high", "low", "close", "volume"]
-                ]
-            )
-        )
-
-        combined = normalize(
-            pd.concat(pages, ignore_index=True)
-        )
-
-        if len(combined) >= target or target <= 1000:
+        frame = pd.DataFrame(rows, columns=["stamp", "open", "high", "low", "close", "volume", "turnover"])
+        frame["time"] = pd.to_datetime(pd.to_numeric(frame["stamp"], errors="coerce"), unit="ms", utc=True)
+        pages.append(normalize_candles(frame[["time", "open", "high", "low", "close", "volume"]]))
+        merged = normalize_candles(pd.concat(pages, ignore_index=True))
+        if len(merged) >= target or target <= 1000:
             break
-
-        next_end = (
-            int(combined["time"].min().timestamp() * 1000) - 1
-        )
-
-        if end_time is not None and next_end >= end_time:
-            warning = "Bybit historical paging stopped."
-            break
-
-        end_time = next_end
+        end_time = int(merged["time"].min().timestamp() * 1000) - 1
         time.sleep(0.05)
-
         if len(pages) >= 110:
-            warning = "Bybit sync limited to 110 pages."
+            warning = "Bybit historical paging capped at 110 pages."
             break
-
     if not pages:
         raise RuntimeError("Bybit returned no candles")
-
-    return (
-        normalize(pd.concat(pages, ignore_index=True))
-        .tail(target)
-        .reset_index(drop=True),
-        "Bybit public API",
-        warning,
-    )
+    return normalize_candles(pd.concat(pages, ignore_index=True)).tail(target).reset_index(drop=True), "Bybit public API", warning
 
 
-# ============================================================
-# OKX PUBLIC CANDLES
-# ============================================================
-
-def fetch_okx(symbol, target):
-    instrument = symbol[:-4] + "-USDT"
-    pages = []
-    after = None
-    warning = None
-
+def fetch_okx(symbol: str, target: int) -> tuple[pd.DataFrame, str, str | None]:
+    inst = symbol[:-4] + "-USDT"
+    pages, after, warning = [], None, None
     while True:
-        current_count = (
-            len(pd.concat(pages, ignore_index=True))
-            if pages
-            else 0
-        )
-
-        params = {
-            "instId": instrument,
-            "bar": "1m",
-            "limit": str(min(300, max(40, target - current_count))),
-        }
-
+        have = len(normalize_candles(pd.concat(pages, ignore_index=True))) if pages else 0
+        params = {"instId": inst, "bar": "1m", "limit": str(min(300, max(40, target - have)))}
         if after is not None:
             params["after"] = after
-
-        response = get(
-            "https://www.okx.com/api/v5/market/candles",
-            params,
-        )
+        response = http_get("https://www.okx.com/api/v5/market/candles", params)
         response.raise_for_status()
-        payload = response.json()
-
-        if str(payload.get("code")) != "0":
-            raise RuntimeError(
-                f"OKX {payload.get('code')}: {payload.get('msg')}"
-            )
-
-        rows = payload.get("data") or []
-
+        obj = response.json()
+        if str(obj.get("code")) != "0":
+            raise RuntimeError(f"OKX {obj.get('code')}: {obj.get('msg')}")
+        rows = obj.get("data") or []
         if not rows:
             break
-
-        data = pd.DataFrame(
-            rows,
-            columns=[
-                "stamp", "open", "high", "low", "close",
-                "volume", "volume_currency", "volume_quote", "confirm",
-            ],
-        )
-
-        data["time"] = pd.to_datetime(
-            pd.to_numeric(data["stamp"], errors="coerce"),
-            unit="ms",
-            utc=True,
-        )
-
-        pages.append(
-            normalize(
-                data[
-                    ["time", "open", "high", "low", "close", "volume"]
-                ]
-            )
-        )
-
-        combined = normalize(
-            pd.concat(pages, ignore_index=True)
-        )
-
-        if len(combined) >= target or target <= 300:
+        frame = pd.DataFrame(rows, columns=["stamp", "open", "high", "low", "close", "volume", "vol_ccy", "vol_quote", "confirm"])
+        frame["time"] = pd.to_datetime(pd.to_numeric(frame["stamp"], errors="coerce"), unit="ms", utc=True)
+        pages.append(normalize_candles(frame[["time", "open", "high", "low", "close", "volume"]]))
+        merged = normalize_candles(pd.concat(pages, ignore_index=True))
+        if len(merged) >= target or target <= 300:
             break
-
-        next_after = str(
-            int(combined["time"].min().timestamp() * 1000)
-        )
-
-        if after == next_after:
-            warning = "OKX historical paging stopped."
+        new_after = str(int(merged["time"].min().timestamp() * 1000))
+        if after == new_after:
+            warning = "OKX historical paging stopped without advancing."
             break
-
-        after = next_after
+        after = new_after
         time.sleep(0.05)
-
         if len(pages) >= 340:
-            warning = "OKX sync limited to 340 pages."
+            warning = "OKX historical paging capped at 340 pages."
             break
-
     if not pages:
         raise RuntimeError("OKX returned no candles")
-
-    return (
-        normalize(pd.concat(pages, ignore_index=True))
-        .tail(target)
-        .reset_index(drop=True),
-        "OKX public API",
-        warning,
-    )
+    return normalize_candles(pd.concat(pages, ignore_index=True)).tail(target).reset_index(drop=True), "OKX public API", warning
 
 
-# ============================================================
-# GATE.IO AND COINBASE PUBLIC CANDLES
-# ============================================================
-
-def fetch_gate(symbol, target):
+def fetch_gate(symbol: str, target: int) -> tuple[pd.DataFrame, str, str | None]:
     pair = symbol[:-4] + "_USDT"
-
-    response = get(
-        "https://api.gateio.ws/api/v4/spot/candlesticks",
-        {
-            "currency_pair": pair,
-            "interval": "1m",
-            "limit": min(1000, target),
-        },
-    )
+    response = http_get("https://api.gateio.ws/api/v4/spot/candlesticks", {"currency_pair": pair, "interval": "1m", "limit": min(1000, target)})
     response.raise_for_status()
     rows = response.json()
-
     if not isinstance(rows, list) or not rows:
         raise RuntimeError("Gate.io returned no candles")
-
-    data = pd.DataFrame(
-        rows,
-        columns=[
-            "stamp", "volume", "close", "high",
-            "low", "open", "quote_volume",
-        ],
-    )
-
-    data["time"] = pd.to_datetime(
-        pd.to_numeric(data["stamp"], errors="coerce"),
-        unit="s",
-        utc=True,
-    )
-
-    return (
-        normalize(
-            data[["time", "open", "high", "low", "close", "volume"]]
-        ),
-        "Gate.io public API",
-        None,
-    )
+    frame = pd.DataFrame(rows, columns=["stamp", "volume", "close", "high", "low", "open", "quote_volume"])
+    frame["time"] = pd.to_datetime(pd.to_numeric(frame["stamp"], errors="coerce"), unit="s", utc=True)
+    return normalize_candles(frame[["time", "open", "high", "low", "close", "volume"]]), "Gate.io public API", None
 
 
-def fetch_coinbase(symbol):
-    product = COINBASE.get(symbol)
-
+def fetch_coinbase(symbol: str) -> tuple[pd.DataFrame, str, str | None]:
+    product = {
+        "BTCUSDT":"BTC-USD", "ETHUSDT":"ETH-USD", "SOLUSDT":"SOL-USD", "XRPUSDT":"XRP-USD",
+        "DOGEUSDT":"DOGE-USD", "ADAUSDT":"ADA-USD", "AVAXUSDT":"AVAX-USD", "LINKUSDT":"LINK-USD",
+        "BCHUSDT":"BCH-USD", "KSMUSDT":"KSM-USD", "AAVEUSDT":"AAVE-USD", "CAKEUSDT":"CAKE-USD", "UNIUSDT":"UNI-USD",
+    }.get(symbol)
     if not product:
-        raise RuntimeError("No Coinbase mapping for symbol")
-
+        raise RuntimeError("Coinbase has no fallback mapping for this asset")
     end = now_utc().floor("min")
     start = end - pd.Timedelta(minutes=299)
-
-    params = {
-        "granularity": 60,
-        "start": start.isoformat().replace("+00:00", "Z"),
-        "end": end.isoformat().replace("+00:00", "Z"),
-    }
-
-    response = get(
-        f"https://api.exchange.coinbase.com/products/{product}/candles",
-        params,
-    )
+    params = {"granularity":60,"start":start.isoformat().replace("+00:00","Z"),"end":end.isoformat().replace("+00:00","Z")}
+    response = http_get(f"https://api.exchange.coinbase.com/products/{product}/candles", params)
     response.raise_for_status()
     rows = response.json()
-
     if not rows:
         raise RuntimeError("Coinbase returned no candles")
-
-    data = pd.DataFrame(
-        rows,
-        columns=["stamp", "low", "high", "open", "close", "volume"],
-    )
-
-    data["time"] = pd.to_datetime(
-        data["stamp"], unit="s", utc=True
-    )
-
-    return (
-        normalize(
-            data[["time", "open", "high", "low", "close", "volume"]]
-        ),
-        "Coinbase public API",
-        None,
-    )
+    frame = pd.DataFrame(rows, columns=["stamp","low","high","open","close","volume"])
+    frame["time"] = pd.to_datetime(frame["stamp"], unit="s", utc=True)
+    return normalize_candles(frame[["time","open","high","low","close","volume"]]), "Coinbase public API", None
 
 
-# ============================================================
-# YAHOO FINANCE
-# ============================================================
+def yahoo_symbol(asset: dict[str, Any]) -> str:
+    if asset["kind"] == "yahoo":
+        return str(asset["data_symbol"])
+    return str(asset["data_symbol"])
 
-def fetch_yahoo(asset):
-    symbol = asset["symbol"]
 
-    if asset["kind"] == "crypto":
-        symbol = COINBASE.get(symbol, symbol)
-
+def fetch_yahoo(asset: dict[str, Any]) -> tuple[pd.DataFrame, str, str | None]:
+    symbol = yahoo_symbol(asset)
     errors = []
-
-    for host in [
-        "query1.finance.yahoo.com",
-        "query2.finance.yahoo.com",
-    ]:
+    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
         try:
             encoded = requests.utils.quote(symbol, safe="")
-            url = f"https://{host}/v8/finance/chart/{encoded}"
-
-            response = get(
-                url,
-                {
-                    "range": "7d",
-                    "interval": "1m",
-                    "includePrePost": "false",
-                },
-            )
+            response = http_get(f"https://{host}/v8/finance/chart/{encoded}", {"range":"7d","interval":"1m","includePrePost":"false"})
+            if response.status_code == 429:
+                raise RuntimeError("HTTP 429: Yahoo rate limit; waiting or reducing selected assets may help")
             response.raise_for_status()
-
             chart = response.json().get("chart", {})
-
             if chart.get("error"):
                 raise RuntimeError(str(chart["error"]))
-
             items = chart.get("result") or []
-
             if not items:
-                raise RuntimeError("Yahoo returned no result")
-
+                raise RuntimeError(f"Yahoo has no minute data for {symbol}")
             item = items[0]
-            quotes = (
-                item.get("indicators", {}).get("quote") or [{}]
-            )
-            quote = quotes[0]
             timestamps = item.get("timestamp") or []
-
+            quotes = item.get("indicators", {}).get("quote") or [{}]
             if not timestamps:
-                raise RuntimeError("Yahoo returned no timestamps")
-
-            data = pd.DataFrame({
-                "time": pd.to_datetime(
-                    timestamps, unit="s", utc=True
-                ),
-                "open": quote.get("open", []),
-                "high": quote.get("high", []),
-                "low": quote.get("low", []),
-                "close": quote.get("close", []),
-                "volume": quote.get("volume", []),
+                raise RuntimeError(f"Yahoo returned no timestamps for {symbol}")
+            quote = quotes[0]
+            frame = pd.DataFrame({
+                "time":pd.to_datetime(timestamps, unit="s", utc=True),
+                "open":quote.get("open", []), "high":quote.get("high", []),
+                "low":quote.get("low", []), "close":quote.get("close", []),
+                "volume":quote.get("volume", []),
             })
-
-            return normalize(data), f"Yahoo Finance ({host})", None
-
-        except Exception as error:
-            errors.append(
-                f"{host}: {type(error).__name__}: {error}"
-            )
-
+            data = normalize_candles(frame)
+            if data.empty:
+                raise RuntimeError(f"Yahoo returned no valid completed candles for {symbol}")
+            return data, f"Yahoo Finance ({host})", None
+        except Exception as exc:
+            errors.append(f"{host}: {type(exc).__name__}: {exc}")
     raise RuntimeError("Yahoo failed: " + " | ".join(errors))
 
 
-# ============================================================
-# LOAD LIVE DATA AND CACHE
-# ============================================================
-
-def get_candles(asset, target):
+def fetch_live(asset: dict[str, Any], target: int) -> tuple[pd.DataFrame, str, list[str]]:
+    kind = asset["kind"]
     symbol = asset["symbol"]
-    errors = []
-    warnings = []
-    recent = pd.DataFrame()
-    source = ""
-
-    if asset["kind"] == "crypto":
-        providers = [
+    warnings: list[str] = []
+    if kind == "index":
+        raise RuntimeError("Crypto IDX is a Binomo/index instrument; a matching public 1-minute price feed is not configured, so no signal is fabricated.")
+    if kind == "crypto":
+        errors = []
+        attempts = [
             ("Binance", lambda: fetch_binance(symbol, target)),
             ("Bybit", lambda: fetch_bybit(symbol, target)),
             ("OKX", lambda: fetch_okx(symbol, target)),
             ("Gate.io", lambda: fetch_gate(symbol, target)),
             ("Coinbase", lambda: fetch_coinbase(symbol)),
-            ("Yahoo", lambda: fetch_yahoo(asset)),
         ]
-
-        for name, fetcher in providers:
+        for provider, fn in attempts:
             try:
-                recent, source, note = fetcher()
+                data, source, warning = fn()
+                if provider != "Binance":
+                    warnings.append(f"Using {provider} public-market prices, not Binomo OTC quotes.")
+                if warning:
+                    warnings.append(warning)
+                return data, source, warnings
+            except Exception as exc:
+                errors.append(f"{provider}: {type(exc).__name__}: {exc}")
+        raise RuntimeError("All public crypto sources failed: " + " | ".join(errors))
+    data, source, warning = fetch_yahoo(asset)
+    if warning:
+        warnings.append(warning)
+    return data, source, warnings
 
-                if note:
-                    warnings.append(str(note))
 
-                if name != "Binance":
-                    warnings.append(
-                        f"Fallback provider {name} used; "
-                        "prices may differ from Binance USDT Spot."
-                    )
+def get_candles(asset: dict[str, Any], target: int, deep_history: bool) -> tuple[pd.DataFrame, str, str | None]:
+    symbol = str(asset["symbol"])
+    cached = load_cache(symbol)
 
-                break
+    # If deep history was previously downloaded, just refresh the last 1,000 candles.
+    # Otherwise sync deep history once; on 40-second re-scans avoid repeatedly downloading 100K candles.
+    fetch_target = target
+    if deep_history and len(cached) >= target - 1000:
+        fetch_target = 1000
 
-            except Exception as error:
-                errors.append(
-                    f"{name}: {type(error).__name__}: {error}"
-                )
-
-    else:
-        try:
-            recent, source, note = fetch_yahoo(asset)
-
-            if note:
-                warnings.append(str(note))
-
-        except Exception as error:
-            errors.append(
-                f"Yahoo: {type(error).__name__}: {error}"
-            )
-
-    recent = normalize(recent)
-
-    if not recent.empty:
-        save_cache(symbol, recent)
-
+    errors: list[str] = []
+    warnings: list[str] = []
+    live = pd.DataFrame()
+    source = ""
     try:
-        cached = load_cache(symbol)
-    except Exception as error:
-        cached = pd.DataFrame()
-        errors.append(f"SQLite: {error}")
+        live, source, provider_warnings = fetch_live(asset, fetch_target)
+        warnings.extend(provider_warnings)
+        if not live.empty:
+            save_cache(symbol, live)
+    except Exception as exc:
+        errors.append(f"Live data: {type(exc).__name__}: {exc}")
 
-    frames = [
-        frame
-        for frame in [cached, recent]
-        if frame is not None and not frame.empty
-    ]
-
+    # Re-read cache after saving newly fetched data.
+    cached = load_cache(symbol)
+    frames = [d for d in (cached, live) if d is not None and not d.empty]
     if not frames:
-        raise RuntimeError(
-            "No live or cached candles. "
-            + (
-                " | ".join(errors)
-                if errors
-                else "All providers returned empty data."
-            )
-        )
-
-    data = (
-        normalize(pd.concat(frames, ignore_index=True))
-        .tail(target)
-        .reset_index(drop=True)
-    )
-
-    if len(data) < 40:
-        raise RuntimeError(
-            f"Only {len(data)} completed candles; need at least 40. "
-            + " | ".join(errors)
-        )
-
-    age_minutes = (
-        now_utc() - data["time"].iloc[-1]
-    ).total_seconds() / 60
-
-    if age_minutes > 5:
-        raise RuntimeError(
-            f"Latest candle is {age_minutes:.1f} minutes old; "
-            "no signal calculated. "
-            + " | ".join(errors)
-        )
-
-    warning_text = (
-        " | ".join(warnings + errors)
-        if warnings or errors
-        else None
-    )
-
-    return data, source, warning_text
+        raise RuntimeError("No live or cached candles. " + " | ".join(errors))
+    combined = normalize_candles(pd.concat(frames, ignore_index=True)).tail(target).reset_index(drop=True)
+    if len(combined) < 25:
+        raise RuntimeError(f"Only {len(combined)} completed candles; need at least 25. " + " | ".join(errors))
+    age_minutes = (now_utc() - combined["time"].iloc[-1]).total_seconds() / 60
+    if age_minutes > 10:
+        raise RuntimeError(f"Latest available candle is {age_minutes:.1f} minutes old; refusing to create a stale signal. " + " | ".join(errors))
+    return combined, source or "SQLite cache", " | ".join(warnings + errors) if warnings or errors else None
 
 
-# ============================================================
-# EMA 15 AND BOLLINGER BANDS — DISPLAY ONLY FOR SIGNAL PURPOSES
-# ============================================================
-
-def indicators(df):
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     data = df.copy()
-
-    data["ema15"] = data["close"].ewm(
-        span=15,
-        adjust=False,
-        min_periods=15,
-    ).mean()
-
-    data["bb_mid"] = data["close"].rolling(
-        20, min_periods=20
-    ).mean()
-
-    deviation = data["close"].rolling(
-        20, min_periods=20
-    ).std(ddof=0)
-
-    data["bb_upper"] = data["bb_mid"] + 2 * deviation
-    data["bb_lower"] = data["bb_mid"] - 2 * deviation
-
+    data["ema15"] = data["close"].ewm(span=15, adjust=False, min_periods=15).mean()
+    data["bb_mid"] = data["close"].rolling(20, min_periods=20).mean()
+    sd = data["close"].rolling(20, min_periods=20).std(ddof=0)
+    data["bb_upper"] = data["bb_mid"] + 2 * sd
+    data["bb_lower"] = data["bb_mid"] - 2 * sd
     return data
 
 
-# ============================================================
-# SIGNAL RULE — USER REQUEST
-#
-# Falling across selected completed candles = BUY
-# Rising across selected completed candles = SELL
-# EMA and Bollinger do not block signals.
-# ============================================================
-
-def signal_for(df, lookback, mode=None):
-    data = (
-        df.copy()
-        if {"ema15", "bb_mid", "bb_upper", "bb_lower"}.issubset(df.columns)
-        else indicators(df)
-    )
-
-    empty = {
+def signal_for(df: pd.DataFrame, lookback: int) -> dict[str, Any]:
+    """Reversal rule: top + three falling/red candles => SELL; bottom + three rising/green candles => BUY."""
+    result = {
         "signal": "NO SIGNAL",
-        "reason": f"Not enough completed candles; need {lookback}.",
+        "reason": "Waiting for a confirmed 3-candle reversal from a swing high/low.",
         "change_pct": np.nan,
         "trend": "Unknown",
-        "green_ratio": np.nan,
-        "red_ratio": np.nan,
+        "three_candle_pattern": "Not confirmed",
+        "swing_point": "Not confirmed",
         "direction_up_ok": False,
         "direction_down_ok": False,
-        "price_above_ema": False,
-        "price_below_ema": False,
-        "upper_band_ok": False,
-        "lower_band_ok": False,
     }
+    if df is None or len(df) < max(lookback, 25):
+        result["reason"] = f"Need at least {max(lookback,25)} completed candles."
+        return result
 
-    if len(data) < int(lookback):
-        return empty
+    window = df.tail(int(lookback)).copy()
+    previous = window.iloc[:-3]
+    last3 = window.iloc[-3:]
+    if len(previous) < 1:
+        return result
 
-    segment = data.tail(int(lookback))
-    first_close = float(segment["close"].iloc[0])
-    last = data.iloc[-1]
-    last_close = float(last["close"])
+    first_close = float(window["close"].iloc[0])
+    last_close = float(window["close"].iloc[-1])
+    pct = ((last_close - first_close) / first_close * 100.0) if first_close else np.nan
 
-    if first_close <= 0:
-        return {
-            **empty,
-            "reason": "Invalid starting close price.",
-        }
+    opens = last3["open"].astype(float).to_numpy()
+    closes = last3["close"].astype(float).to_numpy()
+    red_candles = bool(np.all(closes < opens))
+    green_candles = bool(np.all(closes > opens))
+    closes_fall = bool(closes[0] > closes[1] > closes[2])
+    closes_rise = bool(closes[0] < closes[1] < closes[2])
 
-    change = (last_close - first_close) / first_close * 100.0
+    # The swing extreme must be located BEFORE the latest three candles.
+    previous_peak_time = previous["high"].astype(float).idxmax()
+    previous_bottom_time = previous["low"].astype(float).idxmin()
+    last3_high_max = float(last3["high"].max())
+    last3_low_min = float(last3["low"].min())
+    peak_before_3 = float(previous.loc[previous_peak_time, "high"]) > last3_high_max
+    bottom_before_3 = float(previous.loc[previous_bottom_time, "low"]) < last3_low_min
 
-    green = float(
-        (segment["close"] > segment["open"]).mean()
-    )
-    red = float(
-        (segment["close"] < segment["open"]).mean()
-    )
+    sell_ok = red_candles and closes_fall and peak_before_3
+    buy_ok = green_candles and closes_rise and bottom_before_3
 
-    above = bool(
-        pd.notna(last.get("ema15"))
-        and last_close > float(last["ema15"])
-    )
-    below = bool(
-        pd.notna(last.get("ema15"))
-        and last_close < float(last["ema15"])
-    )
-    upper = bool(
-        pd.notna(last.get("bb_upper"))
-        and float(last["high"]) >= float(last["bb_upper"])
-    )
-    lower = bool(
-        pd.notna(last.get("bb_lower"))
-        and float(last["low"]) <= float(last["bb_lower"])
-    )
+    green_ratio = float((window["close"] > window["open"]).mean())
+    red_ratio = float((window["close"] < window["open"]).mean())
 
-    # Your rule: price falls -> BUY.
-    if last_close < first_close:
-        signal = "BUY"
-        trend = "Falling"
-        reason = (
-            f"BUY: price fell {abs(change):.3f}% across the last "
-            f"{lookback} completed 1-minute candles. "
-            "EMA 15 and Bollinger Bands do not block this signal."
-        )
-
-    # Your rule: price rises -> SELL.
-    elif last_close > first_close:
+    if sell_ok:
         signal = "SELL"
-        trend = "Rising"
+        pattern = "3 consecutive falling/red candles"
+        swing = "Recent swing high was before the 3 falling candles"
         reason = (
-            f"SELL: price rose {change:.3f}% across the last "
-            f"{lookback} completed 1-minute candles. "
-            "EMA 15 and Bollinger Bands do not block this signal."
+            f"SELL: swing high followed by 3 completed bearish candles; "
+            f"their closes descend consecutively. {lookback}-candle change: {pct:+.3f}%."
         )
-
+    elif buy_ok:
+        signal = "BUY"
+        pattern = "3 consecutive rising/green candles"
+        swing = "Recent swing low was before the 3 rising candles"
+        reason = (
+            f"BUY: swing low followed by 3 completed bullish candles; "
+            f"their closes rise consecutively. {lookback}-candle change: {pct:+.3f}%."
+        )
     else:
         signal = "NO SIGNAL"
-        trend = "Flat"
-        reason = (
-            f"First and last closing prices are equal across "
-            f"the selected {lookback} candles."
+        pattern = (
+            "3 red candles" if red_candles and closes_fall else
+            "3 green candles" if green_candles and closes_rise else
+            "Latest 3 candles are not 3 consecutive red/green candles"
         )
+        if red_candles and closes_fall and not peak_before_3:
+            swing = "No confirmed swing high before the latest 3 candles"
+        elif green_candles and closes_rise and not bottom_before_3:
+            swing = "No confirmed swing low before the latest 3 candles"
+        else:
+            swing = "Top/bottom reversal not confirmed"
+        reason = f"No confirmed reversal. Pattern: {pattern}; swing check: {swing}."
 
     return {
         "signal": signal,
         "reason": reason,
-        "change_pct": change,
-        "trend": trend,
-        "green_ratio": green,
-        "red_ratio": red,
-        "direction_up_ok": last_close > first_close,
-        "direction_down_ok": last_close < first_close,
-        "price_above_ema": above,
-        "price_below_ema": below,
-        "upper_band_ok": upper,
-        "lower_band_ok": lower,
+        "change_pct": pct,
+        "trend": "Falling" if sell_ok else "Rising" if buy_ok else "No confirmed reversal",
+        "three_candle_pattern": pattern,
+        "swing_point": swing,
+        "direction_up_ok": closes_rise,
+        "direction_down_ok": closes_fall,
+        "green_ratio": green_ratio,
+        "red_ratio": red_ratio,
     }
 
 
-# ============================================================
-# SCAN ONE ASSET
-# ============================================================
-
-def scan(asset, lookback, mode, target):
+def scan_asset(asset: dict[str, Any], lookback: int, target: int, deep_history: bool) -> dict[str, Any]:
     try:
-        candles, source, warning = get_candles(asset, target)
-        data = indicators(candles)
-        signal = signal_for(data, lookback, mode)
+        candles, source, warning = get_candles(asset, target, deep_history)
+        data = add_indicators(candles)
+        signal = signal_for(data, lookback)
         last = data.iloc[-1]
-
         return {
             **asset,
             **signal,
             "price": float(last["close"]),
-            "ema15": (
-                float(last["ema15"])
-                if pd.notna(last["ema15"])
-                else np.nan
-            ),
-            "bb_upper": (
-                float(last["bb_upper"])
-                if pd.notna(last["bb_upper"])
-                else np.nan
-            ),
-            "bb_mid": (
-                float(last["bb_mid"])
-                if pd.notna(last["bb_mid"])
-                else np.nan
-            ),
-            "bb_lower": (
-                float(last["bb_lower"])
-                if pd.notna(last["bb_lower"])
-                else np.nan
-            ),
+            "ema15": float(last["ema15"]) if pd.notna(last["ema15"]) else np.nan,
+            "bb_upper": float(last["bb_upper"]) if pd.notna(last["bb_upper"]) else np.nan,
+            "bb_mid": float(last["bb_mid"]) if pd.notna(last["bb_mid"]) else np.nan,
+            "bb_lower": float(last["bb_lower"]) if pd.notna(last["bb_lower"]) else np.nan,
             "count": len(data),
             "last_candle_utc": str(last["time"]),
             "source": source,
@@ -1075,22 +653,19 @@ def scan(asset, lookback, mode, target):
             "error": None,
             "warning": warning,
         }
-
-    except Exception as error:
+    except Exception as exc:
         return {
             **asset,
             "signal": "NO SIGNAL",
-            "reason": "Data unavailable; no signal calculated.",
+            "reason": "No signal because usable recent price data is unavailable.",
             "change_pct": np.nan,
             "trend": "Unknown",
-            "green_ratio": np.nan,
-            "red_ratio": np.nan,
+            "three_candle_pattern": "Unavailable",
+            "swing_point": "Unavailable",
             "direction_up_ok": False,
             "direction_down_ok": False,
-            "price_above_ema": False,
-            "price_below_ema": False,
-            "upper_band_ok": False,
-            "lower_band_ok": False,
+            "green_ratio": np.nan,
+            "red_ratio": np.nan,
             "price": np.nan,
             "ema15": np.nan,
             "bb_upper": np.nan,
@@ -1100,703 +675,273 @@ def scan(asset, lookback, mode, target):
             "last_candle_utc": None,
             "source": "Unavailable",
             "candles": None,
-            "error": str(error),
+            "error": f"{type(exc).__name__}: {exc}",
             "warning": None,
         }
 
 
-# ============================================================
-# EXCEL HISTORY — AUTOMATIC SAVE
-# ============================================================
+def safe_excel_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (float, np.floating)) and not np.isfinite(value):
+        return None
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, (pd.Timestamp,)):
+        return str(value)
+    return value
 
-def excel_row(result, scan_time):
+
+def export_row(result: dict[str, Any], scan_time: str) -> dict[str, Any]:
     fields = [
-        "name", "symbol", "category", "kind", "signal",
-        "reason", "trend", "change_pct", "green_ratio", "red_ratio",
-        "price", "ema15", "bb_upper", "bb_mid", "bb_lower",
-        "count", "last_candle_utc", "source", "warning", "error",
+        "name", "symbol", "category", "kind", "payout", "vip_payout", "signal", "reason", "trend",
+        "three_candle_pattern", "swing_point", "change_pct", "green_ratio", "red_ratio", "price", "ema15",
+        "bb_upper", "bb_mid", "bb_lower", "count", "last_candle_utc", "source", "warning", "error",
     ]
-
-    output = {
-        "scan_time_utc": scan_time,
-        **{field: result.get(field) for field in fields},
-    }
-
-    for key, value in output.items():
-        if (
-            isinstance(value, (np.floating, float))
-            and not np.isfinite(value)
-        ):
-            output[key] = None
-        elif isinstance(value, np.integer):
-            output[key] = int(value)
-
-    return output
+    row = {"scan_time_utc": scan_time, **{field: result.get(field) for field in fields}}
+    return {key: safe_excel_value(value) for key, value in row.items()}
 
 
-def save_excel(results, scan_time):
-    result_table = pd.DataFrame([
-        excel_row(result, scan_time)
-        for result in results
-    ])
-
-    error_table = result_table[
-        result_table["error"].notna()
-    ].copy()
-
-    summary_table = pd.DataFrame([{
+def save_excel_history(results: list[dict[str, Any]], scan_time: str) -> None:
+    result_table = pd.DataFrame([export_row(r, scan_time) for r in results])
+    error_table = result_table[result_table["error"].notna()].copy()
+    summary = pd.DataFrame([{
         "scan_time_utc": scan_time,
         "assets_scanned": len(results),
-        "data_ok": sum(
-            not bool(result.get("error"))
-            for result in results
-        ),
-        "data_errors": sum(
-            bool(result.get("error"))
-            for result in results
-        ),
-        "BUY": sum(
-            result.get("signal") == "BUY"
-            and not bool(result.get("error"))
-            for result in results
-        ),
-        "SELL": sum(
-            result.get("signal") == "SELL"
-            and not bool(result.get("error"))
-            for result in results
-        ),
-        "NO_SIGNAL": sum(
-            result.get("signal") == "NO SIGNAL"
-            and not bool(result.get("error"))
-            for result in results
-        ),
+        "data_ok": sum(not bool(r.get("error")) for r in results),
+        "data_errors": sum(bool(r.get("error")) for r in results),
+        "BUY": sum(r.get("signal") == "BUY" and not r.get("error") for r in results),
+        "SELL": sum(r.get("signal") == "SELL" and not r.get("error") for r in results),
+        "NO_SIGNAL": sum(r.get("signal") == "NO SIGNAL" and not r.get("error") for r in results),
     }])
-
-    sheets = {
-        "Scan History": summary_table,
-        "Scan Results": result_table,
-        "Data Errors": error_table,
-    }
-
-    # Append new results without deleting earlier scans.
-    if XLSX.exists():
+    sheets = {"Scan History": summary, "Scan Results": result_table, "Data Errors": error_table}
+    if EXCEL_PATH.exists():
         try:
-            with pd.ExcelFile(XLSX) as workbook:
-                for sheet_name, new_table in list(sheets.items()):
-                    if sheet_name in workbook.sheet_names:
-                        old_table = pd.read_excel(
-                            workbook,
-                            sheet_name=sheet_name,
-                        )
-                        sheets[sheet_name] = pd.concat(
-                            [old_table, new_table],
-                            ignore_index=True,
-                        ).tail(1_000_000)
+            with pd.ExcelFile(EXCEL_PATH) as book:
+                for name, new_table in list(sheets.items()):
+                    if name in book.sheet_names:
+                        old_table = pd.read_excel(book, sheet_name=name)
+                        sheets[name] = pd.concat([old_table, new_table], ignore_index=True).tail(1_000_000)
         except Exception:
-            # If the existing workbook cannot be read, create a new one.
             pass
-
     temporary_path = None
-
     try:
-        with tempfile.NamedTemporaryFile(
-            suffix=".xlsx",
-            prefix="velora_",
-            dir=DATA_DIR,
-            delete=False,
-        ) as file:
-            temporary_path = file.name
-
-        with pd.ExcelWriter(
-            temporary_path,
-            engine="openpyxl",
-        ) as writer:
-            for sheet_name, table in sheets.items():
-                table.to_excel(
-                    writer,
-                    sheet_name=sheet_name,
-                    index=False,
-                )
-
-                worksheet = writer.sheets[sheet_name]
-                worksheet.freeze_panes = "A2"
-                worksheet.auto_filter.ref = worksheet.dimensions
-
-                for cells in worksheet.columns:
-                    width = max(
-                        (
-                            len(str(cell.value))
-                            if cell.value is not None
-                            else 0
-                        )
-                        for cell in cells[:1000]
-                    )
-
-                    worksheet.column_dimensions[
-                        cells[0].column_letter
-                    ].width = min(55, max(12, width + 2))
-
-        os.replace(temporary_path, XLSX)
-
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", prefix="velora_", dir=DATA_DIR, delete=False) as tmp:
+            temporary_path = tmp.name
+        with pd.ExcelWriter(temporary_path, engine="openpyxl") as writer:
+            for name, frame in sheets.items():
+                frame.to_excel(writer, sheet_name=name, index=False)
+                ws = writer.sheets[name]
+                ws.freeze_panes = "A2"
+                ws.auto_filter.ref = ws.dimensions
+                for cells in ws.columns:
+                    width = max((len(str(c.value)) if c.value is not None else 0) for c in cells[:1000])
+                    ws.column_dimensions[cells[0].column_letter].width = min(55, max(12, width + 2))
+        os.replace(temporary_path, EXCEL_PATH)
     finally:
         if temporary_path and os.path.exists(temporary_path):
             os.remove(temporary_path)
 
 
 # ============================================================
-# STREAMLIT USER INTERFACE
+# STREAMLIT UI + AUTOMATIC 40-SECOND REFRESH
 # ============================================================
+st.set_page_config(page_title="Velora Scanner", page_icon="📊", layout="wide")
 
-st.set_page_config(
-    page_title="Velora Scanner",
-    page_icon="📊",
-    layout="wide",
-)
+# This widget triggers a Streamlit rerun every 40 seconds.
+refresh_tick = st_autorefresh(interval=REFRESH_MS, key="velora_refresh_40s", limit=None)
 
-APP_VERSION = "direction-only-15-20-v1"
-
-# Clear old session data after this app version changes.
-if st.session_state.get("_velora_app_version") != APP_VERSION:
-    for key in ("results", "scan_time", "save_msg"):
+if st.session_state.get("_velora_version") != APP_VERSION:
+    for key in ("results", "scan_time", "save_msg", "last_processed_tick"):
         st.session_state.pop(key, None)
+    st.session_state["_velora_version"] = APP_VERSION
 
-    st.session_state["_velora_app_version"] = APP_VERSION
-
-
-st.title("📊 Velora — EMA 15 + Bollinger Bands")
-
-st.caption(
-    "1-minute market scanner | BUY / SELL signals only | "
-    "No order execution"
-)
-
+st.title("📊 Velora — 3-candle reversal scanner")
+st.caption("BUY: 3 rising candles after a swing low | SELL: 3 falling candles after a swing high | Refresh every 40 seconds | No trade execution")
 st.warning(
-    "Public market data only. Crypto tries Binance, Bybit, OKX, "
-    "Gate.io, Coinbase and Yahoo Finance. Forex and stock assets use "
-    "Yahoo Finance. Data availability varies. Yahoo prices are not "
-    "Binomo OTC quotes. This app never places trades."
+    "Important: the OTC quotes shown by Binomo are not available from these public APIs. "
+    "Crypto rows use public exchange Spot prices as proxies; Forex uses Yahoo Finance if the pair is supported. "
+    "Payout/VIP payout are the values from your pasted list and may change on the broker. "
+    "The screen refreshes every 40 seconds, but signals use completed 1-minute candles, so the signal may stay unchanged until a new candle closes."
 )
 
 st.sidebar.header("Scanner settings")
+category = st.sidebar.selectbox("Asset category", ["All", "Crypto", "Forex", "Other"], index=0)
+lookback = st.sidebar.slider("Swing-high / swing-low lookback (candles)", min_value=15, max_value=20, value=15, step=1)
+deep_history = st.sidebar.checkbox("Build history toward 100,000 candles (slower)", value=False)
+show_no_signal = st.sidebar.checkbox("Show NO SIGNAL results", value=True)
 
-category = st.sidebar.selectbox(
-    "Asset category",
-    ["All", "Crypto", "Forex", "Other"],
+category_assets = [a for a in ASSETS if category == "All" or a["category"] == category]
+default_names = [
+    "Bitcoin (OTC)", "Ethereum (OTC)", "Solana (OTC)", "EUR/USD", "AUD/USD",
+    "GBP/USD", "USD/JPY", "USD/CAD", "USD/CHF", "Gold",
+]
+default_assets = [a for a in category_assets if a["name"] in default_names]
+if not default_assets:
+    default_assets = category_assets[:min(10, len(category_assets))]
+
+chosen_names = st.multiselect(
+    "Assets to scan (from your list)",
+    options=[a["name"] for a in category_assets],
+    default=[a["name"] for a in default_assets],
+    help="Selecting many Yahoo Forex assets can trigger rate limits. Start with a smaller group; the list includes all instruments you provided.",
 )
-
-lookback = st.sidebar.select_slider(
-    "Rise/fall candle count",
-    options=list(range(15, 21)),
-    value=15,
-)
-
-mode = st.sidebar.radio(
-    "Bollinger display mode (informational only)",
-    ["Near band (0.50%)", "Touch or cross", "Close outside band"],
-    index=0,
-    help=(
-        "The Bollinger setting only changes diagnostic display. "
-        "BUY/SELL signals are determined by the overall move "
-        "across the selected completed candles."
-    ),
-)
-
-asset_limit = int(
-    st.sidebar.number_input(
-        "Maximum assets per scan",
-        min_value=1,
-        max_value=len(ASSETS),
-        value=10,
-    )
-)
-
-deep = st.sidebar.checkbox(
-    "Sync toward 100,000 candles (slower; crypto providers only)",
-    value=False,
-)
-
-show_no = st.sidebar.checkbox(
-    "Show NO SIGNAL results",
-    value=True,
-)
-
-assets = [
-    asset
-    for asset in ASSETS
-    if category == "All" or asset["category"] == category
-][:asset_limit]
-
-target = TARGET if deep else LIMIT
+selected_assets = [a for a in category_assets if a["name"] in chosen_names]
+target_count = TARGET_HISTORY if deep_history else DEFAULT_HISTORY
+st.write(f"**Assets selected:** {len(selected_assets)}")
+st.write(f"**Scan refresh:** every 40 seconds")
+st.write(f"**Swing lookback:** {lookback} completed one-minute candles")
+st.caption(f"Excel history: `{EXCEL_PATH}`. The file is updated automatically after each scan; download a copy to preserve it across redeployments.")
 
 st.markdown(f"""
-### Strategy rules
-
-- **BUY:** The latest closing price is lower than the closing price
-  at the start of the selected {lookback} completed 1-minute candles.
-- **SELL:** The latest closing price is higher than the closing price
-  at the start of the selected {lookback} completed 1-minute candles.
-- **NO SIGNAL:** The first and last closing prices are equal, or data is unavailable.
-- EMA 15 and Bollinger Bands remain on the chart for reference, but
-  they do not block BUY/SELL signals.
-- The unfinished current 1-minute candle is excluded.
+### Signal rules
+- **SELL:** the highest high in the selected last {lookback} completed candles occurred before the latest three candles, and those latest three candles are all bearish with consecutive lower closes.
+- **BUY:** the lowest low in the selected last {lookback} completed candles occurred before the latest three candles, and those latest three candles are all bullish with consecutive higher closes.
+- Otherwise the result is **NO SIGNAL**. EMA 15 and Bollinger Bands are displayed for reference only and do not block a valid reversal.
+- The unfinished current one-minute candle is excluded.
 """)
 
-st.write(
-    f"Assets selected: **{len(assets)}** · "
-    f"History target: **{target:,} candles per asset**"
-)
-
-st.caption(
-    f"Excel is automatically saved to `{XLSX}` after each scan. "
-    "Download a copy to preserve it because hosted files may be deleted "
-    "during redeployment."
-)
-
-
-# ============================================================
-# SESSION STATE VALIDATION
-# ============================================================
-
-# Do not use `if results` on a possible pandas DataFrame.
-if (
-    "results" not in st.session_state
-    or not isinstance(st.session_state.get("results"), list)
-):
+if "results" not in st.session_state or not isinstance(st.session_state.get("results"), list):
     st.session_state["results"] = []
-
 if "scan_time" not in st.session_state:
     st.session_state["scan_time"] = None
 
+manual_scan = st.button("🔍 SCAN NOW", type="primary", use_container_width=True)
+last_processed_tick = st.session_state.get("last_processed_tick")
+auto_scan_due = last_processed_tick != refresh_tick
+should_scan = manual_scan or auto_scan_due
 
-# ============================================================
-# START SCAN
-# ============================================================
-
-if st.button(
-    "🔍 START SCAN",
-    type="primary",
-    use_container_width=True,
-):
+if should_scan and selected_assets:
     scan_results = []
     progress = st.progress(0.0)
     status = st.empty()
-
-    with ThreadPoolExecutor(
-        max_workers=min(3, max(1, len(assets)))
-    ) as executor:
+    # Use a small worker pool to reduce public-provider rate-limit pressure.
+    with ThreadPoolExecutor(max_workers=min(3, len(selected_assets))) as pool:
         futures = {
-            executor.submit(
-                scan,
-                asset,
-                int(lookback),
-                mode,
-                target,
-            ): asset
-            for asset in assets
+            pool.submit(scan_asset, asset, int(lookback), target_count, deep_history): asset
+            for asset in selected_assets
         }
-
-        for index, future in enumerate(
-            as_completed(futures),
-            start=1,
-        ):
+        for index, future in enumerate(as_completed(futures), start=1):
             asset = futures[future]
-
             try:
                 scan_results.append(future.result())
-
-            except Exception as error:
-                scan_results.append({
-                    **asset,
-                    "signal": "NO SIGNAL",
-                    "reason": "Unexpected scan error.",
-                    "candles": None,
-                    "error": str(error),
-                })
-
-            progress.progress(
-                index / max(1, len(futures))
-            )
-            status.write(
-                f"Scanned {index}/{len(futures)} assets"
-            )
-
-    order = {
-        asset["symbol"]: index
-        for index, asset in enumerate(assets)
-    }
-
-    scan_results.sort(
-        key=lambda result: order.get(
-            result.get("symbol"), 999
-        )
-    )
-
-    scan_time = now_utc().strftime(
-        "%Y-%m-%d %H:%M:%S UTC"
-    )
-
+            except Exception as exc:
+                scan_results.append({**asset, "signal": "NO SIGNAL", "reason": str(exc), "candles": None, "error": str(exc)})
+            progress.progress(index / max(1, len(futures)))
+            status.write(f"Scanning {index}/{len(futures)} · next automatic refresh in 40 seconds")
+    order = {a["name"]: i for i, a in enumerate(selected_assets)}
+    scan_results.sort(key=lambda r: order.get(r.get("name"), 9999))
+    scan_stamp = now_utc().strftime("%Y-%m-%d %H:%M:%S UTC")
     st.session_state["results"] = scan_results
-    st.session_state["scan_time"] = scan_time
-
+    st.session_state["scan_time"] = scan_stamp
+    st.session_state["last_processed_tick"] = refresh_tick
     try:
-        save_excel(scan_results, scan_time)
-        st.session_state["save_msg"] = (
-            f"Excel history saved automatically: {XLSX.name}"
-        )
-    except Exception as error:
-        st.session_state["save_msg"] = (
-            f"Excel save failed: {error}"
-        )
-
+        save_excel_history(scan_results, scan_stamp)
+        st.session_state["save_msg"] = f"Excel saved: {EXCEL_PATH.name}"
+    except Exception as exc:
+        st.session_state["save_msg"] = f"Excel save failed: {type(exc).__name__}: {exc}"
     progress.empty()
     status.empty()
-
-
-# ============================================================
-# DISPLAY RESULTS
-# ============================================================
+elif should_scan and not selected_assets:
+    st.info("Select at least one asset to start scanning.")
+    st.session_state["last_processed_tick"] = refresh_tick
 
 results_value = st.session_state.get("results", [])
-
-if isinstance(results_value, list):
-    results = results_value
-else:
-    results = []
+results = results_value if isinstance(results_value, list) else []
+if not isinstance(results_value, list):
     st.session_state["results"] = []
 
-scan_time = st.session_state.get("scan_time")
+if st.session_state.get("save_msg"):
+    msg = st.session_state["save_msg"]
+    if msg.startswith("Excel saved:"):
+        st.success(msg)
+    else:
+        st.error(msg)
 
-if len(results) == 0:
-    st.info(
-        "Click START SCAN to retrieve candles and calculate signals."
-    )
-
-    if XLSX.exists():
-        st.download_button(
-            "📥 Download Excel history",
-            XLSX.read_bytes(),
-            "velora_scan_history.xlsx",
-            mime=(
-                "application/vnd.openxmlformats-officedocument."
-                "spreadsheetml.sheet"
-            ),
-        )
-
+if not results:
+    st.info("Select assets and wait for the initial scan or press SCAN NOW.")
+    if EXCEL_PATH.exists():
+        st.download_button("📥 Download Excel history", EXCEL_PATH.read_bytes(), "velora_scan_history.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     st.stop()
 
+# Only display results matching the assets currently selected. A later auto-scan updates these rows.
+selected_name_set = set(chosen_names)
+results = [r for r in results if r.get("name") in selected_name_set]
+valid = [r for r in results if r.get("candles") is not None and not r.get("error")]
+errors = [r for r in results if r.get("error")]
+buys = [r for r in valid if r.get("signal") == "BUY"]
+sells = [r for r in valid if r.get("signal") == "SELL"]
 
-if st.session_state.get("save_msg"):
-    message = st.session_state["save_msg"]
-
-    if message.startswith("Excel history saved"):
-        st.success(message)
-    else:
-        st.error(message)
-
-
-valid = [
-    result
-    for result in results
-    if result.get("candles") is not None
-    and not result.get("error")
-]
-
-errors = [
-    result
-    for result in results
-    if result.get("error")
-]
-
-buys = [
-    result
-    for result in valid
-    if result.get("signal") == "BUY"
-]
-
-sells = [
-    result
-    for result in valid
-    if result.get("signal") == "SELL"
-]
-
-st.caption(f"Last scan: {scan_time}")
-
-col1, col2, col3, col4 = st.columns(4)
-
-col1.metric(
-    "Assets with 100K candles",
-    sum(result["count"] >= TARGET for result in valid),
-)
-col2.metric("BUY", len(buys))
-col3.metric("SELL", len(sells))
-col4.metric("Data errors", len(errors))
-
-
-# ============================================================
-# BUY / SELL SIGNALS
-# ============================================================
+st.caption(f"Last scan: {st.session_state.get('scan_time') or 'Not scanned yet'} · auto-refresh: 40 seconds")
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Assets scanned", len(results))
+m2.metric("BUY", len(buys))
+m3.metric("SELL", len(sells))
+m4.metric("Data errors", len(errors))
 
 st.subheader("🚨 BUY / SELL signals")
-
 signals = buys + sells
-
-if len(signals) > 0:
-    signal_table = pd.DataFrame([
-        {
-            "Asset": result.get("name"),
-            "Symbol": result.get("symbol"),
-            "Signal": result.get("signal"),
-            "Price": result.get("price"),
-            "Trend": result.get("trend"),
-            "Change (%)": result.get("change_pct"),
-            "EMA 15": result.get("ema15"),
-            "BB upper": result.get("bb_upper"),
-            "BB lower": result.get("bb_lower"),
-            "Candles": result.get("count"),
-            "Reason": result.get("reason"),
-        }
-        for result in signals
-    ])
-
-    st.table(signal_table)
-
+if signals:
+    st.dataframe(pd.DataFrame([{
+        "Asset": r.get("name"), "Payout": f"{r.get('payout')}%", "VIP": f"{r.get('vip_payout')}%",
+        "Signal": r.get("signal"), "Price": r.get("price"), "Symbol": r.get("symbol"),
+        "Last candle (UTC)": r.get("last_candle_utc"), "Reason": r.get("reason"),
+    } for r in signals]), use_container_width=True, hide_index=True)
 else:
-    st.info(
-        "No direction signal: the first and last closes are equal, "
-        "or valid current market data is unavailable."
-    )
-
-
-# ============================================================
-# ALL RESULTS
-# ============================================================
+    st.info("No confirmed three-candle reversal right now. The scanner will keep checking every 40 seconds.")
 
 st.subheader("📋 All scan results")
-
-shown = (
-    valid
-    if show_no
-    else [
-        result
-        for result in valid
-        if result.get("signal") != "NO SIGNAL"
-    ]
-)
-
-
-def direction_status(result):
-    if result.get("direction_up_ok"):
-        return "PASS — price rose across selected candles"
-
-    if result.get("direction_down_ok"):
-        return "PASS — price fell across selected candles"
-
-    return "NO MOVE — first and last closes are equal"
-
-
-def ema_status(result):
-    if result.get("price_above_ema"):
-        return "INFO — close above EMA 15 (not a filter)"
-
-    if result.get("price_below_ema"):
-        return "INFO — close below EMA 15 (not a filter)"
-
-    return "INFO — EMA 15 unavailable/equal (not a filter)"
-
-
-def band_status(result):
-    if result.get("upper_band_ok"):
-        return "INFO — upper band touched (not a filter)"
-
-    if result.get("lower_band_ok"):
-        return "INFO — lower band touched (not a filter)"
-
-    return "INFO — no band touched (not a filter)"
-
-
-if len(shown) > 0:
-    all_table = pd.DataFrame([
-        {
-            "Asset": result.get("name"),
-            "Symbol": result.get("symbol"),
-            "Category": result.get("category"),
-            "Signal": result.get("signal"),
-            "Price": result.get("price"),
-            "Candles": result.get("count"),
-            "Direction check": direction_status(result),
-            "EMA check": ema_status(result),
-            "Band check": band_status(result),
-            "Source": result.get("source"),
-            "Reason": result.get("reason"),
-        }
-        for result in shown
-    ])
-
-    st.table(all_table)
-
+shown = valid if show_no_signal else [r for r in valid if r.get("signal") != "NO SIGNAL"]
+if shown:
+    st.dataframe(pd.DataFrame([{
+        "Asset": r.get("name"), "Payout": f"{r.get('payout')}%", "VIP payout": f"{r.get('vip_payout')}%",
+        "Symbol": r.get("symbol"), "Category": r.get("category"), "Signal": r.get("signal"),
+        "Price": r.get("price"), "Candles": r.get("count"),
+        "3-candle pattern": r.get("three_candle_pattern"), "Swing check": r.get("swing_point"),
+        "Source": r.get("source"), "Reason": r.get("reason"),
+    } for r in shown]), use_container_width=True, hide_index=True)
 else:
-    st.info(
-        "No valid scan results. Review Data errors below."
-    )
-
-
-# ============================================================
-# CHART
-# ============================================================
+    st.info("No valid results for the selected assets yet. Open Data errors below.")
 
 st.subheader("📈 Asset chart")
-
-chartable = [
-    result
-    for result in valid
-    if isinstance(result.get("candles"), pd.DataFrame)
-    and not result["candles"].empty
-]
-
-if len(chartable) > 0:
-    chart_by_symbol = {
-        result["symbol"]: result
-        for result in chartable
-    }
-
-    selected_symbol = st.selectbox(
-        "Choose an asset",
-        options=list(chart_by_symbol.keys()),
-        format_func=lambda symbol: chart_by_symbol[symbol]["name"],
-        key="velora_chart_symbol",
-    )
-
-    chosen = chart_by_symbol[selected_symbol]
-    chart = chosen["candles"].tail(500).set_index("time")
-
-    st.write(
-        f"**{chosen['signal']}** — {chosen['reason']} "
-        f"· {chosen['source']}"
-    )
-
+chartable = [r for r in valid if isinstance(r.get("candles"), pd.DataFrame) and not r["candles"].empty]
+if chartable:
+    by_name = {r["name"]: r for r in chartable}
+    chosen_name = st.selectbox("Choose an asset", list(by_name.keys()), key="velora_chart_asset")
+    chosen = by_name[chosen_name]
+    chart = chosen["candles"].tail(300).set_index("time")
+    st.write(f"**{chosen['signal']}** — {chosen['reason']} · {chosen.get('source','')}")
     if chosen.get("warning"):
         st.warning(chosen["warning"])
-
     st.markdown("**Close price and EMA 15**")
-
-    st.line_chart(
-        chart[["close", "ema15"]].rename(
-            columns={
-                "close": "Close",
-                "ema15": "EMA 15",
-            }
-        )
-    )
-
+    st.line_chart(chart[["close", "ema15"]].rename(columns={"close":"Close", "ema15":"EMA 15"}))
     st.markdown("**Bollinger Bands**")
-
-    st.line_chart(
-        chart[["close", "bb_upper", "bb_mid", "bb_lower"]].rename(
-            columns={
-                "close": "Close",
-                "bb_upper": "Upper band",
-                "bb_mid": "Middle band",
-                "bb_lower": "Lower band",
-            }
-        )
-    )
-
+    st.line_chart(chart[["close", "bb_upper", "bb_mid", "bb_lower"]].rename(columns={"close":"Close", "bb_upper":"Upper band", "bb_mid":"Middle band", "bb_lower":"Lower band"}))
 else:
-    st.info(
-        "No chart available because no valid current candle data "
-        "was retrieved."
+    st.info("No chart available for the current selection because no valid candle data was retrieved.")
+
+st.subheader("⚠️ Data errors")
+if errors:
+    error_text = "\n\n".join(
+        f"ASSET: {r.get('name')} | SYMBOL: {r.get('symbol')}\n{r.get('error')}"
+        for r in errors
     )
-
-
-# ============================================================
-# DATA ERRORS
-# ============================================================
-
-st.subheader("⚠️ Data errors — readable details")
-
-if len(errors) > 0:
-    st.error(
-        f"{len(errors)} asset(s) could not be scanned. "
-        "Copy the messages below to diagnose them."
-    )
-
-    error_lines = []
-
-    for result in errors:
-        detail = str(
-            result.get("error") or "No error text returned"
-        )
-
-        error_lines.append(
-            f"ASSET: {result.get('name')} | "
-            f"SYMBOL: {result.get('symbol')} | "
-            f"CATEGORY: {result.get('category')}\n{detail}"
-        )
-
-    st.text_area(
-        "Copy provider error messages",
-        value="\n\n".join(error_lines),
-        height=320,
-    )
-
-    for result in errors:
-        with st.expander(
-            f"{result.get('name')} ({result.get('symbol')})"
-        ):
-            st.code(
-                str(result.get("error") or "No error text returned"),
-                language="text",
-            )
-
-    st.caption(
-        "If all providers fail with DNS, timeout, or connection errors, "
-        "the hosting environment may be blocking external APIs."
-    )
-
+    st.text_area("Copy error details", error_text, height=300)
 else:
     st.success("No data errors in this scan.")
 
-
-# ============================================================
-# EXCEL AND CSV DOWNLOADS
-# ============================================================
-
 st.subheader("💾 Automatic Excel history")
-
-if XLSX.exists():
+if EXCEL_PATH.exists():
     st.download_button(
-        "📥 Download Excel history (all scans)",
-        XLSX.read_bytes(),
+        "📥 Download Excel history (all scans)", EXCEL_PATH.read_bytes(),
         "velora_scan_history.xlsx",
-        mime=(
-            "application/vnd.openxmlformats-officedocument."
-            "spreadsheetml.sheet"
-        ),
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
+    st.caption("Workbook sheets: Scan History, Scan Results, Data Errors. Saved after each automatic or manual scan.")
 
-    st.caption(
-        "Workbook sheets: Scan History, Scan Results, Data Errors."
-    )
-
-current_export = pd.DataFrame([
-    excel_row(result, scan_time or "Unknown")
-    for result in results
-])
-
-st.download_button(
-    "📄 Download current scan as CSV",
-    current_export.to_csv(index=False).encode("utf-8-sig"),
-    "velora_current_scan.csv",
-    "text/csv",
-    use_container_width=True,
-)
-
-st.divider()
-
-st.caption(
-    "Analysis signals only; no trade execution. "
-    "100,000 candles are a target, not a guarantee. "
-    "Download the Excel workbook to preserve a copy because hosted "
-    "files may be deleted during redeployment."
-)
+current_export = pd.DataFrame([export_row(r, st.session_state.get("scan_time") or "Unknown") for r in results])
+st.download_button("📄 Download current scan CSV", current_export.to_csv(index=False).encode("utf-8-sig"), "velora_current_scan.csv", "text/csv", use_container_width=True)
+st.caption("A public-market price is not the same as a broker's OTC quote. Signals are informational and do not place orders. Refreshing runs a new scan every 40 seconds; completed 1-minute candle data only changes when a candle closes.")
