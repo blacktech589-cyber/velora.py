@@ -54,8 +54,67 @@ def data_dir():
 DATA_DIR=data_dir(); DB=DATA_DIR/"velora_history.sqlite3"; XLSX=DATA_DIR/"velora_scan_history.xlsx"
 
 def init_db():
+    """Create the current schema and migrate databases made by older Velora versions.
+
+    Earlier app versions used `candle_time`; the current app uses `time`.
+    CREATE TABLE IF NOT EXISTS does not alter an existing table, so explicitly
+    migrate that old schema before reading or writing candles.
+    """
     with sqlite3.connect(DB, timeout=30) as c:
-        c.execute("CREATE TABLE IF NOT EXISTS candles(symbol TEXT, time TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL, PRIMARY KEY(symbol,time))")
+        existing = c.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='candles'"
+        ).fetchone() is not None
+        required = {"symbol", "time", "open", "high", "low", "close", "volume"}
+        columns = (
+            {row[1] for row in c.execute("PRAGMA table_info(candles)").fetchall()}
+            if existing else set()
+        )
+
+        if existing and not required.issubset(columns):
+            # Remove the old index before renaming, since SQLite keeps index names
+            # attached to the renamed legacy table.
+            c.execute("DROP INDEX IF EXISTS idx_symbol_time")
+            c.execute("ALTER TABLE candles RENAME TO candles_legacy")
+            legacy_columns = {
+                row[1] for row in c.execute("PRAGMA table_info(candles_legacy)").fetchall()
+            }
+            c.execute(
+                "CREATE TABLE candles ("
+                "symbol TEXT NOT NULL, time TEXT NOT NULL, "
+                "open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL, "
+                "close REAL NOT NULL, volume REAL DEFAULT 0, "
+                "PRIMARY KEY(symbol,time))"
+            )
+
+            time_column = next(
+                (name for name in ("time", "candle_time", "timestamp") if name in legacy_columns),
+                None,
+            )
+            needed_ohlc = {"symbol", "open", "high", "low", "close"}
+            if time_column and needed_ohlc.issubset(legacy_columns):
+                volume_expr = "volume" if "volume" in legacy_columns else "0"
+                c.execute(
+                    "INSERT OR REPLACE INTO candles "
+                    "(symbol,time,open,high,low,close,volume) "
+                    f"SELECT symbol, {time_column}, open, high, low, close, {volume_expr} "
+                    "FROM candles_legacy "
+                    "WHERE symbol IS NOT NULL AND " + time_column + " IS NOT NULL"
+                )
+            c.execute("DROP TABLE candles_legacy")
+
+        elif not existing:
+            c.execute(
+                "CREATE TABLE candles ("
+                "symbol TEXT NOT NULL, time TEXT NOT NULL, "
+                "open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL, "
+                "close REAL NOT NULL, volume REAL DEFAULT 0, "
+                "PRIMARY KEY(symbol,time))"
+            )
+
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_symbol_time ON candles(symbol,time)"
+        )
+        c.commit()
 
 def normalize(df):
     cols=["time","open","high","low","close","volume"]
@@ -220,7 +279,12 @@ def indicators(df):
     d=df.copy(); d["ema15"]=d.close.ewm(span=15,adjust=False,min_periods=15).mean(); d["bb_mid"]=d.close.rolling(20,min_periods=20).mean(); sd=d.close.rolling(20,min_periods=20).std(ddof=0); d["bb_upper"]=d.bb_mid+2*sd; d["bb_lower"]=d.bb_mid-2*sd; return d
 
 def signal_for(df,lookback,mode):
-    d=indicators(df); last=d.iloc[-1]; seg=d.tail(lookback); empty={"signal":"NO SIGNAL","reason":"Not enough indicator data","change_pct":np.nan,"trend":"Unknown","green_ratio":np.nan,"red_ratio":np.nan}
+    # Use the supplied indicator columns if they are already calculated. This
+    # ensures the signal shown in the result table and the chart comes from the
+    # exact same candle/indicator snapshot.
+    d = df.copy() if {"ema15", "bb_mid", "bb_upper", "bb_lower"}.issubset(df.columns) else indicators(df)
+    last=d.iloc[-1]; seg=d.tail(lookback)
+    empty={"signal":"NO SIGNAL","reason":"Not enough indicator data","change_pct":np.nan,"trend":"Unknown","green_ratio":np.nan,"red_ratio":np.nan,"direction_up_ok":False,"direction_down_ok":False,"price_above_ema":False,"price_below_ema":False,"upper_band_ok":False,"lower_band_ok":False}
     if len(d)<max(40,lookback) or pd.isna(last.ema15) or pd.isna(last.bb_upper) or pd.isna(last.bb_lower): return empty
     first=float(seg.close.iloc[0]); price=float(last.close)
     if first<=0:return {**empty,"reason":"Invalid price"}
@@ -231,7 +295,7 @@ def signal_for(df,lookback,mode):
     if rising and above and upper: sig="SELL"; reason=f"Last {lookback} candles rose {change:.3f}%; above EMA15 and upper Bollinger condition met."
     elif falling and below and lower: sig="BUY"; reason=f"Last {lookback} candles fell {change:.3f}%; below EMA15 and lower Bollinger condition met."
     else: sig="NO SIGNAL"; reason=f"Conditions incomplete: change={change:.3f}%, green={green:.0%}, red={red:.0%}, above EMA={above}, below EMA={below}, upper band={upper}, lower band={lower}."
-    return {"signal":sig,"reason":reason,"change_pct":change,"trend":"Rising" if rising else "Falling" if falling else "Mixed/sideways","green_ratio":green,"red_ratio":red}
+    return {"signal":sig,"reason":reason,"change_pct":change,"trend":"Rising" if rising else "Falling" if falling else "Mixed/sideways","green_ratio":green,"red_ratio":red,"direction_up_ok":rising,"direction_down_ok":falling,"price_above_ema":above,"price_below_ema":below,"upper_band_ok":upper,"lower_band_ok":lower}
 
 def scan(asset,lookback,mode,target):
     try:
@@ -270,6 +334,12 @@ def save_excel(results,scan_time):
         if tmp and os.path.exists(tmp):os.remove(tmp)
 
 st.set_page_config(page_title="Velora Scanner",page_icon="📊",layout="wide")
+APP_VERSION = "2026-10-21-diagnostics-table-2"
+if st.session_state.get("_velora_app_version") != APP_VERSION:
+    for key in ("results", "scan_time", "save_msg"):
+        st.session_state.pop(key, None)
+    st.session_state["_velora_app_version"] = APP_VERSION
+
 st.title("📊 Velora — EMA 15 + Bollinger Bands")
 st.caption("1-minute market scanner | BUY / SELL signals only | No order execution")
 st.warning("Public market data only. Crypto tries Binance, Bybit, OKX, Gate.io, Coinbase and Yahoo. Forex/stock uses Yahoo Finance. Data availability varies; Yahoo prices are not Binomo OTC quotes. This app never places trades.")
@@ -324,16 +394,67 @@ st.caption(f"Last scan: {stamp}")
 a,b,c,d=st.columns(4);a.metric("Assets with 100K candles",sum(r["count"]>=TARGET for r in valid));b.metric("BUY",len(buys));c.metric("SELL",len(sells));d.metric("Data errors",len(errors))
 st.subheader("🚨 BUY / SELL signals")
 signals=buys+sells
-if len(signals) > 0:st.dataframe(pd.DataFrame([{k:r.get(v) for k,v in {"Asset":"name","Symbol":"symbol","Signal":"signal","Price":"price","Trend":"trend","Change (%)":"change_pct","EMA 15":"ema15","BB upper":"bb_upper","BB lower":"bb_lower","Candles":"count","Reason":"reason"}.items()} for r in signals]),use_container_width=True,hide_index=True)
-else:st.info("No BUY or SELL setup meets all selected conditions. No signal is forced.")
+if len(signals) > 0:
+    signal_table = pd.DataFrame([{
+        "Asset": r.get("name"), "Symbol": r.get("symbol"),
+        "Signal": r.get("signal"), "Price": r.get("price"),
+        "Trend": r.get("trend"), "Change (%)": r.get("change_pct"),
+        "EMA 15": r.get("ema15"), "BB upper": r.get("bb_upper"),
+        "BB lower": r.get("bb_lower"), "Candles": r.get("count"),
+        "Reason": r.get("reason")
+    } for r in signals])
+    # st.table renders a static table rather than the interactive canvas grid.
+    st.table(signal_table)
+else:
+    st.info("No BUY or SELL setup meets all selected conditions. No signal is forced.")
 st.subheader("📋 All scan results")
 shown=valid if show_no else [r for r in valid if r["signal"]!="NO SIGNAL"]
-if len(shown) > 0:st.dataframe(pd.DataFrame([{"Asset":r["name"],"Symbol":r["symbol"],"Category":r["category"],"Signal":r["signal"],"Price":r["price"],"Candles":r["count"],"Source":r["source"],"Reason":r["reason"]} for r in shown]),use_container_width=True,hide_index=True)
-else:st.info("No valid scan results. Review Data errors below.")
+if len(shown) > 0:
+    def movement_status(r):
+        if bool(r.get("direction_up_ok")):
+            return "PASS — rising + green-candle rule"
+        if bool(r.get("direction_down_ok")):
+            return "PASS — falling + red-candle rule"
+        return "FAIL — direction/candle-color rule"
+
+    def ema_status(r):
+        if bool(r.get("direction_up_ok")):
+            return "PASS — above EMA 15" if bool(r.get("price_above_ema")) else "FAIL — needs above EMA 15"
+        if bool(r.get("direction_down_ok")):
+            return "PASS — below EMA 15" if bool(r.get("price_below_ema")) else "FAIL — needs below EMA 15"
+        return f"Above={bool(r.get('price_above_ema'))}; below={bool(r.get('price_below_ema'))}"
+
+    def band_status(r):
+        if bool(r.get("direction_up_ok")):
+            return "PASS — upper band" if bool(r.get("upper_band_ok")) else "FAIL — upper band not touched"
+        if bool(r.get("direction_down_ok")):
+            return "PASS — lower band" if bool(r.get("lower_band_ok")) else "FAIL — lower band not touched"
+        return f"Upper={bool(r.get('upper_band_ok'))}; lower={bool(r.get('lower_band_ok'))}"
+
+    all_table = pd.DataFrame([{
+        "Asset": r.get("name"), "Symbol": r.get("symbol"),
+        "Category": r.get("category"), "Signal": r.get("signal"),
+        "Price": r.get("price"), "Candles": r.get("count"),
+        "Direction check": movement_status(r),
+        "EMA check": ema_status(r),
+        "Band check": band_status(r),
+        "Source": r.get("source"), "Reason": r.get("reason")
+    } for r in shown])
+    st.table(all_table)
+else:
+    st.info("No valid scan results. Review Data errors below.")
 st.subheader("📈 Asset chart")
 chartable=[r for r in valid if isinstance(r.get("candles"),pd.DataFrame) and not r["candles"].empty]
 if len(chartable) > 0:
-    chosen=st.selectbox("Choose an asset",chartable,format_func=lambda r:r["name"]);chart=chosen["candles"].tail(500).set_index("time")
+    chart_by_symbol = {r["symbol"]: r for r in chartable}
+    chosen_symbol = st.selectbox(
+        "Choose an asset",
+        options=list(chart_by_symbol.keys()),
+        format_func=lambda symbol: chart_by_symbol[symbol]["name"],
+        key="velora_chart_symbol",
+    )
+    chosen = chart_by_symbol[chosen_symbol]
+    chart=chosen["candles"].tail(500).set_index("time")
     st.write(f"**{chosen['signal']}** — {chosen['reason']} · {chosen['source']}")
     if chosen.get("warning"):st.warning(chosen["warning"])
     st.line_chart(chart[["close","ema15"]].rename(columns={"close":"Close","ema15":"EMA 15"}))
