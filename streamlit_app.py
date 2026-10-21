@@ -1,47 +1,28 @@
 
-import sys
-import importlib.util
 import warnings
 warnings.filterwarnings("ignore")
 
-import streamlit as st
-import pandas as pd
+import time
 import numpy as np
+import pandas as pd
+import streamlit as st
 
 st.set_page_config(
-    page_title="Currency Pair Signal Scanner",
+    page_title="AI Crypto Signal Scanner",
     page_icon="📊",
     layout="wide",
 )
 
-st.title("📊 Currency Pair Signal Scanner")
-st.caption("Currency pairs • Technical analysis • Optional LSTM")
-
+st.title("📊 AI Crypto Signal Scanner")
+st.caption("Binance Spot • BUY/SELL • Technical Analysis • Optional TensorFlow LSTM")
 st.warning(
-    "Analysis only. This app does not connect to your Binomo account "
-    "or execute trades. External market prices may differ from Binomo OTC."
+    "Analysis only: no order execution. Public Binance prices may differ "
+    "from Binomo OTC prices. Signals are not guarantees of profit."
 )
 
-# --------------------------------------------------
-# DEPENDENCY CHECK
-# --------------------------------------------------
-st.sidebar.header("Environment")
-
-st.sidebar.caption(f"Python: {sys.version.split()[0]}")
-
-if importlib.util.find_spec("yfinance") is None:
-    st.error(
-        "The yfinance package is not installed in this Python environment. "
-        "Add yfinance to requirements.txt and redeploy the app."
-    )
-    st.code(
-        "streamlit\npandas\nnumpy\nyfinance\nscikit-learn\ntensorflow",
-        language="text",
-    )
-    st.stop()
-
-import yfinance as yf
-
+# -------------------------------------------------------
+# OPTIONAL TENSORFLOW
+# -------------------------------------------------------
 try:
     from sklearn.preprocessing import MinMaxScaler
 except ImportError:
@@ -51,111 +32,188 @@ try:
     from tensorflow.keras.models import Sequential
     from tensorflow.keras.layers import LSTM, Dense, Dropout
     from tensorflow.keras.callbacks import EarlyStopping
+    TF_AVAILABLE = True
 except ImportError:
-    Sequential = None
-    LSTM = Dense = Dropout = EarlyStopping = None
+    Sequential = LSTM = Dense = Dropout = EarlyStopping = None
+    TF_AVAILABLE = False
+
+# -------------------------------------------------------
+# BINANCE DATA VIA CCXT
+# -------------------------------------------------------
+try:
+    import ccxt
+except ImportError:
+    st.error(
+        "ccxt is not installed. Add ccxt to requirements.txt, "
+        "then redeploy the app."
+    )
+    st.code(
+        "streamlit\npandas\nnumpy\nccxt\nscikit-learn\ntensorflow",
+        language="text",
+    )
+    st.stop()
 
 
-# --------------------------------------------------
-# CURRENCY PAIRS
-# --------------------------------------------------
-PAIRS = {
-    "EUR/USD": "EURUSD=X",
-    "GBP/USD": "GBPUSD=X",
-    "USD/JPY": "JPY=X",
-    "USD/CHF": "CHF=X",
-    "AUD/USD": "AUDUSD=X",
-    "USD/CAD": "CAD=X",
-    "NZD/USD": "NZDUSD=X",
-    "EUR/GBP": "EURGBP=X",
-    "EUR/JPY": "EURJPY=X",
-    "GBP/JPY": "GBPJPY=X",
-    "EUR/CHF": "EURCHF=X",
-    "EUR/CAD": "EURCAD=X",
-    "EUR/AUD": "EURAUD=X",
-    "GBP/CHF": "GBPCHF=X",
-    "GBP/CAD": "GBPCAD=X",
-    "GBP/AUD": "GBPAUD=X",
-    "AUD/JPY": "AUDJPY=X",
-    "AUD/CAD": "AUDCAD=X",
-    "AUD/CHF": "AUDCHF=X",
-    "AUD/NZD": "AUDNZD=X",
-    "CAD/JPY": "CADJPY=X",
-    "CAD/CHF": "CADCHF=X",
-    "NZD/JPY": "NZDJPY=X",
-    "NZD/CAD": "NZDCAD=X",
-    "NZD/CHF": "NZDCHF=X",
-}
-
-CURRENCIES = ["USD", "EUR", "GBP", "TRY", "CAD", "AUD", "JPY", "CHF"]
+@st.cache_resource
+def create_exchange():
+    return ccxt.binance({
+        "enableRateLimit": True,
+        "timeout": 20000,
+        "options": {"defaultType": "spot"},
+    })
 
 
-# --------------------------------------------------
-# DATA DOWNLOAD
-# --------------------------------------------------
-@st.cache_data(ttl=60, show_spinner=False)
-def download_data(ticker, interval, period):
-    data = yf.download(
-        ticker,
-        period=period,
-        interval=interval,
-        progress=False,
-        auto_adjust=False,
-        threads=False,
+exchange = create_exchange()
+
+
+# -------------------------------------------------------
+# UNIVERSE / COIN LIST
+# -------------------------------------------------------
+@st.cache_data(ttl=300, show_spinner=False)
+def get_top_coins(limit=50):
+    ex = create_exchange()
+    markets = ex.load_markets()
+    tickers = ex.fetch_tickers()
+
+    rows = []
+
+    for symbol, ticker in tickers.items():
+        market = markets.get(symbol, {})
+
+        if not market:
+            continue
+
+        if (
+            market.get("spot") is not True
+            or market.get("active") is False
+            or not symbol.endswith("/USDT")
+        ):
+            continue
+
+        base = symbol.split("/")[0]
+
+        # Exclude leveraged tokens and common stablecoins.
+        excluded_suffixes = ("UP", "DOWN", "BULL", "BEAR")
+        excluded_bases = {
+            "USDC", "FDUSD", "TUSD", "USDP", "DAI",
+            "EUR", "AEUR", "USTC",
+        }
+
+        if base in excluded_bases:
+            continue
+
+        if base.endswith(excluded_suffixes):
+            continue
+
+        price = ticker.get("last")
+        quote_volume = ticker.get("quoteVolume")
+
+        if price is None or quote_volume is None:
+            continue
+
+        if not np.isfinite(price) or not np.isfinite(quote_volume):
+            continue
+
+        if price <= 0 or quote_volume <= 0:
+            continue
+
+        rows.append({
+            "Coin": symbol,
+            "Price": float(price),
+            "24h Volume (USDT)": float(quote_volume),
+            "24h Change (%)": float(ticker.get("percentage") or 0),
+        })
+
+    result = pd.DataFrame(rows)
+
+    if result.empty:
+        return result
+
+    return (
+        result.sort_values("24h Volume (USDT)", ascending=False)
+        .head(limit)
+        .reset_index(drop=True)
     )
 
-    if data is None or data.empty:
-        raise ValueError(
-            "No market data returned. Try another pair, timeframe, or period."
-        )
 
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
+# -------------------------------------------------------
+# CANDLES
+# -------------------------------------------------------
+@st.cache_data(ttl=60, show_spinner=False)
+def get_candles(symbol, timeframe="15m", limit=300):
+    ex = create_exchange()
+    rows = ex.fetch_ohlcv(
+        symbol,
+        timeframe=timeframe,
+        limit=limit,
+    )
 
-    required = ["Open", "High", "Low", "Close"]
+    df = pd.DataFrame(
+        rows,
+        columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"],
+    )
 
-    if not all(col in data.columns for col in required):
-        raise ValueError("Market data does not contain OHLC columns.")
+    if df.empty:
+        raise ValueError("Exchange returned no candles.")
 
-    data = data[required].copy()
+    df["Timestamp"] = pd.to_datetime(
+        df["Timestamp"], unit="ms", utc=True
+    )
 
-    for col in required:
-        data[col] = pd.to_numeric(data[col], errors="coerce")
+    numeric_cols = ["Open", "High", "Low", "Close", "Volume"]
+    df[numeric_cols] = df[numeric_cols].apply(
+        pd.to_numeric, errors="coerce"
+    )
 
-    data = data.dropna()
-    data = data[~data.index.duplicated(keep="last")]
-    data = data.sort_index()
+    df = df.dropna()
+    df = df.sort_values("Timestamp").reset_index(drop=True)
 
-    if len(data) < 60:
-        raise ValueError(
-            f"Only {len(data)} candles returned. At least 60 are required."
-        )
+    # Exclude the currently forming candle where possible.
+    if len(df) > 2:
+        timeframe_ms = {
+            "1m": 60_000,
+            "5m": 300_000,
+            "15m": 900_000,
+            "30m": 1_800_000,
+            "1h": 3_600_000,
+            "4h": 14_400_000,
+            "1d": 86_400_000,
+        }[timeframe]
 
-    return data
+        now_ms = int(time.time() * 1000)
+        last_open_ms = int(df.iloc[-1]["Timestamp"].timestamp() * 1000)
+
+        if now_ms < last_open_ms + timeframe_ms:
+            df = df.iloc[:-1].copy()
+
+    if len(df) < 60:
+        raise ValueError("Not enough completed candles.")
+
+    return df.reset_index(drop=True)
 
 
-# --------------------------------------------------
+# -------------------------------------------------------
 # INDICATORS
-# --------------------------------------------------
-def calculate_indicators(data):
+# -------------------------------------------------------
+def add_indicators(data):
     df = data.copy()
 
     close = df["Close"]
     high = df["High"]
     low = df["Low"]
+    volume = df["Volume"]
 
-    # EMA
     df["EMA15"] = close.ewm(span=15, adjust=False).mean()
     df["EMA20"] = close.ewm(span=20, adjust=False).mean()
     df["EMA50"] = close.ewm(span=50, adjust=False).mean()
 
-    # Bollinger Bands
+    # Bollinger Bands 20, 2
     df["BB_Middle"] = close.rolling(20).mean()
     std = close.rolling(20).std()
     df["BB_Upper"] = df["BB_Middle"] + 2 * std
     df["BB_Lower"] = df["BB_Middle"] - 2 * std
 
-    # RSI
+    # RSI 14
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -181,58 +239,59 @@ def calculate_indicators(data):
     ).mean()
 
     # Stochastic
-    lowest = low.rolling(14).min()
-    highest = high.rolling(14).max()
-    denom = (highest - lowest).replace(0, np.nan)
+    low14 = low.rolling(14).min()
+    high14 = high.rolling(14).max()
+    denom = (high14 - low14).replace(0, np.nan)
 
-    df["Stoch_K"] = (100 * (close - lowest) / denom).fillna(50)
+    df["Stoch_K"] = (
+        100 * (close - low14) / denom
+    ).fillna(50)
+
     df["Stoch_D"] = df["Stoch_K"].rolling(3).mean().fillna(50)
 
+    # Volume confirmation
+    df["Volume_MA20"] = volume.rolling(20).mean()
+
     # ATR
-    prev_close = close.shift(1)
+    previous_close = close.shift(1)
 
     tr = pd.concat(
         [
             high - low,
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
+            (high - previous_close).abs(),
+            (low - previous_close).abs(),
         ],
         axis=1,
     ).max(axis=1)
 
     df["ATR"] = tr.rolling(14).mean()
 
-    # ADX and directional indicators
-    up_move = high.diff()
-    down_move = -low.diff()
+    # Directional movement / ADX
+    up = high.diff()
+    down = -low.diff()
 
     plus_dm = pd.Series(
-        np.where(
-            (up_move > down_move) & (up_move > 0),
-            up_move,
-            0.0,
-        ),
+        np.where((up > down) & (up > 0), up, 0.0),
         index=df.index,
     )
 
     minus_dm = pd.Series(
-        np.where(
-            (down_move > up_move) & (down_move > 0),
-            down_move,
-            0.0,
-        ),
+        np.where((down > up) & (down > 0), down, 0.0),
         index=df.index,
     )
 
-    smoothed_tr = tr.ewm(alpha=1 / 14, adjust=False).mean()
-    smoothed_tr = smoothed_tr.replace(0, np.nan)
+    atr_smoothed = tr.ewm(
+        alpha=1 / 14, adjust=False
+    ).mean().replace(0, np.nan)
 
-    plus_di = 100 * (
-        plus_dm.ewm(alpha=1 / 14, adjust=False).mean() / smoothed_tr
+    plus_di = (
+        100 * plus_dm.ewm(alpha=1 / 14, adjust=False).mean()
+        / atr_smoothed
     )
 
-    minus_di = 100 * (
-        minus_dm.ewm(alpha=1 / 14, adjust=False).mean() / smoothed_tr
+    minus_di = (
+        100 * minus_dm.ewm(alpha=1 / 14, adjust=False).mean()
+        / atr_smoothed
     )
 
     di_sum = (plus_di + minus_di).replace(0, np.nan)
@@ -242,121 +301,113 @@ def calculate_indicators(data):
     df["Minus_DI"] = minus_di.fillna(0)
     df["ADX"] = dx.ewm(alpha=1 / 14, adjust=False).mean().fillna(0)
 
-    # CCI
-    typical = (high + low + close) / 3
-    typical_mean = typical.rolling(20).mean()
-
-    deviation = typical.rolling(20).apply(
-        lambda x: np.mean(np.abs(x - np.mean(x))),
-        raw=True,
-    )
-
-    df["CCI"] = (
-        (typical - typical_mean)
-        / (0.015 * deviation.replace(0, np.nan))
-    ).fillna(0)
-
-    # Williams %R
-    rolling_high = high.rolling(14).max()
-    rolling_low = low.rolling(14).min()
-    wr_denom = (rolling_high - rolling_low).replace(0, np.nan)
-
-    df["Williams_R"] = (
-        -100 * (rolling_high - close) / wr_denom
-    ).fillna(-50)
-
-    df["Candle"] = np.where(
-        close > df["Open"],
-        "GREEN",
-        np.where(close < df["Open"], "RED", "DOJI"),
-    )
-
     return df
 
 
-# --------------------------------------------------
-# SIGNAL VOTING
-# --------------------------------------------------
-def technical_signal(row):
+# -------------------------------------------------------
+# SIGNAL ENGINE
+# -------------------------------------------------------
+def analyze_coin(df):
+    row = df.iloc[-1]
+
     buy = 0
     sell = 0
     reasons = []
 
-    def vote(name, buy_condition, sell_condition):
+    def vote(name, is_buy, is_sell):
         nonlocal buy, sell
 
-        if buy_condition:
+        if bool(is_buy):
             buy += 1
             reasons.append(f"{name}: BUY")
-        elif sell_condition:
+        elif bool(is_sell):
             sell += 1
             reasons.append(f"{name}: SELL")
         else:
             reasons.append(f"{name}: NEUTRAL")
 
-    vote(
-        "EMA 15/50",
-        row["EMA15"] > row["EMA50"],
-        row["EMA15"] < row["EMA50"],
-    )
+    vote("EMA trend", row.EMA15 > row.EMA50, row.EMA15 < row.EMA50)
 
     vote(
         "Bollinger Bands",
-        row["Close"] < row["BB_Lower"],
-        row["Close"] > row["BB_Upper"],
+        row.Close < row.BB_Lower,
+        row.Close > row.BB_Upper,
     )
 
-    vote("RSI", row["RSI"] < 30, row["RSI"] > 70)
+    vote("RSI", row.RSI < 30, row.RSI > 70)
 
     vote(
         "MACD",
-        row["MACD"] > row["MACD_Signal"],
-        row["MACD"] < row["MACD_Signal"],
+        row.MACD > row.MACD_Signal,
+        row.MACD < row.MACD_Signal,
     )
 
     vote(
         "Stochastic",
-        row["Stoch_K"] < 20 and row["Stoch_K"] > row["Stoch_D"],
-        row["Stoch_K"] > 80 and row["Stoch_K"] < row["Stoch_D"],
+        row.Stoch_K < 20 and row.Stoch_K > row.Stoch_D,
+        row.Stoch_K > 80 and row.Stoch_K < row.Stoch_D,
     )
 
     vote(
         "ADX + DI",
-        row["ADX"] >= 20 and row["Plus_DI"] > row["Minus_DI"],
-        row["ADX"] >= 20 and row["Minus_DI"] > row["Plus_DI"],
+        row.ADX >= 20 and row.Plus_DI > row.Minus_DI,
+        row.ADX >= 20 and row.Minus_DI > row.Plus_DI,
     )
 
-    vote("CCI", row["CCI"] < -100, row["CCI"] > 100)
-
     vote(
-        "Williams %R",
-        row["Williams_R"] < -80,
-        row["Williams_R"] > -20,
+        "Volume",
+        row.Volume > row.Volume_MA20 and row.Close > row.Open,
+        row.Volume > row.Volume_MA20 and row.Close < row.Open,
     )
 
     if buy > sell:
-        signal = "BUY"
+        raw_signal = "BUY"
     elif sell > buy:
-        signal = "SELL"
+        raw_signal = "SELL"
     else:
+        raw_signal = "NO SIGNAL"
+
+    # Conservative default: require at least 4 votes and a margin.
+    if max(buy, sell) < 4 or abs(buy - sell) < 2:
         signal = "NO SIGNAL"
+    else:
+        signal = raw_signal
 
-    return signal, buy, sell, reasons
+    total = buy + sell
+    strength = (
+        round(100 * max(buy, sell) / total)
+        if total > 0
+        else 0
+    )
+
+    return {
+        "Signal": signal,
+        "BUY votes": buy,
+        "SELL votes": sell,
+        "Strength (%)": strength,
+        "RSI": round(float(row.RSI), 2),
+        "EMA15": float(row.EMA15),
+        "EMA50": float(row.EMA50),
+        "Price": float(row.Close),
+        "Volume": float(row.Volume),
+        "Reasons": reasons,
+    }
 
 
-# --------------------------------------------------
-# OPTIONAL LSTM
-# --------------------------------------------------
-def predict_lstm(close_series, epochs=5, lookback=30):
-    if Sequential is None or MinMaxScaler is None:
+# -------------------------------------------------------
+# OPTIONAL TENSORFLOW LSTM
+# -------------------------------------------------------
+def lstm_predict(close_series, epochs=5, lookback=30):
+    if not TF_AVAILABLE or MinMaxScaler is None:
         return None, (
-            "LSTM is unavailable. Check tensorflow and scikit-learn installation."
+            "TensorFlow or scikit-learn is unavailable. "
+            "The technical scanner still works without LSTM."
         )
 
-    values = close_series.astype(float).values.reshape(-1, 1)
+    values = np.asarray(close_series, dtype=float).reshape(-1, 1)
 
     if len(values) < lookback + 100:
-        return None, "Not enough historical data for LSTM."
+        return None, "Not enough candles for LSTM training."
 
     split = int(len(values) * 0.8)
 
@@ -376,122 +427,122 @@ def predict_lstm(close_series, epochs=5, lookback=30):
     train_end = split - lookback
 
     if train_end < 30:
-        return None, "Not enough LSTM training samples."
+        return None, "Not enough training samples."
 
     X_train = X[:train_end].reshape(-1, lookback, 1)
     y_train = y[:train_end]
-
     X_val = X[train_end:].reshape(-1, lookback, 1)
     y_val = y[train_end:]
 
-    model = Sequential(
-        [
-            LSTM(32, return_sequences=True, input_shape=(lookback, 1)),
-            Dropout(0.2),
-            LSTM(16),
-            Dropout(0.2),
-            Dense(8, activation="relu"),
-            Dense(1),
-        ]
-    )
+    model = Sequential([
+        LSTM(32, return_sequences=True, input_shape=(lookback, 1)),
+        Dropout(0.2),
+        LSTM(16),
+        Dropout(0.2),
+        Dense(8, activation="relu"),
+        Dense(1),
+    ])
 
     model.compile(optimizer="adam", loss="mse")
 
-    callbacks = [
-        EarlyStopping(
-            monitor="val_loss",
-            patience=2,
-            restore_best_weights=True,
-        )
-    ]
-
-    kwargs = {
+    fit_args = {
         "x": X_train,
         "y": y_train,
         "epochs": epochs,
         "batch_size": 32,
-        "callbacks": callbacks,
         "verbose": 0,
+        "callbacks": [
+            EarlyStopping(
+                monitor="val_loss",
+                patience=2,
+                restore_best_weights=True,
+            )
+        ],
     }
 
-    if len(X_val) > 0:
-        kwargs["validation_data"] = (X_val, y_val)
+    if len(X_val):
+        fit_args["validation_data"] = (X_val, y_val)
 
-    model.fit(**kwargs)
+    model.fit(**fit_args)
 
-    last_sequence = scaled[-lookback:].reshape(1, lookback, 1)
-    predicted_scaled = model.predict(last_sequence, verbose=0)
-    predicted = float(scaler.inverse_transform(predicted_scaled)[0, 0])
     current = float(values[-1, 0])
+    last = scaled[-lookback:].reshape(1, lookback, 1)
+    prediction = float(
+        scaler.inverse_transform(model.predict(last, verbose=0))[0, 0]
+    )
 
-    if predicted > current:
+    if prediction > current:
         direction = "BUY"
-    elif predicted < current:
+    elif prediction < current:
         direction = "SELL"
     else:
         direction = "NO SIGNAL"
 
     return {
-        "current": current,
-        "predicted": predicted,
-        "signal": direction,
+        "Current price": current,
+        "LSTM estimate": prediction,
+        "LSTM direction": direction,
     }, None
 
 
-# --------------------------------------------------
+# -------------------------------------------------------
 # SIDEBAR
-# --------------------------------------------------
-st.sidebar.header("⚙️ Settings")
-
-pair = st.sidebar.selectbox("Currency pair", list(PAIRS.keys()))
+# -------------------------------------------------------
+st.sidebar.header("⚙️ Scanner settings")
 
 timeframe = st.sidebar.selectbox(
-    "Timeframe",
-    ["5m", "15m", "30m", "1h", "1d"],
+    "Candlestick timeframe",
+    ["5m", "15m", "30m", "1h", "4h", "1d"],
+    index=1,
 )
 
-period_options = {
-    "5m": ["5d", "1mo"],
-    "15m": ["5d", "1mo", "3mo"],
-    "30m": ["5d", "1mo", "3mo"],
-    "1h": ["1mo", "3mo", "6mo", "1y"],
-    "1d": ["3mo", "6mo", "1y", "2y", "5y"],
-}
-
-period = st.sidebar.selectbox(
-    "Historical period",
-    period_options[timeframe],
+coin_limit = st.sidebar.slider(
+    "Coins to scan by 24h volume",
+    min_value=10,
+    max_value=100,
+    value=50,
+    step=10,
 )
 
-min_votes = st.sidebar.slider(
-    "Minimum votes",
-    min_value=1,
-    max_value=8,
-    value=4,
+min_volume = st.sidebar.number_input(
+    "Minimum 24h quote volume (USDT)",
+    min_value=0.0,
+    value=1_000_000.0,
+    step=500_000.0,
 )
 
-enable_lstm = st.sidebar.checkbox("Enable optional LSTM", value=False)
+enable_lstm = st.sidebar.checkbox(
+    "Use TensorFlow LSTM confirmation",
+    value=False,
+)
 
 lstm_epochs = st.sidebar.slider(
-    "LSTM epochs",
+    "LSTM training epochs",
     min_value=2,
-    max_value=20,
+    max_value=15,
     value=5,
     disabled=not enable_lstm,
 )
 
+st.sidebar.caption(
+    "Top-volume coins are screened first. Signals can be wrong."
+)
 
-# --------------------------------------------------
+
+# -------------------------------------------------------
 # INVESTMENT CALCULATOR
-# --------------------------------------------------
+# -------------------------------------------------------
 st.header("💰 Investment calculator")
 
-c1, c2, c3 = st.columns(3)
+cc1, cc2, cc3 = st.columns(3)
 
-with c1:
-    currency = st.selectbox("Account currency", CURRENCIES, index=0)
+with cc1:
+    currency = st.selectbox(
+        "Display currency",
+        ["USDT", "USD", "EUR", "TRY"],
+    )
 
-with c2:
+with cc2:
     stake = st.number_input(
         "Investment amount",
         min_value=0.01,
@@ -499,7 +550,7 @@ with c2:
         step=0.25,
     )
 
-with c3:
+with cc3:
     payout = st.number_input(
         "Payout (%)",
         min_value=0.0,
@@ -508,150 +559,235 @@ with c3:
         step=1.0,
     )
 
-profit = stake * payout / 100
-loss = stake
+c1, c2, c3 = st.columns(3)
 
-r1, r2, r3 = st.columns(3)
-r1.metric("Calculated stake", f"{stake:.2f} {currency}")
-r2.metric("Profit if correct", f"{profit:.2f} {currency}")
-r3.metric("Loss if incorrect", f"{loss:.2f} {currency}")
+c1.metric("Stake", f"{stake:.2f} {currency}")
+c2.metric("Profit if correct", f"{stake * payout / 100:.2f} {currency}")
+c3.metric("Loss if incorrect", f"{stake:.2f} {currency}")
 
 st.caption(
-    "Mathematical estimate based on the payout entered. "
-    "Currency selection changes the display label only; it does not convert money."
+    "This is a mathematical estimate only. Currency changes the display "
+    "label and does not perform a real conversion."
 )
 
 st.divider()
 
 
-# --------------------------------------------------
-# ANALYSIS
-# --------------------------------------------------
-st.header("📈 Market analysis")
+# -------------------------------------------------------
+# PRIORITY COIN PANEL
+# -------------------------------------------------------
+st.header("⭐ Priority coins")
+st.write(
+    "The panel ranks screened coins by signal quality and volume. "
+    "A coin is not automatically a BUY just because it appears first."
+)
 
-if st.button("🔍 Analyze market", type="primary", use_container_width=True):
+if st.button("🔎 Scan coins now", type="primary", use_container_width=True):
     try:
-        with st.spinner("Downloading public market data..."):
-            raw = download_data(PAIRS[pair], timeframe, period)
-            df = calculate_indicators(raw)
-            latest = df.iloc[-1]
+        with st.spinner("Loading Binance Spot markets and 24h volumes..."):
+            universe = get_top_coins(coin_limit)
 
-        tech, buy_votes, sell_votes, reasons = technical_signal(latest)
+        if universe.empty:
+            st.error("No eligible USDT Spot markets were returned.")
+            st.stop()
 
-        final_signal = tech
-        if buy_votes < min_votes and sell_votes < min_votes:
-            final_signal = "NO SIGNAL"
+        universe = universe[
+            universe["24h Volume (USDT)"] >= min_volume
+        ].copy()
 
-        lstm_result = None
-        lstm_error = None
-
-        if enable_lstm:
-            with st.spinner("Training LSTM model..."):
-                lstm_result, lstm_error = predict_lstm(
-                    df["Close"],
-                    epochs=lstm_epochs,
-                )
-
-            if lstm_result is not None:
-                if final_signal in ("BUY", "SELL"):
-                    if lstm_result["signal"] != final_signal:
-                        final_signal = "NO SIGNAL"
-                else:
-                    final_signal = "NO SIGNAL"
-
-        st.subheader(f"{pair} | {timeframe}")
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Latest close", f"{float(latest['Close']):.6f}")
-        m2.metric("BUY votes", str(buy_votes))
-        m3.metric("SELL votes", str(sell_votes))
-        m4.metric("RSI", f"{float(latest['RSI']):.2f}")
-
-        if final_signal == "BUY":
-            st.success("🟢 BUY")
-        elif final_signal == "SELL":
-            st.error("🔴 SELL")
-        else:
-            st.info("⚪ NO SIGNAL")
-
-        st.write(f"**Latest candle:** {df.index[-1]}")
-        st.caption(
-            "The latest candle may still be forming. Signals can change. "
-            "Yahoo Finance prices may differ from Binomo OTC prices."
-        )
-
-        st.subheader("Price chart")
-        chart_columns = [
-            "Close", "EMA15", "EMA20", "EMA50",
-            "BB_Upper", "BB_Middle", "BB_Lower",
-        ]
-        st.line_chart(df[chart_columns].tail(200))
-
-        st.subheader("Technical indicators")
-        table = pd.DataFrame(
-            {
-                "Indicator": [
-                    "EMA 15", "EMA 20", "EMA 50",
-                    "Bollinger Upper", "Bollinger Middle", "Bollinger Lower",
-                    "RSI", "MACD", "MACD Signal",
-                    "Stochastic %K", "Stochastic %D",
-                    "ADX", "+DI", "-DI", "CCI", "Williams %R", "ATR",
-                    "Candle",
-                ],
-                "Value": [
-                    latest["EMA15"], latest["EMA20"], latest["EMA50"],
-                    latest["BB_Upper"], latest["BB_Middle"], latest["BB_Lower"],
-                    latest["RSI"], latest["MACD"], latest["MACD_Signal"],
-                    latest["Stoch_K"], latest["Stoch_D"],
-                    latest["ADX"], latest["Plus_DI"], latest["Minus_DI"],
-                    latest["CCI"], latest["Williams_R"], latest["ATR"],
-                    latest["Candle"],
-                ],
-            }
-        )
-
-        st.dataframe(table, use_container_width=True, hide_index=True)
-
-        st.subheader("Signal breakdown")
-        for reason in reasons:
-            st.write("• " + reason)
-
-        st.write(
-            f"**BUY votes:** {buy_votes}/8 | "
-            f"**SELL votes:** {sell_votes}/8 | "
-            f"**Minimum votes:** {min_votes}"
-        )
-
-        if enable_lstm:
-            st.subheader("🧠 LSTM prediction")
-
-            if lstm_result is None:
-                st.warning(lstm_error or "LSTM prediction unavailable.")
-            else:
-                x, y, z = st.columns(3)
-                x.metric("Latest close", f"{lstm_result['current']:.6f}")
-                y.metric("Model estimate", f"{lstm_result['predicted']:.6f}")
-                z.metric("LSTM direction", lstm_result["signal"])
-
-        with st.expander("Show last 30 candles"):
-            st.dataframe(
-                df.tail(30).sort_index(ascending=False),
-                use_container_width=True,
+        if universe.empty:
+            st.warning(
+                "No coins meet the volume threshold. Lower the minimum volume."
             )
+            st.stop()
+
+        results = []
+        progress = st.progress(0)
+        status = st.empty()
+
+        total = len(universe)
+
+        for i, item in enumerate(universe.itertuples(index=False), start=1):
+            symbol = item.Coin
+            status.write(f"Scanning {symbol} ({i}/{total})")
+
+            try:
+                candles = get_candles(symbol, timeframe, 300)
+                df = add_indicators(candles)
+                analysis = analyze_coin(df)
+
+                lstm_direction = "NOT USED"
+                lstm_estimate = np.nan
+
+                if enable_lstm and TF_AVAILABLE:
+                    try:
+                        pred, err = lstm_predict(
+                            df["Close"],
+                            epochs=lstm_epochs,
+                        )
+
+                        if pred:
+                            lstm_direction = pred["LSTM direction"]
+                            lstm_estimate = pred["LSTM estimate"]
+                        else:
+                            lstm_direction = "UNAVAILABLE"
+                    except Exception:
+                        lstm_direction = "ERROR"
+
+                # Conservative LSTM confirmation.
+                final_signal = analysis["Signal"]
+
+                if enable_lstm:
+                    if lstm_direction in ("BUY", "SELL"):
+                        if final_signal != lstm_direction:
+                            final_signal = "NO SIGNAL"
+                    else:
+                        final_signal = "NO SIGNAL"
+
+                results.append({
+                    "Coin": symbol,
+                    "Signal": final_signal,
+                    "BUY votes": analysis["BUY votes"],
+                    "SELL votes": analysis["SELL votes"],
+                    "Strength (%)": analysis["Strength (%)"],
+                    "Price": analysis["Price"],
+                    "24h Volume (USDT)": item._2,
+                    "24h Change (%)": item._3,
+                    "RSI": analysis["RSI"],
+                    "LSTM": lstm_direction,
+                    "LSTM estimate": lstm_estimate,
+                    "Reasons": " | ".join(analysis["Reasons"]),
+                })
+
+            except Exception as exc:
+                results.append({
+                    "Coin": symbol,
+                    "Signal": "DATA ERROR",
+                    "BUY votes": 0,
+                    "SELL votes": 0,
+                    "Strength (%)": 0,
+                    "Price": item.Price,
+                    "24h Volume (USDT)": item._2,
+                    "24h Change (%)": item._3,
+                    "RSI": np.nan,
+                    "LSTM": "NOT AVAILABLE",
+                    "LSTM estimate": np.nan,
+                    "Reasons": str(exc)[:160],
+                })
+
+            progress.progress(i / total)
+
+        status.empty()
+        progress.empty()
+
+        result_df = pd.DataFrame(results)
+
+        # Prioritize actionable signals, then strength and liquidity.
+        signal_order = {
+            "BUY": 0,
+            "SELL": 1,
+            "NO SIGNAL": 2,
+            "DATA ERROR": 3,
+        }
+
+        result_df["_order"] = result_df["Signal"].map(signal_order).fillna(4)
+
+        result_df = result_df.sort_values(
+            ["_order", "Strength (%)", "24h Volume (USDT)"],
+            ascending=[True, False, False],
+        ).drop(columns="_order")
+
+        st.session_state["scan_results"] = result_df
 
     except Exception as exc:
-        st.error("Market analysis failed.")
-        st.write(
-            "Check the selected pair, data provider availability, "
-            "internet connection, and installed dependencies."
+        st.error(
+            "Could not scan Binance markets. The service may be unavailable "
+            "or access may be restricted from this network."
         )
         st.code(str(exc))
 
-else:
-    st.info("Choose a currency pair and timeframe, then click Analyze market.")
+
+# -------------------------------------------------------
+# DISPLAY SCAN RESULTS
+# -------------------------------------------------------
+if "scan_results" in st.session_state:
+    result_df = st.session_state["scan_results"]
+
+    st.subheader("🏆 First-priority coins")
+
+    actionable = result_df[
+        result_df["Signal"].isin(["BUY", "SELL"])
+    ].head(10)
+
+    if actionable.empty:
+        st.info(
+            "No coins currently meet the signal rules. "
+            "The app will not force a BUY or SELL signal."
+        )
+    else:
+        st.dataframe(
+            actionable[
+                [
+                    "Coin",
+                    "Signal",
+                    "Strength (%)",
+                    "BUY votes",
+                    "SELL votes",
+                    "Price",
+                    "24h Volume (USDT)",
+                    "24h Change (%)",
+                    "RSI",
+                    "LSTM",
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.subheader("📋 All scanned coins")
+
+    signal_filter = st.selectbox(
+        "Filter results",
+        ["ALL", "BUY", "SELL", "NO SIGNAL", "DATA ERROR"],
+    )
+
+    display_df = result_df.copy()
+
+    if signal_filter != "ALL":
+        display_df = display_df[
+            display_df["Signal"] == signal_filter
+        ]
+
+    st.dataframe(
+        display_df.drop(columns=["Reasons", "LSTM estimate"], errors="ignore"),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    selected_coin = st.selectbox(
+        "View signal details",
+        result_df["Coin"].tolist(),
+    )
+
+    selected_row = result_df[
+        result_df["Coin"] == selected_coin
+    ].iloc[0]
+
+    st.write(f"**Coin:** {selected_coin}")
+    st.write(f"**Signal:** {selected_row['Signal']}")
+    st.write(f"**Reason details:** {selected_row['Reasons']}")
+
+    st.download_button(
+        "⬇️ Download scan results CSV",
+        data=result_df.to_csv(index=False).encode("utf-8"),
+        file_name="crypto_signal_scan.csv",
+        mime="text/csv",
+    )
 
 st.divider()
+
 st.caption(
-    "Analysis only. Signals are estimates, not guarantees. "
-    "No trades are executed."
+    "Public market data only. No Binance keys are required. No orders are "
+    "placed. TensorFlow estimates are experimental and are not proof of "
+    "future price direction."
 )
