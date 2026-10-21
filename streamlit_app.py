@@ -26,7 +26,6 @@ st.set_page_config(
 )
 
 TARGET_CANDLES = 100_000
-INTERVAL_MINUTES = 1
 CHUNK_MINUTES = 3_000
 DB_PATH = "velora_history.sqlite3"
 TD_BASE = "https://api.twelvedata.com"
@@ -37,7 +36,8 @@ SESSION.headers.update({
     "User-Agent": "VeloraHistoricalScanner/1.0"
 })
 
-# Varlık adı | kategori | Twelve Data sembolü | OTC etiketi
+# Varlık formatı:
+# Görünen ad | kategori | Twelve Data sembolü | OTC etiketi
 RAW_ASSETS = """
 Crypto IDX|index||0
 Bitcoin (OTC)|crypto|BTC/USD|1
@@ -234,8 +234,6 @@ def db_write(symbol, df):
 # ============================================================
 
 def td_fetch_chunk(symbol, start_dt, end_dt, api_key):
-    """Twelve Data'dan tek bir tarih aralığının mumlarını ister."""
-
     params = {
         "symbol": symbol,
         "interval": "1min",
@@ -266,11 +264,9 @@ def td_fetch_chunk(symbol, start_dt, end_dt, api_key):
     df = pd.DataFrame(payload["values"])
 
     if df.empty:
-        return pd.DataFrame(
-            columns=[
-                "time", "open", "high", "low", "close", "volume"
-            ]
-        )
+        return pd.DataFrame(columns=[
+            "time", "open", "high", "low", "close", "volume"
+        ])
 
     df["time"] = pd.to_datetime(
         df["datetime"], utc=True, errors="coerce"
@@ -296,12 +292,6 @@ def td_fetch_chunk(symbol, start_dt, end_dt, api_key):
 
 
 def fetch_history_100k(asset, progress_callback=None):
-    """
-    100.000 tamamlanmış 1 dakikalık mum hedefler.
-    Geçmiş veriyi parçalar hâlinde ister ve SQLite'a kaydeder.
-    API planı, sembol kapsamı veya limitler nedeniyle başarısız olabilir.
-    """
-
     symbol = asset.get("symbol")
 
     if not symbol:
@@ -322,16 +312,17 @@ def fetch_history_100k(asset, progress_callback=None):
         second=0, microsecond=0
     )
 
-    # Forex, metal ve hisse senetlerinde piyasa kapalı saatleri bulunur.
+    # Piyasa kapalı saatleri nedeniyle FX, metal ve hisse senetleri
+    # için daha geniş bir takvim aralığı istenir.
     calendar_factor = (
         1.6
         if asset.get("category") in ("forex", "metal", "stock")
         else 1.08
     )
 
-    lookback_minutes = int(
-        TARGET_CANDLES * calendar_factor
-    ) + 3_000
+    lookback_minutes = (
+        int(TARGET_CANDLES * calendar_factor) + 3_000
+    )
 
     start = now - timedelta(minutes=lookback_minutes)
 
@@ -348,7 +339,6 @@ def fetch_history_100k(asset, progress_callback=None):
         )
 
     cursor = start
-
     chunk_count = int(np.ceil(
         (now - start).total_seconds() / 60 / CHUNK_MINUTES
     ))
@@ -367,7 +357,7 @@ def fetch_history_100k(asset, progress_callback=None):
         )
 
         if not part.empty:
-            # İçinde bulunulan, henüz tamamlanmamış dakikayı alma.
+            # Henüz tamamlanmamış güncel dakikayı kullanma.
             part = part[part["time"] < pd.Timestamp(now)]
 
             if not part.empty:
@@ -382,8 +372,6 @@ def fetch_history_100k(asset, progress_callback=None):
             )
 
         cursor = chunk_end
-
-        # Sağlayıcı limitlerine karşı istekler arasında kısa bekleme.
         time.sleep(0.15)
 
     frames = [cached] if not cached.empty else []
@@ -399,13 +387,10 @@ def fetch_history_100k(asset, progress_callback=None):
             subset=["time"]
         ).sort_values("time")
     else:
-        combined = pd.DataFrame(
-            columns=[
-                "time", "open", "high", "low", "close", "volume"
-            ]
-        )
+        combined = pd.DataFrame(columns=[
+            "time", "open", "high", "low", "close", "volume"
+        ])
 
-    # Önceden kaydedilmiş tüm satırları yeniden oku.
     stored = db_read(
         symbol,
         start.strftime("%Y-%m-%d %H:%M:%S"),
@@ -431,8 +416,8 @@ def fetch_history_100k(asset, progress_callback=None):
     if len(combined) < TARGET_CANDLES:
         raise RuntimeError(
             f"{len(combined):,}/{TARGET_CANDLES:,} mum alınabildi. "
-            "Veri sağlayıcısının sembol kapsamı, geçmiş veri planı "
-            "veya API kotası yetersiz olabilir."
+            "Veri sağlayıcısının sembol kapsamı, tarihsel veri "
+            "planı veya API kotası yetersiz olabilir."
         )
 
     return combined, "Twelve Data historical"
@@ -444,7 +429,6 @@ def fetch_history_100k(asset, progress_callback=None):
 
 def rsi_calc(close, period=14):
     delta = close.diff()
-
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
@@ -498,7 +482,6 @@ def calculate_indicators(df):
 
     # Bollinger Bands
     df["bb_mid"] = close.rolling(20).mean()
-
     std = close.rolling(20).std(ddof=0)
 
     df["bb_upper"] = df["bb_mid"] + 2 * std
@@ -522,33 +505,26 @@ def calculate_indicators(df):
         span=9, adjust=False
     ).mean()
 
-    df["macd_hist"] = (
-        df["macd"] - df["macd_signal"]
-    )
+    df["macd_hist"] = df["macd"] - df["macd_signal"]
 
     # Stochastic
     low14 = low.rolling(14).min()
     high14 = high.rolling(14).max()
-
     denom = (high14 - low14).replace(0, np.nan)
 
     df["stoch_k"] = (
         (close - low14) / denom * 100
     )
-
     df["stoch_d"] = df["stoch_k"].rolling(3).mean()
 
     # ATR
     prev_close = close.shift(1)
 
-    tr = pd.concat(
-        [
-            high - low,
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
 
     df["atr"] = tr.ewm(
         alpha=1 / 14,
@@ -560,25 +536,17 @@ def calculate_indicators(df):
         df["atr"] / close.replace(0, np.nan) * 100
     )
 
-    # ADX and directional indicators
+    # ADX
     up = high.diff()
     down = -low.diff()
 
     plus_dm = pd.Series(
-        np.where(
-            (up > down) & (up > 0),
-            up,
-            0.0,
-        ),
+        np.where((up > down) & (up > 0), up, 0.0),
         index=df.index,
     )
 
     minus_dm = pd.Series(
-        np.where(
-            (down > up) & (down > 0),
-            down,
-            0.0,
-        ),
+        np.where((down > up) & (down > 0), down, 0.0),
         index=df.index,
     )
 
@@ -615,7 +583,7 @@ def calculate_indicators(df):
         adjust=False,
     ).mean()
 
-    # Volume ve momentum
+    # Hacim ve momentum
     df["volume_sma"] = df["volume"].rolling(20).mean()
 
     df["volume_ratio"] = (
@@ -667,7 +635,7 @@ def make_signal(df, min_votes=4, min_margin=2):
     reasons = []
     close = float(row["close"])
 
-    # EMA trend yönü
+    # EMA trendi
     if close > row["ema20"] > row["ema50"]:
         buy += 1
         reasons.append("EMA trendi yukarı")
@@ -740,7 +708,7 @@ def make_signal(df, min_votes=4, min_margin=2):
             sell += 1
             reasons.append("ADX yönü aşağı")
 
-    # Hacim filtresi; bazı varlıklarda hacim bulunmayabilir.
+    # Hacim filtresi
     if (
         pd.notna(row.get("volume_ratio"))
         and row["volume_ratio"] >= 1.2
@@ -770,10 +738,7 @@ def make_signal(df, min_votes=4, min_margin=2):
         signal = "NO SIGNAL"
         reasons.append("Gösterge uyumu yetersiz")
 
-    score = min(
-        100,
-        round(max(buy, sell) / 8 * 100),
-    )
+    score = min(100, round(max(buy, sell) / 8 * 100))
 
     return {
         "signal": signal,
@@ -811,7 +776,6 @@ def scan_one(asset, min_votes, min_margin):
 
     try:
         candles, source = fetch_history_100k(asset)
-
         indicators = calculate_indicators(candles)
 
         if indicators.empty:
@@ -829,7 +793,7 @@ def scan_one(asset, min_votes, min_margin):
 
         if asset["otc"]:
             source += (
-                " — OTC VERİSİ DEĞİL; temel piyasa proxy verisi"
+                " — OTC DEĞİL; temel piyasa proxy verisi"
             )
 
         return {
@@ -906,7 +870,6 @@ st.info(
     "veriler SQLite yerel önbelleğinde saklanır."
 )
 
-# Kenar çubuğu
 st.sidebar.header("Tarama ayarları")
 
 group = st.sidebar.selectbox(
@@ -915,13 +878,11 @@ group = st.sidebar.selectbox(
 )
 
 min_votes = st.sidebar.slider(
-    "Minimum gösterge puanı",
-    3, 7, 4,
+    "Minimum gösterge puanı", 3, 7, 4
 )
 
 min_margin = st.sidebar.slider(
-    "BUY/SELL puan farkı",
-    1, 4, 2,
+    "BUY/SELL puan farkı", 1, 4, 2
 )
 
 asset_limit = st.sidebar.number_input(
@@ -996,7 +957,7 @@ if st.button(
     progress = st.progress(0)
     status = st.empty()
 
-    # API limitleri için eşzamanlı tarama sayısı düşük tutulur.
+    # Tarihsel veri istekleri nedeniyle eşzamanlı işlem sayısı düşük.
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = {
             pool.submit(
@@ -1136,7 +1097,9 @@ if signals:
     )
 
 else:
-    st.info("Eşik koşullarını sağlayan BUY/SELL sinyali yok.")
+    st.info(
+        "Eşik koşullarını sağlayan BUY/SELL sinyali yok."
+    )
 
 
 # Tüm analiz sonuçları
