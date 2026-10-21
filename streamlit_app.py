@@ -269,7 +269,7 @@ def get_candles(asset,target):
     except Exception as e: cached=pd.DataFrame(); errors.append(f"SQLite: {e}")
     parts=[x for x in [cached,recent] if x is not None and not x.empty]
     if not parts: raise RuntimeError("No live or cached candles. "+(" | ".join(errors) or "All providers returned empty data."))
-    d=normalize(pd.concat(parts,ignore_index=True)).tail(TARGET).reset_index(drop=True)
+    d=normalize(pd.concat(parts,ignore_index=True)).tail(target).reset_index(drop=True)
     if len(d)<40: raise RuntimeError(f"Only {len(d)} completed candles; need at least 40. "+(" | ".join(errors) or ""))
     age=(now_utc()-d.time.iloc[-1]).total_seconds()/60
     if age>5: raise RuntimeError(f"Latest candle is {age:.1f} minutes old; no signal calculated. "+" | ".join(errors))
@@ -289,8 +289,17 @@ def signal_for(df,lookback,mode):
     first=float(seg.close.iloc[0]); price=float(last.close)
     if first<=0:return {**empty,"reason":"Invalid price"}
     change=(price-first)/first*100; green=float((seg.close>seg.open).mean()); red=float((seg.close<seg.open).mean())
-    upper= float(last.high)>=float(last.bb_upper) if mode=="Touch or cross" else price>float(last.bb_upper)
-    lower= float(last.low)<=float(last.bb_lower) if mode=="Touch or cross" else price<float(last.bb_lower)
+    if mode == "Touch or cross":
+        upper = float(last.high) >= float(last.bb_upper)
+        lower = float(last.low) <= float(last.bb_lower)
+    elif mode == "Near band (0.50%)":
+        # Allow price to be within 0.50% of the relevant Bollinger band.
+        # Direction, candle-color, and EMA confirmations still apply.
+        upper = float(last.high) >= float(last.bb_upper) * (1 - 0.005)
+        lower = float(last.low) <= float(last.bb_lower) * (1 + 0.005)
+    else:  # Close outside band
+        upper = price > float(last.bb_upper)
+        lower = price < float(last.bb_lower)
     rising=change>0 and green>=.5; falling=change<0 and red>=.5; above=price>float(last.ema15); below=price<float(last.ema15)
     if rising and above and upper: sig="SELL"; reason=f"Last {lookback} candles rose {change:.3f}%; above EMA15 and upper Bollinger condition met."
     elif falling and below and lower: sig="BUY"; reason=f"Last {lookback} candles fell {change:.3f}%; below EMA15 and lower Bollinger condition met."
@@ -346,13 +355,13 @@ st.warning("Public market data only. Crypto tries Binance, Bybit, OKX, Gate.io, 
 st.sidebar.header("Scanner settings")
 category=st.sidebar.selectbox("Asset category",["All","Crypto","Forex","Other"])
 lookback=st.sidebar.select_slider("Rise/fall candle count",options=[15,16,17],value=15)
-mode=st.sidebar.radio("Bollinger confirmation",["Touch or cross","Close outside band"])
+mode=st.sidebar.radio("Bollinger confirmation",["Near band (0.50%)","Touch or cross","Close outside band"],index=0,help="Near band allows the candle high/low to come within 0.50% of the relevant band. EMA and candle-direction filters still apply.")
 asset_limit=int(st.sidebar.number_input("Maximum assets per scan",min_value=1,max_value=len(ASSETS),value=10))
 deep=st.sidebar.checkbox("Sync toward 100,000 candles (slower; crypto providers only)",value=False)
 show_no=st.sidebar.checkbox("Show NO SIGNAL results",value=True)
 assets=[a for a in ASSETS if category=="All" or a["category"]==category][:asset_limit]
 target=TARGET if deep else LIMIT
-st.markdown(f"**Strategy:** SELL after rising candles, at least half green, close above EMA15 and upper Bollinger condition. BUY after falling candles, at least half red, close below EMA15 and lower Bollinger condition. Only completed 1-minute candles are used. Otherwise NO SIGNAL.")
+st.markdown(f"**Strategy:** SELL after rising candles, at least half green, close above EMA15 and the selected upper Bollinger condition. BUY after falling candles, at least half red, close below EMA15 and the selected lower Bollinger condition. Only completed 1-minute candles are used. Otherwise NO SIGNAL.")
 st.write(f"Assets selected: **{len(assets)}** · History target: **{target:,} candles per asset**")
 st.caption(f"Excel automatically saved to `{XLSX}` after each scan. Download it to preserve a copy; hosted local files may not survive redeployment.")
 # Session state may survive a Streamlit rerun/deployment while the app code
@@ -426,9 +435,9 @@ if len(shown) > 0:
 
     def band_status(r):
         if bool(r.get("direction_up_ok")):
-            return "PASS — upper band" if bool(r.get("upper_band_ok")) else "FAIL — upper band not touched"
+            return "PASS — upper band condition" if bool(r.get("upper_band_ok")) else ("FAIL — not touched / near upper band" if mode == "Near band (0.50%)" else "FAIL — upper band not touched")
         if bool(r.get("direction_down_ok")):
-            return "PASS — lower band" if bool(r.get("lower_band_ok")) else "FAIL — lower band not touched"
+            return "PASS — lower band condition" if bool(r.get("lower_band_ok")) else ("FAIL — not touched / near lower band" if mode == "Near band (0.50%)" else "FAIL — lower band not touched")
         return f"Upper={bool(r.get('upper_band_ok'))}; lower={bool(r.get('lower_band_ok'))}"
 
     all_table = pd.DataFrame([{
