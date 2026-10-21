@@ -11,12 +11,10 @@ import requests
 import streamlit as st
 
 # ============================================================
-# VELORA 1M HISTORICAL SCANNER
-# - Hedef: Her varlık için 100.000 tamamlanmış 1 dakikalık mum
-# - BUY / SELL sinyalleri
-# - Emir göndermez
-# - Binance API kullanmaz
-# - Temel piyasa verisini Binomo OTC verisi olarak tanıtmaz
+# VELORA — 100K MUM / 1 DAKİKA
+# BUY / SELL teknik tarayıcı
+# Binance kullanmaz. Emir göndermez.
+# Gerçek Binomo OTC mumlarına eriştiğini iddia etmez.
 # ============================================================
 
 st.set_page_config(
@@ -37,7 +35,7 @@ SESSION.headers.update({
 })
 
 # Varlık formatı:
-# Görünen ad | kategori | Twelve Data sembolü | OTC etiketi
+# Görünen ad | kategori | veri sağlayıcı sembolü | OTC etiketi
 RAW_ASSETS = """
 Crypto IDX|index||0
 Bitcoin (OTC)|crypto|BTC/USD|1
@@ -210,9 +208,9 @@ def db_write(symbol, df):
     for row in df.itertuples(index=False):
         records.append((
             symbol,
-            pd.Timestamp(row.time)
-            .tz_convert("UTC")
-            .strftime("%Y-%m-%d %H:%M:%S"),
+            pd.Timestamp(row.time).tz_convert("UTC").strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
             float(row.open),
             float(row.high),
             float(row.low),
@@ -230,7 +228,7 @@ def db_write(symbol, df):
 
 
 # ============================================================
-# TWELVE DATA TARİHSEL MUM İNDİRME
+# TWELVE DATA TARİHSEL VERİ
 # ============================================================
 
 def td_fetch_chunk(symbol, start_dt, end_dt, api_key):
@@ -312,8 +310,8 @@ def fetch_history_100k(asset, progress_callback=None):
         second=0, microsecond=0
     )
 
-    # Piyasa kapalı saatleri nedeniyle FX, metal ve hisse senetleri
-    # için daha geniş bir takvim aralığı istenir.
+    # Forex, metal ve hisse senetleri için piyasa kapalı
+    # saatlerini hesaba katmak üzere daha geniş tarih aralığı.
     calendar_factor = (
         1.6
         if asset.get("category") in ("forex", "metal", "stock")
@@ -323,7 +321,6 @@ def fetch_history_100k(asset, progress_callback=None):
     lookback_minutes = (
         int(TARGET_CANDLES * calendar_factor) + 3_000
     )
-
     start = now - timedelta(minutes=lookback_minutes)
 
     cached = db_read(
@@ -357,7 +354,7 @@ def fetch_history_100k(asset, progress_callback=None):
         )
 
         if not part.empty:
-            # Henüz tamamlanmamış güncel dakikayı kullanma.
+            # Henüz tamamlanmamış güncel dakikayı dahil etme.
             part = part[part["time"] < pd.Timestamp(now)]
 
             if not part.empty:
@@ -391,6 +388,7 @@ def fetch_history_100k(asset, progress_callback=None):
             "time", "open", "high", "low", "close", "volume"
         ])
 
+    # Veritabanındaki önbelleği de dahil et.
     stored = db_read(
         symbol,
         start.strftime("%Y-%m-%d %H:%M:%S"),
@@ -416,8 +414,8 @@ def fetch_history_100k(asset, progress_callback=None):
     if len(combined) < TARGET_CANDLES:
         raise RuntimeError(
             f"{len(combined):,}/{TARGET_CANDLES:,} mum alınabildi. "
-            "Veri sağlayıcısının sembol kapsamı, tarihsel veri "
-            "planı veya API kotası yetersiz olabilir."
+            "Veri sağlayıcısının sembol kapsamı, geçmiş verisi "
+            "veya API kotası yetersiz olabilir."
         )
 
     return combined, "Twelve Data historical"
@@ -500,16 +498,18 @@ def calculate_indicators(df):
     ).mean()
 
     df["macd"] = ema12 - ema26
-
     df["macd_signal"] = df["macd"].ewm(
         span=9, adjust=False
     ).mean()
 
-    df["macd_hist"] = df["macd"] - df["macd_signal"]
+    df["macd_hist"] = (
+        df["macd"] - df["macd_signal"]
+    )
 
     # Stochastic
     low14 = low.rolling(14).min()
     high14 = high.rolling(14).max()
+
     denom = (high14 - low14).replace(0, np.nan)
 
     df["stoch_k"] = (
@@ -536,17 +536,25 @@ def calculate_indicators(df):
         df["atr"] / close.replace(0, np.nan) * 100
     )
 
-    # ADX
+    # ADX ve yön göstergeleri
     up = high.diff()
     down = -low.diff()
 
     plus_dm = pd.Series(
-        np.where((up > down) & (up > 0), up, 0.0),
+        np.where(
+            (up > down) & (up > 0),
+            up,
+            0.0,
+        ),
         index=df.index,
     )
 
     minus_dm = pd.Series(
-        np.where((down > up) & (down > 0), down, 0.0),
+        np.where(
+            (down > up) & (down > 0),
+            down,
+            0.0,
+        ),
         index=df.index,
     )
 
@@ -583,7 +591,7 @@ def calculate_indicators(df):
         adjust=False,
     ).mean()
 
-    # Hacim ve momentum
+    # Hacim ve kısa momentum
     df["volume_sma"] = df["volume"].rolling(20).mean()
 
     df["volume_ratio"] = (
@@ -621,7 +629,7 @@ def make_signal(df, min_votes=4, min_margin=2):
         "adx", "plus_di", "minus_di",
     ]
 
-    if any(pd.isna(row[k]) for k in required):
+    if any(pd.isna(row[key]) for key in required):
         return {
             "signal": "NO SIGNAL",
             "buy_score": 0,
@@ -792,9 +800,7 @@ def scan_one(asset, min_votes, min_margin):
         last = indicators.iloc[-1]
 
         if asset["otc"]:
-            source += (
-                " — OTC DEĞİL; temel piyasa proxy verisi"
-            )
+            source += " — OTC DEĞİL; temel piyasa proxy verisi"
 
         return {
             **asset,
@@ -851,16 +857,14 @@ def scan_one(asset, min_votes, min_margin):
 st.title("📊 Velora — 100K Mum / 1 Dakika")
 
 st.caption(
-    "BUY / SELL teknik tarayıcı • Binance kullanmaz • "
-    "Emir göndermez"
+    "BUY / SELL teknik tarayıcı • Binance kullanmaz • Emir göndermez"
 )
 
 st.warning(
     "Gerçek Binomo OTC mumları bu uygulamada bulunmuyor. "
-    "OTC etiketi taşıyan varlıklarda sağlayıcıdan gelen temel "
-    "piyasa verisi kullanılabilir; bu, Binomo OTC fiyatı değildir. "
-    "Sağlayıcıda sembol veya 100.000 mum geçmişi yoksa uygulama "
-    "hatayı açıkça gösterir."
+    "OTC etiketi taşıyan varlıklarda sağlayıcıdan gelen temel piyasa "
+    "verisi kullanılabilir; bu, Binomo OTC fiyatı değildir. Sağlayıcıda "
+    "sembol veya 100.000 mum geçmişi yoksa uygulama hatayı gösterir."
 )
 
 st.info(
@@ -878,11 +882,13 @@ group = st.sidebar.selectbox(
 )
 
 min_votes = st.sidebar.slider(
-    "Minimum gösterge puanı", 3, 7, 4
+    "Minimum gösterge puanı",
+    3, 7, 4,
 )
 
 min_margin = st.sidebar.slider(
-    "BUY/SELL puan farkı", 1, 4, 2
+    "BUY/SELL puan farkı",
+    1, 4, 2,
 )
 
 asset_limit = st.sidebar.number_input(
@@ -903,19 +909,16 @@ if group == "Kripto":
         a for a in ASSETS
         if a["category"] == "crypto"
     ]
-
 elif group == "Forex":
     chosen = [
         a for a in ASSETS
         if a["category"] == "forex"
     ]
-
 elif group == "Diğer":
     chosen = [
         a for a in ASSETS
         if a["category"] in ("metal", "stock", "index")
     ]
-
 else:
     chosen = list(ASSETS)
 
@@ -935,7 +938,6 @@ if "velora_scan_time" not in st.session_state:
     st.session_state.velora_scan_time = None
 
 st.write(f"Bu taramada seçilen varlık: **{len(chosen)}**")
-
 st.write(
     f"Her varlık için hedef: **{TARGET_CANDLES:,} "
     "tamamlanmış 1 dakikalık mum**"
@@ -957,7 +959,7 @@ if st.button(
     progress = st.progress(0)
     status = st.empty()
 
-    # Tarihsel veri istekleri nedeniyle eşzamanlı işlem sayısı düşük.
+    # Tarihsel veri istekleri yoğun olabilir; eşzamanlılık sınırlı.
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = {
             pool.submit(
@@ -977,7 +979,6 @@ if st.button(
         ):
             try:
                 results.append(future.result())
-
             except Exception as exc:
                 results.append({
                     "name": futures[future],
@@ -989,12 +990,9 @@ if st.button(
                 })
 
             progress.progress(i / max(total, 1))
-            status.write(
-                f"Tamamlanan varlık: {i}/{total}"
-            )
+            status.write(f"Tamamlanan varlık: {i}/{total}")
 
     st.session_state.velora_results = results
-
     st.session_state.velora_scan_time = (
         datetime.now(timezone.utc).strftime(
             "%Y-%m-%d %H:%M:%S UTC"
@@ -1006,7 +1004,7 @@ if st.button(
 
 
 # ============================================================
-# SONUÇLAR
+# SONUÇ TABLOLARI
 # ============================================================
 
 results = st.session_state.velora_results
@@ -1020,52 +1018,29 @@ if not results:
 
 valid = [
     r for r in results
-    if r.get("candles") is not None
-    and not r.get("error")
+    if r.get("candles") is not None and not r.get("error")
 ]
 
-errors = [
-    r for r in results
-    if r.get("error")
-]
+errors = [r for r in results if r.get("error")]
 
-buy = [
-    r for r in valid
-    if r.get("signal") == "BUY"
-]
-
-sell = [
-    r for r in valid
-    if r.get("signal") == "SELL"
-]
-
-no_signal = [
-    r for r in valid
-    if r.get("signal") == "NO SIGNAL"
-]
+buy = [r for r in valid if r.get("signal") == "BUY"]
+sell = [r for r in valid if r.get("signal") == "SELL"]
 
 c1, c2, c3, c4 = st.columns(4)
 
 c1.metric(
     "100K geçmişi tamamlanan",
-    sum(
-        1 for r in valid
-        if r.get("count") == TARGET_CANDLES
-    ),
+    sum(1 for r in valid if r.get("count") == TARGET_CANDLES),
 )
-
 c2.metric("BUY", len(buy))
 c3.metric("SELL", len(sell))
 c4.metric("Veri hatası / eksik geçmiş", len(errors))
 
 if st.session_state.velora_scan_time:
-    st.caption(
-        "Son tarama: "
-        + st.session_state.velora_scan_time
-    )
+    st.caption("Son tarama: " + st.session_state.velora_scan_time)
 
 
-# BUY / SELL tablosu
+# BUY / SELL sonuçları
 st.subheader("🚨 BUY / SELL sinyalleri")
 
 signals = sorted(
@@ -1095,23 +1070,17 @@ if signals:
         use_container_width=True,
         hide_index=True,
     )
-
 else:
-    st.info(
-        "Eşik koşullarını sağlayan BUY/SELL sinyali yok."
-    )
+    st.info("Eşik koşullarını sağlayan BUY/SELL sinyali yok.")
 
 
-# Tüm analiz sonuçları
+# Tüm başarılı taramalar
 st.subheader("📋 Tüm analiz sonuçları")
 
 shown = (
     valid
     if include_no_signal
-    else [
-        r for r in valid
-        if r.get("signal") != "NO SIGNAL"
-    ]
+    else [r for r in valid if r.get("signal") != "NO SIGNAL"]
 )
 
 if shown:
@@ -1136,7 +1105,10 @@ if shown:
     )
 
 
-# Grafikler
+# ============================================================
+# GRAFİKLER
+# ============================================================
+
 st.subheader("🔬 Varlık grafiği")
 
 chartable = [
@@ -1158,21 +1130,16 @@ if chartable:
     candles = selected["candles"]
 
     st.write(f"**Veri kaynağı:** {selected['source']}")
-
     st.write(
         f"**Alınan tamamlanmış mum:** "
         f"{selected['count']:,} / {TARGET_CANDLES:,}"
     )
-
     st.write(
-        f"**Sinyal:** {selected['signal']} — "
-        f"{selected['reason']}"
+        f"**Sinyal:** {selected['signal']} — {selected['reason']}"
     )
 
     st.line_chart(
-        candles.set_index("time")[
-            ["close", "ema20", "ema50"]
-        ].rename(
+        candles.set_index("time")[["close", "ema20", "ema50"]].rename(
             columns={
                 "close": "Kapanış",
                 "ema20": "EMA 20",
@@ -1199,14 +1166,14 @@ if chartable:
             columns={"rsi": "RSI"}
         )
     )
-
 else:
-    st.info(
-        "Grafik için yeterli tarihsel veri bulunamadı."
-    )
+    st.info("Grafik için yeterli tarihsel veri bulunamadı.")
 
 
-# Veri hataları
+# ============================================================
+# VERİ HATALARI
+# ============================================================
+
 st.subheader(
     "⚠️ Verisi alınamayan veya 100K mum tamamlayamayan varlıklar"
 )
@@ -1224,12 +1191,14 @@ if errors:
         use_container_width=True,
         hide_index=True,
     )
-
 else:
     st.success("Bu taramada veri hatası yok.")
 
 
-# CSV dışa aktarımı
+# ============================================================
+# CSV DIŞA AKTARMA
+# ============================================================
+
 if results:
     export = pd.DataFrame([
         {
@@ -1251,9 +1220,7 @@ if results:
 
     st.download_button(
         "📥 CSV sonuçlarını indir",
-        data=export.to_csv(
-            index=False
-        ).encode("utf-8-sig"),
+        data=export.to_csv(index=False).encode("utf-8-sig"),
         file_name="velora_100k_1m_scan.csv",
         mime="text/csv",
         use_container_width=True,
@@ -1264,8 +1231,7 @@ st.divider()
 
 st.caption(
     "Velora yalnızca teknik analiz yapar; emir göndermez. "
-    "100.000 mum hedefi, veri sağlayıcısının tarihçe, sembol "
-    "ve API kotasıyla sınırlıdır. Sinyal skoru kazanma "
-    "olasılığı değildir. OTC olarak işaretlenen varlıklarda "
-    "gerçek Binomo OTC fiyatı kullanılmıyor."
+    "100.000 mum hedefi veri sağlayıcısının geçmiş, sembol ve API "
+    "kotasına bağlıdır. Sinyal skoru kazanma olasılığı değildir. "
+    "OTC etiketi taşıyan varlıklarda gerçek Binomo OTC fiyatı kullanılmıyor."
 )
