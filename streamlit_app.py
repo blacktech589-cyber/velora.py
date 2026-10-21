@@ -1,7 +1,7 @@
 
 import sqlite3
-from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -9,90 +9,138 @@ import requests
 import streamlit as st
 
 # ============================================================
-# VELORA — EMA 15 + BOLLINGER BANDS
-# 1-minute scanner | BUY / SELL only | No order execution
-# API key not required
+# VELORA - EMA 15 + BOLLINGER BANDS SCANNER
+# 1-minute candles | BUY / SELL signals | No order execution
+# No API key required
 # ============================================================
 
 st.set_page_config(
-    page_title="Velora — EMA15 Bollinger Scanner",
+    page_title="Velora Scanner",
     page_icon="📊",
     layout="wide",
 )
 
 DB_PATH = "velora_history.sqlite3"
 TARGET_CANDLES = 100_000
-YAHOO_BASE = "https://query1.finance.yahoo.com/v8/finance/chart"
-TIMEOUT = 20
+REQUEST_TIMEOUT = 20
 
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json",
-})
-
-# Yahoo Finance symbols. These are market-data proxies,
-# NOT actual Binomo OTC prices.
 ASSETS = [
     {"name": "Bitcoin", "symbol": "BTC-USD", "category": "Crypto"},
     {"name": "Ethereum", "symbol": "ETH-USD", "category": "Crypto"},
     {"name": "Solana", "symbol": "SOL-USD", "category": "Crypto"},
-    {"name": "Cardano", "symbol": "ADA-USD", "category": "Crypto"},
-    {"name": "Chainlink", "symbol": "LINK-USD", "category": "Crypto"},
-    {"name": "Bitcoin Cash", "symbol": "BCH-USD", "category": "Crypto"},
-    {"name": "Avalanche", "symbol": "AVAX-USD", "category": "Crypto"},
-    {"name": "Dogecoin", "symbol": "DOGE-USD", "category": "Crypto"},
     {"name": "XRP", "symbol": "XRP-USD", "category": "Crypto"},
-    {"name": "Polkadot", "symbol": "DOT-USD", "category": "Crypto"},
+    {"name": "Dogecoin", "symbol": "DOGE-USD", "category": "Crypto"},
+    {"name": "Cardano", "symbol": "ADA-USD", "category": "Crypto"},
+    {"name": "Avalanche", "symbol": "AVAX-USD", "category": "Crypto"},
+    {"name": "Chainlink", "symbol": "LINK-USD", "category": "Crypto"},
     {"name": "EUR/USD", "symbol": "EURUSD=X", "category": "Forex"},
     {"name": "GBP/USD", "symbol": "GBPUSD=X", "category": "Forex"},
     {"name": "USD/JPY", "symbol": "JPY=X", "category": "Forex"},
-    {"name": "USD/CHF", "symbol": "CHF=X", "category": "Forex"},
     {"name": "AUD/USD", "symbol": "AUDUSD=X", "category": "Forex"},
     {"name": "USD/CAD", "symbol": "CAD=X", "category": "Forex"},
+    {"name": "USD/CHF", "symbol": "CHF=X", "category": "Forex"},
     {"name": "NZD/USD", "symbol": "NZDUSD=X", "category": "Forex"},
     {"name": "EUR/GBP", "symbol": "EURGBP=X", "category": "Forex"},
-    {"name": "Gold Futures (proxy)", "symbol": "GC=F", "category": "Other"},
+    {"name": "Gold futures proxy", "symbol": "GC=F", "category": "Other"},
     {"name": "Apple", "symbol": "AAPL", "category": "Other"},
     {"name": "Microsoft", "symbol": "MSFT", "category": "Other"},
     {"name": "NVIDIA", "symbol": "NVDA", "category": "Other"},
 ]
 
 
-# --------------------------- DATABASE ---------------------------
+# ------------------------------------------------------------
+# HTTP SESSION
+# ------------------------------------------------------------
+
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/130.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json,text/plain,*/*",
+})
+
+
+# ------------------------------------------------------------
+# DATABASE
+# ------------------------------------------------------------
 
 def init_db():
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS candles (
                 symbol TEXT NOT NULL,
-                time TEXT NOT NULL,
+                candle_time TEXT NOT NULL,
                 open REAL NOT NULL,
                 high REAL NOT NULL,
                 low REAL NOT NULL,
                 close REAL NOT NULL,
                 volume REAL DEFAULT 0,
-                PRIMARY KEY (symbol, time)
+                PRIMARY KEY (symbol, candle_time)
             )
         """)
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_candles_symbol_time
-            ON candles(symbol, time)
+            ON candles(symbol, candle_time)
         """)
         conn.commit()
 
 
-def save_candles(symbol, df):
+def load_cached_candles(symbol):
+    init_db()
+
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        df = pd.read_sql_query(
+            """
+            SELECT candle_time AS time, open, high, low, close, volume
+            FROM candles
+            WHERE symbol = ?
+            ORDER BY candle_time ASC
+            """,
+            conn,
+            params=(symbol,),
+        )
+
+    if not df.empty:
+        df["time"] = pd.to_datetime(
+            df["time"],
+            utc=True,
+            errors="coerce",
+        )
+
+        for column in ["open", "high", "low", "close", "volume"]:
+            df[column] = pd.to_numeric(
+                df[column],
+                errors="coerce",
+            )
+
+        df = df.dropna(
+            subset=["time", "open", "high", "low", "close"]
+        )
+
+    return df
+
+
+def save_cached_candles(symbol, df):
     if df is None or df.empty:
         return
 
     rows = []
+
     for row in df.itertuples(index=False):
         timestamp = pd.Timestamp(row.time)
+
         if timestamp.tzinfo is None:
             timestamp = timestamp.tz_localize("UTC")
         else:
             timestamp = timestamp.tz_convert("UTC")
+
+        volume = getattr(row, "volume", 0)
+
+        if pd.isna(volume):
+            volume = 0
 
         rows.append((
             symbol,
@@ -101,311 +149,440 @@ def save_candles(symbol, df):
             float(row.high),
             float(row.low),
             float(row.close),
-            float(row.volume),
+            float(volume),
         ))
 
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.executemany("""
+        conn.executemany(
+            """
             INSERT OR REPLACE INTO candles
-            (symbol, time, open, high, low, close, volume)
+            (symbol, candle_time, open, high, low, close, volume)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, rows)
+            """,
+            rows,
+        )
         conn.commit()
 
 
-def load_candles(symbol):
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        df = pd.read_sql_query("""
-            SELECT time, open, high, low, close, volume
-            FROM candles
-            WHERE symbol = ?
-            ORDER BY time ASC
-        """, conn, params=(symbol,))
+# ------------------------------------------------------------
+# YAHOO FINANCE DATA
+# ------------------------------------------------------------
 
-    if not df.empty:
-        df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(
-            subset=["time", "open", "high", "low", "close"]
+def fetch_yahoo_candles(symbol):
+    """
+    Try two Yahoo Finance hosts for recent one-minute OHLCV data.
+    This endpoint requires no API key, but access and history
+    availability are not guaranteed.
+    """
+
+    errors = []
+
+    encoded_symbol = requests.utils.quote(symbol, safe="")
+
+    hosts = [
+        "query1.finance.yahoo.com",
+        "query2.finance.yahoo.com",
+    ]
+
+    for host in hosts:
+        url = (
+            f"https://{host}/v8/finance/chart/"
+            f"{encoded_symbol}"
         )
 
-    return df
+        try:
+            response = SESSION.get(
+                url,
+                params={
+                    "range": "7d",
+                    "interval": "1m",
+                    "includePrePost": "false",
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
 
+            if response.status_code == 429:
+                raise RuntimeError(
+                    "HTTP 429: provider rate limit reached."
+                )
 
-# --------------------------- DATA SOURCE ---------------------------
+            if response.status_code in (401, 403):
+                raise RuntimeError(
+                    f"HTTP {response.status_code}: access denied."
+                )
 
-def fetch_yahoo_1m(symbol):
-    """
-    Fetch recent 1-minute candles without an API key.
-    Yahoo's unofficial endpoint has history and symbol limitations.
-    """
+            response.raise_for_status()
 
-    url = f"{YAHOO_BASE}/{requests.utils.quote(symbol, safe='')}"
+            try:
+                payload = response.json()
+            except ValueError:
+                raise RuntimeError(
+                    "Provider returned an invalid JSON response."
+                )
 
-    response = SESSION.get(
-        url,
-        params={
-            "range": "7d",
-            "interval": "1m",
-            "includePrePost": "false",
-        },
-        timeout=TIMEOUT,
+            chart = payload.get("chart", {})
+
+            if chart.get("error"):
+                error_info = chart["error"] or {}
+                raise RuntimeError(
+                    str(
+                        error_info.get("description")
+                        or error_info.get("code")
+                        or "Provider returned a chart error."
+                    )
+                )
+
+            results = chart.get("result") or []
+
+            if not results:
+                raise RuntimeError(
+                    "No chart data returned for this symbol."
+                )
+
+            result = results[0]
+            timestamps = result.get("timestamp") or []
+
+            quotes = (
+                result.get("indicators", {}).get("quote") or []
+            )
+
+            if not timestamps or not quotes:
+                raise RuntimeError(
+                    "Response has no timestamp or OHLC data."
+                )
+
+            quote = quotes[0]
+
+            df = pd.DataFrame({
+                "time": pd.to_datetime(
+                    timestamps,
+                    unit="s",
+                    utc=True,
+                ),
+                "open": quote.get("open", []),
+                "high": quote.get("high", []),
+                "low": quote.get("low", []),
+                "close": quote.get("close", []),
+                "volume": quote.get("volume", []),
+            })
+
+            for column in [
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+            ]:
+                df[column] = pd.to_numeric(
+                    df[column],
+                    errors="coerce",
+                )
+
+            df["volume"] = df["volume"].fillna(0)
+
+            df = df.dropna(
+                subset=["time", "open", "high", "low", "close"]
+            )
+
+            df = (
+                df.drop_duplicates(subset=["time"])
+                .sort_values("time")
+                .reset_index(drop=True)
+            )
+
+            # Remove the current unfinished one-minute candle.
+            current_minute = pd.Timestamp.now(
+                tz="UTC"
+            ).floor("min")
+
+            df = df[
+                df["time"] < current_minute
+            ].reset_index(drop=True)
+
+            if df.empty:
+                raise RuntimeError(
+                    "No completed one-minute candles returned."
+                )
+
+            return df, host
+
+        except Exception as exc:
+            errors.append(f"{host}: {exc}")
+
+    raise RuntimeError(
+        "Both Yahoo Finance endpoints failed. "
+        + " | ".join(errors)
     )
-    response.raise_for_status()
-
-    payload = response.json()
-    chart = payload.get("chart", {})
-
-    if chart.get("error"):
-        message = chart["error"].get("description", "Yahoo data error")
-        raise RuntimeError(message)
-
-    results = chart.get("result") or []
-    if not results:
-        raise RuntimeError("No data returned for this symbol.")
-
-    item = results[0]
-    timestamps = item.get("timestamp") or []
-
-    quotes = item.get("indicators", {}).get("quote") or []
-    if not timestamps or not quotes:
-        raise RuntimeError("No candle data in provider response.")
-
-    quote = quotes[0]
-
-    df = pd.DataFrame({
-        "time": pd.to_datetime(timestamps, unit="s", utc=True),
-        "open": quote.get("open", []),
-        "high": quote.get("high", []),
-        "low": quote.get("low", []),
-        "close": quote.get("close", []),
-        "volume": quote.get("volume", []),
-    })
-
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df["volume"] = df["volume"].fillna(0)
-    df = df.dropna(subset=["time", "open", "high", "low", "close"])
-    df = df.drop_duplicates(subset=["time"]).sort_values("time")
-
-    # Exclude the current, unfinished minute candle.
-    current_minute = pd.Timestamp.now(tz="UTC").floor("min")
-    df = df[df["time"] < current_minute]
-
-    if df.empty:
-        raise RuntimeError("No completed 1-minute candles available.")
-
-    return df.reset_index(drop=True)
 
 
-def get_history(asset):
-    """
-    Combine recently fetched candles with the local SQLite cache.
-    100,000 candles is a target, not a guaranteed data-provider result.
-    """
-
-    init_db()
+def get_candles(asset):
     symbol = asset["symbol"]
 
-    recent = fetch_yahoo_1m(symbol)
-    save_candles(symbol, recent)
+    recent = pd.DataFrame()
+    provider_error = None
+    host_used = None
 
-    cached = load_candles(symbol)
-    combined = pd.concat([cached, recent], ignore_index=True)
+    try:
+        recent, host_used = fetch_yahoo_candles(symbol)
+        save_cached_candles(symbol, recent)
 
-    if combined.empty:
-        raise RuntimeError("No candle history available.")
+    except Exception as exc:
+        provider_error = str(exc)
 
-    combined = combined.drop_duplicates(subset=["time"], keep="last")
-    combined = combined.sort_values("time").reset_index(drop=True)
+    cached = load_cached_candles(symbol)
 
-    # Exclude unfinished candles even if they exist in the local cache.
-    current_minute = pd.Timestamp.now(tz="UTC").floor("min")
-    combined = combined[combined["time"] < current_minute]
+    frames = [
+        frame
+        for frame in [cached, recent]
+        if frame is not None and not frame.empty
+    ]
 
-    return combined.reset_index(drop=True)
+    if not frames:
+        raise RuntimeError(
+            provider_error or "No market data available."
+        )
+
+    df = pd.concat(frames, ignore_index=True)
+
+    df["time"] = pd.to_datetime(
+        df["time"],
+        utc=True,
+        errors="coerce",
+    )
+
+    df = df.dropna(
+        subset=["time", "open", "high", "low", "close"]
+    )
+
+    df = (
+        df.drop_duplicates(subset=["time"], keep="last")
+        .sort_values("time")
+        .reset_index(drop=True)
+    )
+
+    current_minute = pd.Timestamp.now(
+        tz="UTC"
+    ).floor("min")
+
+    df = df[df["time"] < current_minute]
+
+    # Keep the most recent target candles in local history.
+    df = df.tail(TARGET_CANDLES).reset_index(drop=True)
+
+    if len(df) < 40:
+        raise RuntimeError(
+            f"Only {len(df)} completed candles are available. "
+            "At least 40 are required. "
+            + (provider_error or "")
+        )
+
+    if host_used:
+        source = f"Yahoo Finance ({host_used}) + SQLite cache"
+    else:
+        source = "SQLite cache only; live provider unavailable"
+
+    return df, source, provider_error
 
 
-# --------------------------- INDICATORS ---------------------------
+# ------------------------------------------------------------
+# TECHNICAL INDICATORS
+# ------------------------------------------------------------
 
-def add_indicators(df):
+def calculate_indicators(df):
     df = df.copy()
 
-    # EMA 15
+    # Exponential Moving Average, period 15
     df["ema15"] = df["close"].ewm(
         span=15,
         adjust=False,
         min_periods=15,
     ).mean()
 
-    # Bollinger Bands: 20-period SMA, 2 standard deviations
+    # Bollinger Bands: SMA 20, standard deviation x 2
     df["bb_mid"] = df["close"].rolling(
         window=20,
         min_periods=20,
     ).mean()
 
-    rolling_std = df["close"].rolling(
+    standard_deviation = df["close"].rolling(
         window=20,
         min_periods=20,
     ).std(ddof=0)
 
-    df["bb_upper"] = df["bb_mid"] + (2 * rolling_std)
-    df["bb_lower"] = df["bb_mid"] - (2 * rolling_std)
+    df["bb_upper"] = (
+        df["bb_mid"] + 2 * standard_deviation
+    )
+
+    df["bb_lower"] = (
+        df["bb_mid"] - 2 * standard_deviation
+    )
 
     return df
 
 
-# --------------------------- SIGNAL LOGIC ---------------------------
+# ------------------------------------------------------------
+# BUY / SELL SIGNALS
+# ------------------------------------------------------------
 
-def generate_signal(df, lookback=15, band_mode="Touch or cross"):
+def calculate_signal(df, lookback=15, band_mode="Touch or cross"):
     """
     SELL:
-      1. Price rose over the selected 15-17 candle period.
-      2. Close is above EMA 15.
-      3. Bollinger upper-band condition is satisfied.
+      - Price rose over the selected completed-candle period.
+      - At least half of the period's candles were green.
+      - Latest close is above EMA 15.
+      - Upper Bollinger condition is met.
 
     BUY:
-      1. Price fell over the selected 15-17 candle period.
-      2. Close is below EMA 15.
-      3. Bollinger lower-band condition is satisfied.
+      - Price fell over the selected completed-candle period.
+      - At least half of the period's candles were red.
+      - Latest close is below EMA 15.
+      - Lower Bollinger condition is met.
 
-    Signals are analysis outputs, not trade instructions or guarantees.
+    This app only calculates signals and never places orders.
     """
 
     empty = {
         "signal": "NO SIGNAL",
-        "reason": "Not enough data or conditions not met.",
+        "reason": "Not enough data to calculate a signal.",
         "change_pct": np.nan,
         "trend": "Unknown",
-        "price": np.nan,
-        "ema15": np.nan,
-        "bb_upper": np.nan,
-        "bb_lower": np.nan,
     }
 
-    if df is None or len(df) < max(lookback + 20, 40):
+    if df is None or len(df) < max(lookback + 25, 40):
         return empty
 
-    data = add_indicators(df)
-    last = data.iloc[-1]
-    start = data.iloc[-(lookback + 1)]
+    data = calculate_indicators(df)
+
+    latest = data.iloc[-1]
+    starting = data.iloc[-(lookback + 1)]
 
     required = [
-        last["close"], last["ema15"], last["bb_upper"],
-        last["bb_lower"], start["close"],
+        latest["ema15"],
+        latest["bb_upper"],
+        latest["bb_lower"],
+        starting["close"],
     ]
 
-    if any(pd.isna(x) for x in required):
-        return empty
+    if any(pd.isna(value) for value in required):
+        return {
+            **empty,
+            "reason": "EMA or Bollinger indicators are not ready.",
+        }
 
-    start_price = float(start["close"])
-    price = float(last["close"])
-    ema15 = float(last["ema15"])
-    upper = float(last["bb_upper"])
-    lower = float(last["bb_lower"])
+    start_price = float(starting["close"])
+    current_price = float(latest["close"])
 
     if start_price == 0:
-        return empty
+        return {
+            **empty,
+            "reason": "Starting price is zero.",
+        }
 
-    change_pct = (price - start_price) / start_price * 100
+    change_pct = (
+        (current_price - start_price) / start_price
+    ) * 100
 
-    rising = price > start_price
-    falling = price < start_price
+    # Use the previous completed candles to assess candle direction.
+    segment = data.iloc[-(lookback + 1):-1]
+
+    green_ratio = float(
+        (segment["close"] > segment["open"]).mean()
+    )
+
+    red_ratio = float(
+        (segment["close"] < segment["open"]).mean()
+    )
+
+    rising = change_pct > 0 and green_ratio >= 0.5
+    falling = change_pct < 0 and red_ratio >= 0.5
+
+    if band_mode == "Touch or cross":
+        upper_condition = (
+            float(latest["high"]) >= float(latest["bb_upper"])
+        )
+        lower_condition = (
+            float(latest["low"]) <= float(latest["bb_lower"])
+        )
+    else:
+        upper_condition = (
+            current_price >= float(latest["bb_upper"])
+        )
+        lower_condition = (
+            current_price <= float(latest["bb_lower"])
+        )
+
+    above_ema = current_price > float(latest["ema15"])
+    below_ema = current_price < float(latest["ema15"])
+
+    if rising and above_ema and upper_condition:
+        signal = "SELL"
+        reason = (
+            f"Last {lookback} candles rose by "
+            f"{change_pct:.3f}%; close above EMA 15; "
+            "upper Bollinger condition met."
+        )
+
+    elif falling and below_ema and lower_condition:
+        signal = "BUY"
+        reason = (
+            f"Last {lookback} candles fell by "
+            f"{change_pct:.3f}%; close below EMA 15; "
+            "lower Bollinger condition met."
+        )
+
+    else:
+        signal = "NO SIGNAL"
+        reason = (
+            f"Conditions incomplete. Change={change_pct:.3f}%; "
+            f"green candle ratio={green_ratio:.0%}; "
+            f"red candle ratio={red_ratio:.0%}."
+        )
 
     if rising:
         trend = "Rising"
     elif falling:
         trend = "Falling"
     else:
-        trend = "Flat"
-
-    if band_mode == "Touch or cross":
-        upper_condition = float(last["high"]) >= upper
-        lower_condition = float(last["low"]) <= lower
-    else:
-        upper_condition = price >= upper
-        lower_condition = price <= lower
-
-    # SELL: rising period + EMA15 confirmation + upper band
-    sell_condition = (
-        rising
-        and price > ema15
-        and upper_condition
-    )
-
-    # BUY: falling period + EMA15 confirmation + lower band
-    buy_condition = (
-        falling
-        and price < ema15
-        and lower_condition
-    )
-
-    if sell_condition and not buy_condition:
-        signal = "SELL"
-        reason = (
-            f"Last {lookback} candles rose by {change_pct:.3f}%; "
-            "close is above EMA 15 and upper Bollinger condition is met."
-        )
-    elif buy_condition and not sell_condition:
-        signal = "BUY"
-        reason = (
-            f"Last {lookback} candles fell by {change_pct:.3f}%; "
-            "close is below EMA 15 and lower Bollinger condition is met."
-        )
-    else:
-        signal = "NO SIGNAL"
-        reason = (
-            f"No complete setup. Trend={trend}; "
-            f"change={change_pct:.3f}%; "
-            f"close={price:.6g}; EMA15={ema15:.6g}."
-        )
+        trend = "Mixed / sideways"
 
     return {
         "signal": signal,
         "reason": reason,
         "change_pct": change_pct,
         "trend": trend,
-        "price": price,
-        "ema15": ema15,
-        "bb_upper": upper,
-        "bb_lower": lower,
     }
 
 
-# --------------------------- SCANNER ---------------------------
+# ------------------------------------------------------------
+# SCAN ONE ASSET
+# ------------------------------------------------------------
 
 def scan_asset(asset, lookback, band_mode):
     try:
-        candles = get_history(asset)
-
-        if len(candles) < 40:
-            raise RuntimeError(
-                f"Only {len(candles)} candles available; more data is needed."
-            )
-
-        indicators = add_indicators(candles)
-        signal = generate_signal(indicators, lookback, band_mode)
+        candles, source, provider_error = get_candles(asset)
+        data = calculate_indicators(candles)
+        signal = calculate_signal(data, lookback, band_mode)
+        latest = data.iloc[-1]
 
         return {
             **asset,
             **signal,
-            "count": len(indicators),
-            "progress_pct": min(
-                100.0,
-                len(indicators) / TARGET_CANDLES * 100,
-            ),
-            "candles": indicators,
+            "price": float(latest["close"]),
+            "ema15": float(latest["ema15"]),
+            "bb_upper": float(latest["bb_upper"]),
+            "bb_lower": float(latest["bb_lower"]),
+            "count": len(data),
+            "source": source,
+            "candles": data,
             "error": None,
-            "source": "Yahoo Finance + local SQLite cache",
+            "provider_warning": provider_error,
         }
 
     except Exception as exc:
         return {
             **asset,
             "signal": "NO SIGNAL",
-            "reason": "Signal not calculated because data was unavailable.",
+            "reason": "No signal calculated because data is unavailable.",
             "change_pct": np.nan,
             "trend": "Unknown",
             "price": np.nan,
@@ -413,33 +590,35 @@ def scan_asset(asset, lookback, band_mode):
             "bb_upper": np.nan,
             "bb_lower": np.nan,
             "count": 0,
-            "progress_pct": 0.0,
+            "source": "Unavailable",
             "candles": None,
             "error": str(exc),
-            "source": "Unavailable",
+            "provider_warning": None,
         }
 
 
-# --------------------------- USER INTERFACE ---------------------------
+# ------------------------------------------------------------
+# STREAMLIT UI
+# ------------------------------------------------------------
 
 st.title("📊 Velora — EMA 15 + Bollinger Bands")
+
 st.caption(
-    "1-minute market scanner | BUY / SELL signals only | "
-    "No automatic order execution"
+    "1-minute market scanner | BUY / SELL only | "
+    "No automatic trading"
 )
 
 st.warning(
-    "API key is not required. This app attempts to retrieve recent 1-minute "
-    "candles from Yahoo Finance's unofficial chart endpoint. Data availability "
-    "depends on the symbol and provider. These are not actual Binomo OTC quotes."
+    "No API key is required. The app attempts to use Yahoo Finance's "
+    "unofficial chart endpoint. Provider access and available history "
+    "are not guaranteed. These prices are not actual Binomo OTC quotes."
 )
 
 st.info(
-    "100,000 one-minute candles represent about 69.4 days of continuous data. "
-    "The free source usually cannot provide this much intraday history. "
-    "The SQLite cache can accumulate data over time, but it cannot recreate "
-    "historical candles that the provider never supplied. Cloud redeployments "
-    "may also reset local files."
+    "Target: 100,000 completed one-minute candles per asset. "
+    "The free Yahoo Finance endpoint does not guarantee that history. "
+    "SQLite can accumulate candles while the app retains its database, "
+    "but it cannot recreate candles that were never downloaded."
 )
 
 st.sidebar.header("Scanner settings")
@@ -450,7 +629,7 @@ category = st.sidebar.selectbox(
 )
 
 lookback = st.sidebar.select_slider(
-    "Candles used to measure rise/fall",
+    "Rise/fall candle count",
     options=[15, 16, 17],
     value=15,
 )
@@ -459,6 +638,11 @@ band_mode = st.sidebar.radio(
     "Bollinger confirmation",
     ["Touch or cross", "Close outside band"],
     index=0,
+    format_func=lambda value: (
+        "Touch or cross"
+        if value == "Touch or cross"
+        else "Close outside band"
+    ),
 )
 
 asset_limit = st.sidebar.number_input(
@@ -474,33 +658,52 @@ show_no_signal = st.sidebar.checkbox(
     value=True,
 )
 
+st.sidebar.success("No API key required")
+
 if category == "Crypto":
-    selected_assets = [a for a in ASSETS if a["category"] == "Crypto"]
+    selected_assets = [
+        asset for asset in ASSETS
+        if asset["category"] == "Crypto"
+    ]
 elif category == "Forex":
-    selected_assets = [a for a in ASSETS if a["category"] == "Forex"]
+    selected_assets = [
+        asset for asset in ASSETS
+        if asset["category"] == "Forex"
+    ]
 elif category == "Other":
-    selected_assets = [a for a in ASSETS if a["category"] == "Other"]
+    selected_assets = [
+        asset for asset in ASSETS
+        if asset["category"] == "Other"
+    ]
 else:
-    selected_assets = list(ASSETS)
+    selected_assets = ASSETS.copy()
 
 selected_assets = selected_assets[:int(asset_limit)]
-
-st.sidebar.success("No API key required")
 
 st.markdown("### Strategy rules")
 st.markdown(
     f"""
-- **SELL:** The last {lookback} completed candles rose, the close is above
-  EMA 15, and the Bollinger upper-band condition is met.
-- **BUY:** The last {lookback} completed candles fell, the close is below
-  EMA 15, and the Bollinger lower-band condition is met.
+- **SELL:** The last {lookback} completed candles rose,
+  at least half of the period candles were green,
+  the latest close is above EMA 15, and the upper Bollinger
+  condition is met.
+- **BUY:** The last {lookback} completed candles fell,
+  at least half of the period candles were red,
+  the latest close is below EMA 15, and the lower Bollinger
+  condition is met.
 - **NO SIGNAL:** The complete setup is not present.
-- The current unfinished 1-minute candle is excluded.
+- The unfinished current one-minute candle is excluded.
 """
 )
 
 st.write(f"Assets selected: **{len(selected_assets)}**")
-st.write(f"History target per asset: **{TARGET_CANDLES:,} completed candles**")
+st.write(f"History target per asset: **{TARGET_CANDLES:,} candles**")
+
+if "velora_results" not in st.session_state:
+    st.session_state["velora_results"] = []
+
+if "velora_scan_time" not in st.session_state:
+    st.session_state["velora_scan_time"] = None
 
 if st.button(
     "🔍 START SCAN",
@@ -511,10 +714,14 @@ if st.button(
     progress = st.progress(0)
     status = st.empty()
 
-    # Low concurrency to reduce provider errors.
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = {
-            executor.submit(scan_asset, asset, lookback, band_mode): asset
+            executor.submit(
+                scan_asset,
+                asset,
+                lookback,
+                band_mode,
+            ): asset
             for asset in selected_assets
         }
 
@@ -529,15 +736,13 @@ if st.button(
                     **asset,
                     "signal": "NO SIGNAL",
                     "reason": "Scanner error.",
-                    "count": 0,
-                    "progress_pct": 0.0,
-                    "candles": None,
                     "error": str(exc),
-                    "source": "Unavailable",
+                    "count": 0,
+                    "candles": None,
                 })
 
             progress.progress(index / max(total, 1))
-            status.write(f"Scanned {index} of {total} assets")
+            status.write(f"Scanned {index} / {total} assets")
 
     st.session_state["velora_results"] = results
     st.session_state["velora_scan_time"] = datetime.now(
@@ -547,7 +752,7 @@ if st.button(
     progress.empty()
     status.empty()
 
-results = st.session_state.get("velora_results", [])
+results = st.session_state["velora_results"]
 
 if not results:
     st.info("Click START SCAN to retrieve data and calculate signals.")
@@ -555,30 +760,45 @@ if not results:
 
 valid_results = [
     result for result in results
-    if result.get("candles") is not None and not result.get("error")
+    if result.get("candles") is not None
+    and not result.get("error")
 ]
 
-errors = [result for result in results if result.get("error")]
+errors = [
+    result for result in results
+    if result.get("error")
+]
 
 buy_results = [
-    result for result in valid_results if result["signal"] == "BUY"
+    result for result in valid_results
+    if result.get("signal") == "BUY"
 ]
+
 sell_results = [
-    result for result in valid_results if result["signal"] == "SELL"
+    result for result in valid_results
+    if result.get("signal") == "SELL"
 ]
+
 no_signal_results = [
-    result for result in valid_results if result["signal"] == "NO SIGNAL"
+    result for result in valid_results
+    if result.get("signal") == "NO SIGNAL"
 ]
 
 st.caption(
-    "Last scan: " + st.session_state.get("velora_scan_time", "Unknown")
+    "Last scan: "
+    + str(st.session_state.get("velora_scan_time") or "Not available")
 )
 
 col1, col2, col3, col4 = st.columns(4)
+
 col1.metric(
     "Assets with 100K candles",
-    sum(1 for r in valid_results if r["count"] >= TARGET_CANDLES),
+    sum(
+        result["count"] >= TARGET_CANDLES
+        for result in valid_results
+    ),
 )
+
 col2.metric("BUY", len(buy_results))
 col3.metric("SELL", len(sell_results))
 col4.metric("Data errors", len(errors))
@@ -588,19 +808,28 @@ st.subheader("🚨 BUY / SELL signals")
 signals = buy_results + sell_results
 
 if signals:
-    signal_table = pd.DataFrame([{
-        "Asset": r["name"],
-        "Signal": r["signal"],
-        "Price": r["price"],
-        f"{lookback}-candle trend": r["trend"],
-        f"{lookback}-candle change (%)": r["change_pct"],
-        "EMA 15": r["ema15"],
-        "Bollinger upper": r["bb_upper"],
-        "Bollinger lower": r["bb_lower"],
-        "Candles stored": r["count"],
-        "100K progress (%)": round(r["progress_pct"], 2),
-        "Reason": r["reason"],
-    } for r in signals])
+    signal_table = pd.DataFrame([
+        {
+            "Asset": result["name"],
+            "Signal": result["signal"],
+            "Price": result["price"],
+            "Trend": result["trend"],
+            "Period change (%)": result["change_pct"],
+            "EMA 15": result["ema15"],
+            "Bollinger upper": result["bb_upper"],
+            "Bollinger lower": result["bb_lower"],
+            "Candles stored": result["count"],
+            "100K progress (%)": round(
+                min(
+                    100,
+                    result["count"] / TARGET_CANDLES * 100,
+                ),
+                2,
+            ),
+            "Reason": result["reason"],
+        }
+        for result in signals
+    ])
 
     st.dataframe(
         signal_table,
@@ -608,29 +837,43 @@ if signals:
         hide_index=True,
     )
 else:
-    st.info("No BUY or SELL setups currently meet all selected conditions.")
+    st.info(
+        "No BUY or SELL setup currently meets all selected conditions."
+    )
 
 st.subheader("📋 All scan results")
 
 shown_results = (
     valid_results
     if show_no_signal
-    else [r for r in valid_results if r["signal"] != "NO SIGNAL"]
+    else [
+        result for result in valid_results
+        if result["signal"] != "NO SIGNAL"
+    ]
 )
 
 if shown_results:
-    all_table = pd.DataFrame([{
-        "Asset": r["name"],
-        "Category": r["category"],
-        "Signal": r["signal"],
-        "Price": r["price"],
-        "Trend": r["trend"],
-        "Candles stored": r["count"],
-        "100K complete": r["count"] >= TARGET_CANDLES,
-        "100K progress (%)": round(r["progress_pct"], 2),
-        "Source": r["source"],
-        "Reason": r["reason"],
-    } for r in shown_results])
+    all_table = pd.DataFrame([
+        {
+            "Asset": result["name"],
+            "Category": result["category"],
+            "Signal": result["signal"],
+            "Price": result["price"],
+            "Trend": result["trend"],
+            "Candles": result["count"],
+            "100K complete": result["count"] >= TARGET_CANDLES,
+            "100K progress (%)": round(
+                min(
+                    100,
+                    result["count"] / TARGET_CANDLES * 100,
+                ),
+                2,
+            ),
+            "Source": result["source"],
+            "Reason": result["reason"],
+        }
+        for result in shown_results
+    ])
 
     st.dataframe(
         all_table,
@@ -641,42 +884,51 @@ if shown_results:
 st.subheader("📈 Asset chart")
 
 chartable = [
-    r for r in valid_results
-    if r.get("candles") is not None
-    and len(r["candles"]) > 0
+    result for result in valid_results
+    if result.get("candles") is not None
+    and not result["candles"].empty
 ]
 
 if chartable:
     selected_name = st.selectbox(
         "Choose an asset",
-        [r["name"] for r in chartable],
+        [result["name"] for result in chartable],
     )
 
     selected = next(
-        r for r in chartable if r["name"] == selected_name
+        result for result in chartable
+        if result["name"] == selected_name
     )
 
-    chart_df = selected["candles"].tail(500).copy()
-    chart_df = chart_df.set_index("time")
+    chart_df = (
+        selected["candles"]
+        .tail(500)
+        .set_index("time")
+    )
 
     st.write(f"**Signal:** {selected['signal']}")
     st.write(f"**Reason:** {selected['reason']}")
     st.write(
-        f"**Candles available:** {selected['count']:,} / "
-        f"{TARGET_CANDLES:,} target"
+        f"**Available candles:** {selected['count']:,} / "
+        f"{TARGET_CANDLES:,}"
     )
+    st.write(f"**Source:** {selected['source']}")
 
     st.markdown("**Close price and EMA 15**")
     st.line_chart(
-        chart_df[["close", "ema15"]].rename(columns={
-            "close": "Close",
-            "ema15": "EMA 15",
-        })
+        chart_df[["close", "ema15"]].rename(
+            columns={
+                "close": "Close",
+                "ema15": "EMA 15",
+            }
+        )
     )
 
     st.markdown("**Bollinger Bands**")
     st.line_chart(
-        chart_df[["close", "bb_upper", "bb_mid", "bb_lower"]].rename(
+        chart_df[
+            ["close", "bb_upper", "bb_mid", "bb_lower"]
+        ].rename(
             columns={
                 "close": "Close",
                 "bb_upper": "Upper band",
@@ -686,17 +938,27 @@ if chartable:
         )
     )
 else:
-    st.info("No chart available because candle data could not be retrieved.")
+    st.info(
+        "No chart available because candle data could not be retrieved."
+    )
 
 st.subheader("⚠️ Data errors")
 
 if errors:
+    st.error(
+        "Some assets could not be loaded. Read the Error column "
+        "to diagnose the problem."
+    )
+
     st.dataframe(
-        pd.DataFrame([{
-            "Asset": r["name"],
-            "Symbol": r["symbol"],
-            "Error": r.get("error", "Unknown error"),
-        } for r in errors]),
+        pd.DataFrame([
+            {
+                "Asset": result.get("name"),
+                "Symbol": result.get("symbol"),
+                "Error": result.get("error"),
+            }
+            for result in errors
+        ]),
         use_container_width=True,
         hide_index=True,
     )
@@ -704,22 +966,25 @@ else:
     st.success("No data errors in this scan.")
 
 if results:
-    export_df = pd.DataFrame([{
-        "asset": r.get("name"),
-        "symbol": r.get("symbol"),
-        "category": r.get("category"),
-        "signal": r.get("signal"),
-        "price": r.get("price"),
-        "trend": r.get("trend"),
-        "change_pct": r.get("change_pct"),
-        "ema15": r.get("ema15"),
-        "bb_upper": r.get("bb_upper"),
-        "bb_lower": r.get("bb_lower"),
-        "candle_count": r.get("count"),
-        "source": r.get("source"),
-        "reason": r.get("reason"),
-        "error": r.get("error"),
-    } for r in results])
+    export_df = pd.DataFrame([
+        {
+            "asset": result.get("name"),
+            "symbol": result.get("symbol"),
+            "category": result.get("category"),
+            "signal": result.get("signal"),
+            "price": result.get("price"),
+            "trend": result.get("trend"),
+            "change_pct": result.get("change_pct"),
+            "ema15": result.get("ema15"),
+            "bb_upper": result.get("bb_upper"),
+            "bb_lower": result.get("bb_lower"),
+            "candle_count": result.get("count"),
+            "source": result.get("source"),
+            "reason": result.get("reason"),
+            "error": result.get("error"),
+        }
+        for result in results
+    ])
 
     st.download_button(
         "📥 Download CSV results",
@@ -730,9 +995,10 @@ if results:
     )
 
 st.divider()
+
 st.caption(
-    "Velora only analyzes market data and does not place trades. "
-    "A signal is not a guarantee of a profitable outcome. Yahoo Finance "
-    "intraday history is limited and may fail for some symbols. The 100,000 "
-    "candle target is not guaranteed. Prices are not actual Binomo OTC quotes."
+    "Velora does not execute trades. Signals do not guarantee profit. "
+    "Yahoo Finance's one-minute history is limited and may be unavailable. "
+    "100,000 candles are a target, not a guarantee. "
+    "Yahoo market data is not actual Binomo OTC pricing."
 )
