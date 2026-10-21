@@ -22,13 +22,15 @@ st.set_page_config(page_title="Velora 1M Scanner", page_icon="📊", layout="wid
 
 TARGET_CANDLES = 100_000
 INTERVAL_MINUTES = 1
-CHUNK_MINUTES = 3_000  # small enough to stay below common outputsize limits
 DB_PATH = "velora_history.sqlite3"
-TD_BASE = "https://api.twelvedata.com"
+YAHOO_BASE = "https://query1.finance.yahoo.com/v8/finance/chart"
 HTTP_TIMEOUT = 30
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "VeloraHistoricalScanner/1.0"})
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+    "Accept": "application/json,text/plain,*/*",
+})
 
 
 # Asset format: display name | category | provider symbol | OTC label
@@ -134,23 +136,29 @@ for line in RAW_ASSETS.splitlines():
     })
 
 
-# Optional key entered in the sidebar. This value is kept in Streamlit's
-# widget session state, not written to disk or shown in the interface.
-API_KEY_OVERRIDE = ""
+def get_yahoo_symbol(asset):
+    """Convert the app's display symbol to a Yahoo Finance chart ticker."""
+    symbol = asset.get("symbol")
+    category = asset.get("category")
 
+    if not symbol:
+        return None
 
-def get_api_key():
-    manual_key = str(API_KEY_OVERRIDE or "").strip()
-    if manual_key:
-        return manual_key
+    if category == "crypto":
+        return symbol.replace("/", "-")
 
-    try:
-        key = st.secrets.get("TWELVE_DATA_API_KEY", "")
-        if key:
-            return str(key).strip()
-    except Exception:
-        pass
-    return os.environ.get("TWELVE_DATA_API_KEY", "").strip()
+    if category == "forex":
+        # Yahoo FX ticker format, for example EURUSD=X
+        return symbol.replace("/", "") + "=X"
+
+    if category == "metal":
+        # Gold futures is a proxy, not a spot quote and not Binomo OTC.
+        return "GC=F" if symbol == "XAU/USD" else symbol
+
+    if category == "stock":
+        return symbol
+
+    return None
 
 
 def init_db():
@@ -191,6 +199,23 @@ def db_read(symbol, start_iso, end_iso):
     return df
 
 
+def db_read_all(symbol):
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        df = pd.read_sql_query(
+            """
+            SELECT ts AS time, open, high, low, close, volume
+            FROM candles
+            WHERE symbol = ?
+            ORDER BY ts ASC
+            """,
+            conn,
+            params=(symbol,),
+        )
+    if not df.empty:
+        df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+    return df
+
+
 def db_write(symbol, df):
     if df is None or df.empty:
         return
@@ -211,135 +236,108 @@ def db_write(symbol, df):
         conn.commit()
 
 
-def td_fetch_chunk(symbol, start_dt, end_dt, api_key):
-    """Fetch one historical time range from Twelve Data."""
+def yahoo_fetch_recent_1m(yahoo_symbol):
+    """Fetch recent one-minute OHLCV bars from Yahoo's unauthenticated chart endpoint.
+
+    This is an unofficial endpoint. Intraday history is limited and may be
+    unavailable for some symbols/regions; there is no guarantee of 100K bars.
+    """
+    if not yahoo_symbol:
+        raise RuntimeError("Bu varlık için desteklenen Yahoo sembolü yok.")
+
+    url = f"{YAHOO_BASE}/{requests.utils.quote(yahoo_symbol, safe='')}"
     params = {
-        "symbol": symbol,
-        "interval": "1min",
-        "start_date": start_dt.strftime("%Y-%m-%d %H:%M:%S"),
-        "end_date": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
-        "outputsize": 5000,
-        "timezone": "UTC",
-        "apikey": api_key,
-        "format": "JSON",
+        "range": "7d",
+        "interval": "1m",
+        "includePrePost": "false",
+        "events": "history",
     }
-    response = SESSION.get(
-        f"{TD_BASE}/time_series",
-        params=params,
-        timeout=HTTP_TIMEOUT,
-    )
+    response = SESSION.get(url, params=params, timeout=HTTP_TIMEOUT)
     response.raise_for_status()
     payload = response.json()
 
-    if "values" not in payload:
-        message = payload.get("message") or payload.get("code") or str(payload)
-        raise RuntimeError(str(message))
+    chart = payload.get("chart", {})
+    if chart.get("error"):
+        error = chart["error"] or {}
+        raise RuntimeError(
+            str(error.get("description") or error.get("code") or "Yahoo Finance veri hatası")
+        )
 
-    df = pd.DataFrame(payload["values"])
-    if df.empty:
-        return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
+    results = chart.get("result") or []
+    if not results:
+        raise RuntimeError("Yahoo Finance bu sembol için veri döndürmedi.")
 
-    df["time"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
-    for col in ("open", "high", "low", "close"):
+    item = results[0]
+    timestamps = item.get("timestamp") or []
+    indicators = item.get("indicators", {})
+    quotes = indicators.get("quote") or []
+    if not timestamps or not quotes:
+        raise RuntimeError("Yanıtta mum verisi bulunamadı.")
+
+    quote = quotes[0]
+    df = pd.DataFrame({
+        "time": pd.to_datetime(timestamps, unit="s", utc=True),
+        "open": quote.get("open", []),
+        "high": quote.get("high", []),
+        "low": quote.get("low", []),
+        "close": quote.get("close", []),
+        "volume": quote.get("volume", []),
+    })
+
+    for col in ("open", "high", "low", "close", "volume"):
+        if col not in df:
+            df[col] = 0.0
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    if "volume" in df:
-        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
-    else:
-        df["volume"] = 0.0
 
+    df["volume"] = df["volume"].fillna(0)
     df = df.dropna(subset=["time", "open", "high", "low", "close"])
+    df = df.drop_duplicates(subset=["time"]).sort_values("time")
+
+    # Current forming minute is excluded.
+    cutoff = pd.Timestamp(datetime.now(timezone.utc).replace(second=0, microsecond=0))
+    df = df[df["time"] < cutoff]
+
+    if df.empty:
+        raise RuntimeError("Son 7 günlük aralıkta tamamlanmış 1 dakikalık mum bulunamadı.")
+
     return df[["time", "open", "high", "low", "close", "volume"]]
 
 
 def fetch_history_100k(asset, progress_callback=None):
+    """Collect recent no-key Yahoo 1m bars and combine with locally cached history.
+
+    100,000 candles is the target, not a promise: a no-key source usually only
+    provides a short recent intraday window. Repeated scans can accumulate bars
+    in SQLite over time, but cannot backfill unavailable history.
     """
-    Target 100,000 completed one-minute candles.
-    Historical ranges are requested in chunks and cached in SQLite.
-    Provider plans/rate limits may prevent completion.
-    """
-    symbol = asset.get("symbol")
-    if not symbol:
+    init_db()
+    yahoo_symbol = get_yahoo_symbol(asset)
+    if not yahoo_symbol:
         raise RuntimeError("Bu varlık için veri sağlayıcı sembolü tanımlı değil.")
 
-    api_key = get_api_key()
-    if not api_key:
-        raise RuntimeError("TWELVE_DATA_API_KEY eksik. Streamlit Secrets'e ekleyin.")
+    recent = yahoo_fetch_recent_1m(yahoo_symbol)
+    if not recent.empty:
+        db_write(yahoo_symbol, recent)
 
-    init_db()
+    stored = db_read_all(yahoo_symbol)
+    frames = [frame for frame in (stored, recent) if frame is not None and not frame.empty]
+    if not frames:
+        raise RuntimeError("Anahtarsız veri kaynağından mum alınamadı.")
 
-    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-    # FX/metals/stocks have market closures, so request a wider calendar window.
-    # Crypto runs continuously; the wider buffer also allows for provider gaps.
-    calendar_factor = 1.6 if asset.get("category") in ("forex", "metal", "stock") else 1.08
-    lookback_minutes = int(TARGET_CANDLES * calendar_factor) + 3_000
-    start = now - timedelta(minutes=lookback_minutes)
-
-    # Read any cached history first.
-    cached = db_read(
-        symbol,
-        start.strftime("%Y-%m-%d %H:%M:%S"),
-        now.strftime("%Y-%m-%d %H:%M:%S"),
-    )
-    if len(cached) >= TARGET_CANDLES:
-        return cached.tail(TARGET_CANDLES).reset_index(drop=True), "SQLite cache"
-
-    # Query chunks from oldest to newest. This is intentionally conservative.
-    cursor = start
-    chunk_count = int(np.ceil((now - start).total_seconds() / 60 / CHUNK_MINUTES))
-    completed_chunks = 0
-    new_parts = []
-
-    while cursor < now:
-        chunk_end = min(cursor + timedelta(minutes=CHUNK_MINUTES), now)
-
-        # Avoid hammering provider APIs; this also helps with rate limits.
-        part = td_fetch_chunk(symbol, cursor, chunk_end, api_key)
-        if not part.empty:
-            # Exclude the current still-forming minute.
-            part = part[part["time"] < pd.Timestamp(now)]
-            if not part.empty:
-                db_write(symbol, part)
-                new_parts.append(part)
-
-        completed_chunks += 1
-        if progress_callback:
-            progress_callback(completed_chunks / max(chunk_count, 1))
-
-        cursor = chunk_end
-        time.sleep(0.15)
-
-    frames = [cached] if not cached.empty else []
-    frames.extend(new_parts)
-
-    if frames:
-        combined = pd.concat(frames, ignore_index=True)
-        combined["time"] = pd.to_datetime(combined["time"], utc=True, errors="coerce")
-        combined = combined.dropna(subset=["time"])
-        combined = combined.drop_duplicates(subset=["time"]).sort_values("time")
-    else:
-        combined = pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
-
-    # Reload from DB to include rows inserted by prior runs.
-    stored = db_read(
-        symbol,
-        start.strftime("%Y-%m-%d %H:%M:%S"),
-        now.strftime("%Y-%m-%d %H:%M:%S"),
-    )
-    if not stored.empty:
-        combined = pd.concat([combined, stored], ignore_index=True)
-        combined = combined.drop_duplicates(subset=["time"]).sort_values("time")
-
-    # Use completed candles only.
-    combined = combined[combined["time"] < pd.Timestamp(now)]
+    combined = pd.concat(frames, ignore_index=True)
+    combined["time"] = pd.to_datetime(combined["time"], utc=True, errors="coerce")
+    combined = combined.dropna(subset=["time", "open", "high", "low", "close"])
+    combined = combined.drop_duplicates(subset=["time"]).sort_values("time")
+    combined = combined[combined["time"] < pd.Timestamp(datetime.now(timezone.utc).replace(second=0, microsecond=0))]
     combined = combined.tail(TARGET_CANDLES).reset_index(drop=True)
 
-    if len(combined) < TARGET_CANDLES:
+    if len(combined) < 60:
         raise RuntimeError(
-            f"{len(combined):,}/{TARGET_CANDLES:,} mum alınabildi. "
-            "Veri sağlayıcısının geçmiş/plan/API kotası yetersiz olabilir."
+            f"Yalnızca {len(combined):,} tamamlanmış mum alındı; sinyal için en az 60 mum gerekli."
         )
 
-    return combined, "Twelve Data historical"
+    source = f"Yahoo Finance (anahtarsız, {yahoo_symbol}) + yerel SQLite önbelleği"
+    return combined, source
 
 
 def rsi_calc(close, period=14):
@@ -563,17 +561,17 @@ st.title("📊 Velora — 100K Mum / 1 Dakika")
 st.caption("BUY / SELL teknik tarayıcı • Binance kullanmaz • Emir göndermez")
 
 st.warning(
-    "Gerçek Binomo OTC mumları bu uygulamada bulunmuyor. "
-    "OTC etiketi taşıyan varlıklarda sağlayıcıdan gelen temel piyasa verisi "
-    "kullanılabilir; bu, Binomo OTC fiyatı değildir. Sağlayıcıda sembol veya "
-    "100.000 mum geçmişi yoksa uygulama hatayı açıkça gösterir."
+    "Bu sürüm API anahtarı istemez; Yahoo Finance'in anahtarsız, resmi olmayan "
+    "grafik uç noktasından son 7 günlük 1 dakikalık veriyi dener. Bu kaynak "
+    "100.000 tarihsel mumu tek seferde sağlayamaz ve tüm sembolleri desteklemez. "
+    "Gerçek Binomo OTC mumları burada bulunmaz. OTC etiketi yalnızca gösterim etiketidir."
 )
 
 st.info(
-    "100.000 adet 1 dakikalık mum yaklaşık 69,4 günlük veri demektir. "
-    "Her varlık için bu kadar geçmişi indirmek çok sayıda API çağrısı ve "
-    "uygun veri planı gerektirebilir. İlk tarama uzun sürebilir; veriler "
-    "SQLite yerel önbelleğinde saklanır."
+    "100.000 adet 1 dakikalık mum yaklaşık 69,4 gün kesintisiz veridir. "
+    "Anahtarsız kaynak sadece sınırlı yakın geçmiş sağlayabilir; SQLite önbelleği "
+    "verileri taramalar arasında biriktirir, ancak geçmişte hiç sunulmayan mumları "
+    "oluşturamaz. Streamlit Cloud yeniden dağıtımlarında yerel önbellek silinebilir."
 )
 
 st.sidebar.header("Tarama ayarları")
@@ -596,25 +594,10 @@ else:
     chosen = list(ASSETS)
 chosen = chosen[:int(asset_limit)]
 
-manual_api_key = st.sidebar.text_input(
-    "Twelve Data API Key",
-    type="password",
-    key="velora_twelve_data_key",
-    help=(
-        "API anahtarınızı buraya yapıştırın. İsterseniz bunun yerine "
-        "Streamlit Secrets içinde TWELVE_DATA_API_KEY tanımlayabilirsiniz."
-    ),
+st.sidebar.success("Anahtar gerekmiyor — Yahoo Finance anahtarsız veri kaynağı")
+st.sidebar.caption(
+    "Not: 1 dakikalık tarihçe sınırlıdır; tüm forex/kripto sembolleri bulunmayabilir."
 )
-API_KEY_OVERRIDE = manual_api_key.strip()
-
-api_key = get_api_key()
-if api_key:
-    st.sidebar.success("Twelve Data API anahtarı bulundu.")
-else:
-    st.sidebar.error(
-        "API anahtarı eksik. Anahtarı yukarıdaki alana yapıştırın "
-        "veya Streamlit Secrets bölümüne ekleyin."
-    )
 
 if "velora_results" not in st.session_state:
     st.session_state.velora_results = []
@@ -625,13 +608,6 @@ st.write(f"Bu taramada seçilen varlık: **{len(chosen)}**")
 st.write(f"Her varlık için hedef: **{TARGET_CANDLES:,} tamamlanmış 1 dakikalık mum**")
 
 if st.button("🔍 100.000 MUM İLE TARAMAYI BAŞLAT", type="primary", use_container_width=True):
-    if not api_key:
-        st.error(
-            "Önce Twelve Data API anahtarını sol menüdeki alana yapıştırın "
-            "veya Streamlit Secrets bölümüne TWELVE_DATA_API_KEY ekleyin."
-        )
-        st.stop()
-
     results = []
     progress = st.progress(0)
     status = st.empty()
@@ -663,7 +639,7 @@ if st.button("🔍 100.000 MUM İLE TARAMAYI BAŞLAT", type="primary", use_conta
 
 results = st.session_state.velora_results
 if not results:
-    st.info("Tarama başlatılmadı. API anahtarını ekledikten sonra taramayı başlat.")
+    st.info("Tarama henüz başlatılmadı. Anahtarsız veri kaynağını denemek için taramayı başlat.")
     st.stop()
 
 valid = [r for r in results if r.get("candles") is not None and not r.get("error")]
@@ -694,6 +670,7 @@ if signals:
         "RSI": r.get("rsi"),
         "ADX": r.get("adx"),
         "Mum sayısı": r.get("count"),
+        "100K ilerleme %": round(min(100, r.get("count", 0) / TARGET_CANDLES * 100), 2),
         "Kaynak": r.get("source"),
         "Gerekçe": r.get("reason"),
     } for r in signals]), use_container_width=True, hide_index=True)
@@ -711,6 +688,7 @@ if shown:
         "Skor": r.get("score"),
         "Mum sayısı": r.get("count"),
         "100K tamamlandı": r.get("count") == TARGET_CANDLES,
+        "100K ilerleme %": round(min(100, r.get("count", 0) / TARGET_CANDLES * 100), 2),
         "Kaynak": r.get("source"),
     } for r in shown]), use_container_width=True, hide_index=True)
 
@@ -768,8 +746,8 @@ if results:
 
 st.divider()
 st.caption(
-    "Velora yalnızca teknik analiz yapar; emir göndermez. 100.000 mum hedefi, "
-    "veri sağlayıcısının tarihçe, sembol ve API kotasıyla sınırlıdır. "
-    "Sinyal skoru kazanma olasılığı değildir. OTC olarak işaretlenen varlıklarda "
-    "gerçek Binomo OTC fiyatı kullanılmıyor."
+    "Velora yalnızca teknik analiz yapar; emir göndermez. Anahtarsız intraday kaynak "
+    "resmi olmayan ve sınırlı olabilir; 100.000 mum hedefi garanti değildir. "
+    "Sinyal skoru kazanma olasılığı değildir. OTC etiketli varlıklarda gerçek "
+    "Binomo OTC fiyatı kullanılmıyor."
 )
