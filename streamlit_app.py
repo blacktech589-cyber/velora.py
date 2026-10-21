@@ -1,95 +1,102 @@
 
 import time
 import warnings
-
-import ccxt
+import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
+
 from sklearn.preprocessing import MinMaxScaler
 
 warnings.filterwarnings("ignore")
 
-# TensorFlow is optional at runtime.
+# TensorFlow is optional. The technical scanner works without it.
 try:
     import tensorflow as tf
     from tensorflow.keras import Sequential
-    from tensorflow.keras.layers import LSTM, Dense, Input, Dropout
-
+    from tensorflow.keras.layers import Input, LSTM, Dense, Dropout
     TF_AVAILABLE = True
 except Exception:
     tf = None
     TF_AVAILABLE = False
 
 
-# ============================================================
-# PAGE CONFIG
-# ============================================================
+# =========================================================
+# PAGE
+# =========================================================
 
 st.set_page_config(
-    page_title="AI Crypto Signal Scanner",
-    page_icon="📊",
+    page_title="Velora AI Crypto Scanner",
+    page_icon="📈",
     layout="wide",
 )
 
-st.title("📊 AI Crypto Signal Scanner")
+st.title("📈 Velora AI Crypto Scanner")
 st.caption(
-    "Analysis only — no order execution. Public Binance prices may differ "
-    "from Binomo OTC prices. Signals are not guarantees of profit."
+    "Analysis only — no order execution. Binance prices may differ "
+    "from Binomo OTC prices. Signals do not guarantee profit."
 )
 
-
-# ============================================================
-# CONSTANTS
-# ============================================================
+API_BASE = "https://api.binance.com"
+HTTP = requests.Session()
+HTTP.headers.update({"User-Agent": "Velora-Crypto-Scanner/1.0"})
 
 STABLECOINS = {
     "USDC", "FDUSD", "TUSD", "USDP", "DAI", "USDE",
     "BUSD", "UST", "USTC", "EUR", "AEUR", "EURI",
 }
 
-LEVERAGED_SUFFIXES = (
-    "UP", "DOWN", "BULL", "BEAR",
-)
+LEVERAGED_SUFFIXES = ("UP", "DOWN", "BULL", "BEAR")
 
 TIMEFRAMES = ["5m", "15m", "30m", "1h", "4h", "1d"]
 
 
-# ============================================================
-# BINANCE CONNECTION
-# ============================================================
+# =========================================================
+# BINANCE PUBLIC REST API — NO CCXT REQUIRED
+# =========================================================
 
-@st.cache_resource
-def get_exchange():
-    exchange = ccxt.binance({
-        "enableRateLimit": True,
-        "timeout": 20000,
-        "options": {
-            "defaultType": "spot",
-            "adjustForTimeDifference": True,
-        },
-    })
-    return exchange
+def api_get(path, params=None):
+    """GET request to Binance public market-data endpoints."""
+    url = API_BASE + path
+    response = HTTP.get(url, params=params, timeout=20)
+    response.raise_for_status()
+
+    data = response.json()
+
+    if isinstance(data, dict) and "code" in data and data["code"] < 0:
+        raise RuntimeError(data.get("msg", "Binance API error"))
+
+    return data
 
 
-def get_spot_universe(exchange, limit=50):
-    """Return liquid, active Binance USDT spot markets."""
-    markets = exchange.load_markets()
-    tickers = exchange.fetch_tickers()
+def get_coin_universe(limit=50):
+    """
+    Find active Binance Spot USDT pairs and rank them by
+    24-hour quote volume.
+    """
+    exchange_info = api_get("/api/v3/exchangeInfo")
+    tickers = api_get("/api/v3/ticker/24hr")
+
+    ticker_map = {
+        item.get("symbol"): item
+        for item in tickers
+        if item.get("symbol")
+    }
 
     rows = []
 
-    for symbol, market in markets.items():
-        if not market.get("active", True):
+    for market in exchange_info.get("symbols", []):
+        symbol = market.get("symbol", "")
+        base = market.get("baseAsset", "")
+
+        if market.get("status") != "TRADING":
             continue
 
-        if not market.get("spot", False):
+        if market.get("isSpotTradingAllowed") is False:
             continue
 
-        if not symbol.endswith("/USDT"):
+        if market.get("quoteAsset") != "USDT":
             continue
-
-        base = market.get("base", "")
 
         if base in STABLECOINS:
             continue
@@ -97,38 +104,37 @@ def get_spot_universe(exchange, limit=50):
         if any(base.endswith(suffix) for suffix in LEVERAGED_SUFFIXES):
             continue
 
-        ticker = tickers.get(symbol, {})
-        last_price = ticker.get("last")
-        quote_volume = ticker.get("quoteVolume")
-        percentage = ticker.get("percentage")
+        ticker = ticker_map.get(symbol)
+        if not ticker:
+            continue
 
         try:
-            last_price = float(last_price)
-            quote_volume = float(quote_volume or 0)
-            percentage = float(percentage or 0)
+            price = float(ticker.get("lastPrice", 0))
+            volume = float(ticker.get("quoteVolume", 0))
+            change = float(ticker.get("priceChangePercent", 0))
         except (TypeError, ValueError):
             continue
 
-        if not np.isfinite(last_price) or last_price <= 0:
+        if not np.isfinite(price) or price <= 0:
             continue
 
-        if not np.isfinite(quote_volume) or quote_volume <= 0:
+        if not np.isfinite(volume) or volume <= 0:
             continue
 
-        if not np.isfinite(percentage):
-            percentage = 0.0
+        if not np.isfinite(change):
+            change = 0.0
 
         rows.append({
             "Coin": base,
             "Symbol": symbol,
-            "Price": last_price,
-            "24h Volume (USDT)": quote_volume,
-            "24h Change (%)": percentage,
+            "Price": price,
+            "24h Volume (USDT)": volume,
+            "24h Change (%)": change,
         })
 
     if not rows:
         raise RuntimeError(
-            "No eligible Binance Spot USDT markets were returned."
+            "Binance did not return eligible USDT Spot pairs."
         )
 
     result = pd.DataFrame(rows)
@@ -139,57 +145,78 @@ def get_spot_universe(exchange, limit=50):
     return result.reset_index(drop=True)
 
 
-# ============================================================
-# MARKET DATA
-# ============================================================
+def timeframe_milliseconds(timeframe):
+    units = {
+        "m": 60_000,
+        "h": 3_600_000,
+        "d": 86_400_000,
+    }
 
-def fetch_candles(exchange, symbol, timeframe, requested=300):
-    """Fetch OHLCV candles and remove the latest possibly incomplete candle."""
-    candles = exchange.fetch_ohlcv(
-        symbol,
-        timeframe=timeframe,
-        limit=int(requested),
+    number = int(timeframe[:-1])
+    unit = timeframe[-1]
+
+    if unit not in units:
+        raise ValueError("Unsupported timeframe")
+
+    return number * units[unit]
+
+
+def get_candles(symbol, timeframe="15m", limit=300):
+    """
+    Retrieve candles from Binance.
+    Remove the last candle if it has not closed yet.
+    """
+    raw = api_get(
+        "/api/v3/klines",
+        {
+            "symbol": symbol,
+            "interval": timeframe,
+            "limit": min(int(limit), 1000),
+        },
     )
 
-    if not candles or len(candles) < 60:
-        raise ValueError("Not enough candle data.")
+    if not raw:
+        raise RuntimeError("No candles returned")
 
-    df = pd.DataFrame(
-        candles,
-        columns=[
-            "timestamp", "open", "high", "low",
-            "close", "volume",
-        ],
-    )
-
-    df["timestamp"] = pd.to_datetime(
-        df["timestamp"], unit="ms", utc=True
-    )
-
-    numeric_columns = [
-        "open", "high", "low", "close", "volume"
+    columns = [
+        "open_time", "open", "high", "low", "close",
+        "volume", "close_time", "quote_volume",
+        "trade_count", "taker_buy_base",
+        "taker_buy_quote", "ignore",
     ]
 
-    for col in numeric_columns:
+    df = pd.DataFrame(raw, columns=columns)
+
+    df["timestamp"] = pd.to_datetime(
+        df["open_time"], unit="ms", utc=True
+    )
+
+    for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df = df.dropna(subset=numeric_columns)
-    df = df.drop_duplicates(subset=["timestamp"])
-    df = df.sort_values("timestamp").reset_index(drop=True)
+    df["close_time"] = pd.to_numeric(
+        df["close_time"], errors="coerce"
+    )
 
-    # The latest returned candle may still be forming.
-    if len(df) > 60:
+    df = df.dropna(
+        subset=["open", "high", "low", "close", "volume"]
+    )
+
+    now_ms = int(time.time() * 1000)
+
+    # Binance closeTime is the last millisecond of a candle.
+    if len(df) and int(df.iloc[-1]["close_time"]) >= now_ms:
         df = df.iloc[:-1].copy()
 
     if len(df) < 60:
-        raise ValueError("Not enough completed candles.")
+        raise RuntimeError("Not enough completed candles")
 
     return df.reset_index(drop=True)
 
 
-# ============================================================
+# =========================================================
 # TECHNICAL INDICATORS
-# ============================================================
+# =========================================================
 
 def add_indicators(df):
     df = df.copy()
@@ -199,33 +226,33 @@ def add_indicators(df):
     low = df["low"]
     volume = df["volume"]
 
-    # Moving averages
+    # EMA
     df["EMA15"] = close.ewm(span=15, adjust=False).mean()
     df["EMA20"] = close.ewm(span=20, adjust=False).mean()
     df["EMA50"] = close.ewm(span=50, adjust=False).mean()
 
     # Bollinger Bands
     df["BB_MID"] = close.rolling(20).mean()
-    bb_std = close.rolling(20).std(ddof=0)
-    df["BB_UPPER"] = df["BB_MID"] + 2 * bb_std
-    df["BB_LOWER"] = df["BB_MID"] - 2 * bb_std
+    std = close.rolling(20).std(ddof=0)
+
+    df["BB_UPPER"] = df["BB_MID"] + 2 * std
+    df["BB_LOWER"] = df["BB_MID"] - 2 * std
 
     # RSI
     delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    gains = delta.clip(lower=0)
+    losses = -delta.clip(upper=0)
 
-    avg_gain = gain.ewm(
+    avg_gain = gains.ewm(
         alpha=1 / 14, min_periods=14, adjust=False
     ).mean()
 
-    avg_loss = loss.ewm(
+    avg_loss = losses.ewm(
         alpha=1 / 14, min_periods=14, adjust=False
     ).mean()
 
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    df["RSI"] = 100 - (100 / (1 + rs))
-    df["RSI"] = df["RSI"].fillna(50)
+    df["RSI"] = (100 - 100 / (1 + rs)).fillna(50)
 
     # MACD
     ema12 = close.ewm(span=12, adjust=False).mean()
@@ -237,34 +264,34 @@ def add_indicators(df):
     ).mean()
     df["MACD_HIST"] = df["MACD"] - df["MACD_SIGNAL"]
 
-    # Stochastic oscillator
-    lowest_low = low.rolling(14).min()
-    highest_high = high.rolling(14).max()
-    denominator = (highest_high - lowest_low).replace(0, np.nan)
+    # Stochastic
+    lowest = low.rolling(14).min()
+    highest = high.rolling(14).max()
+    denominator = (highest - lowest).replace(0, np.nan)
 
     df["STOCH_K"] = (
-        100 * (close - lowest_low) / denominator
+        100 * (close - lowest) / denominator
     ).fillna(50)
 
     df["STOCH_D"] = df["STOCH_K"].rolling(3).mean().fillna(50)
 
     # ATR
-    previous_close = close.shift(1)
+    prev_close = close.shift(1)
 
-    tr = pd.concat(
+    true_range = pd.concat(
         [
             high - low,
-            (high - previous_close).abs(),
-            (low - previous_close).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
         ],
         axis=1,
     ).max(axis=1)
 
-    df["ATR"] = tr.ewm(
+    df["ATR"] = true_range.ewm(
         alpha=1 / 14, min_periods=14, adjust=False
     ).mean()
 
-    # ADX and directional indicators
+    # Directional movement and ADX
     up_move = high.diff()
     down_move = -low.diff()
 
@@ -286,21 +313,23 @@ def add_indicators(df):
         index=df.index,
     )
 
-    atr_safe = df["ATR"].replace(0, np.nan)
+    safe_atr = df["ATR"].replace(0, np.nan)
 
     df["PLUS_DI"] = (
         100 * plus_dm.ewm(
             alpha=1 / 14, min_periods=14, adjust=False
-        ).mean() / atr_safe
+        ).mean() / safe_atr
     )
 
     df["MINUS_DI"] = (
         100 * minus_dm.ewm(
             alpha=1 / 14, min_periods=14, adjust=False
-        ).mean() / atr_safe
+        ).mean() / safe_atr
     )
 
-    di_sum = (df["PLUS_DI"] + df["MINUS_DI"]).replace(0, np.nan)
+    di_sum = (
+        df["PLUS_DI"] + df["MINUS_DI"]
+    ).replace(0, np.nan)
 
     dx = (
         100 * (df["PLUS_DI"] - df["MINUS_DI"]).abs() / di_sum
@@ -310,30 +339,25 @@ def add_indicators(df):
         alpha=1 / 14, min_periods=14, adjust=False
     ).mean()
 
-    # Volume confirmation
     df["VOLUME_AVG20"] = volume.rolling(20).mean()
-
-    # Recent candle direction
-    df["CANDLE_GREEN"] = df["close"] > df["open"]
-    df["CANDLE_RED"] = df["close"] < df["open"]
 
     return df.replace([np.inf, -np.inf], np.nan)
 
 
-# ============================================================
-# SIGNAL ENGINE
-# ============================================================
+# =========================================================
+# BUY / SELL SIGNAL ENGINE
+# =========================================================
 
-def generate_signal(df):
+def analyze_signal(df):
     latest = df.iloc[-1]
     previous = df.iloc[-2]
 
     required = [
         "close", "EMA15", "EMA20", "EMA50",
         "BB_UPPER", "BB_LOWER", "RSI",
-        "MACD", "MACD_SIGNAL", "STOCH_K",
-        "STOCH_D", "PLUS_DI", "MINUS_DI",
-        "ADX", "VOLUME_AVG20",
+        "MACD", "MACD_SIGNAL", "MACD_HIST",
+        "STOCH_K", "STOCH_D", "PLUS_DI",
+        "MINUS_DI", "ADX", "VOLUME_AVG20",
     ]
 
     if latest[required].isna().any():
@@ -341,63 +365,71 @@ def generate_signal(df):
             "Signal": "NO SIGNAL",
             "Buy Votes": 0,
             "Sell Votes": 0,
-            "Reasons": "Indicator data incomplete",
             "Confidence": 0,
+            "RSI": np.nan,
+            "ADX": np.nan,
+            "ATR (%)": np.nan,
+            "Reasons": "Indicator values incomplete",
         }
 
     price = float(latest["close"])
-    buy_votes = 0
-    sell_votes = 0
+    buy = 0
+    sell = 0
     buy_reasons = []
     sell_reasons = []
 
-    # Trend
+    # EMA trend
     if latest["EMA15"] > latest["EMA20"] > latest["EMA50"]:
-        buy_votes += 1
-        buy_reasons.append("EMA bullish alignment")
+        buy += 1
+        buy_reasons.append("EMA bullish trend")
 
     elif latest["EMA15"] < latest["EMA20"] < latest["EMA50"]:
-        sell_votes += 1
-        sell_reasons.append("EMA bearish alignment")
+        sell += 1
+        sell_reasons.append("EMA bearish trend")
 
-    # Bollinger Bands: use a return from outside the band rather
-    # than automatically selling/buying every band touch.
+    # Bollinger Band re-entry
     if (
         previous["close"] < previous["BB_LOWER"]
         and price > latest["BB_LOWER"]
     ):
-        buy_votes += 1
-        buy_reasons.append("Price returned above lower Bollinger Band")
+        buy += 1
+        buy_reasons.append("Bollinger lower-band recovery")
 
     if (
         previous["close"] > previous["BB_UPPER"]
         and price < latest["BB_UPPER"]
     ):
-        sell_votes += 1
-        sell_reasons.append("Price returned below upper Bollinger Band")
+        sell += 1
+        sell_reasons.append("Bollinger upper-band rejection")
 
     # RSI
-    if 30 <= latest["RSI"] <= 45 and latest["RSI"] > previous["RSI"]:
-        buy_votes += 1
-        buy_reasons.append("RSI recovering from lower zone")
+    if (
+        30 <= latest["RSI"] <= 45
+        and latest["RSI"] > previous["RSI"]
+    ):
+        buy += 1
+        buy_reasons.append("RSI recovering")
 
-    elif 55 <= latest["RSI"] <= 70 and latest["RSI"] < previous["RSI"]:
-        sell_votes += 1
-        sell_reasons.append("RSI weakening from upper zone")
+    elif (
+        55 <= latest["RSI"] <= 70
+        and latest["RSI"] < previous["RSI"]
+    ):
+        sell += 1
+        sell_reasons.append("RSI weakening")
 
     # MACD
     if (
         latest["MACD"] > latest["MACD_SIGNAL"]
         and latest["MACD_HIST"] > previous["MACD_HIST"]
     ):
-        buy_votes += 1
+        buy += 1
         buy_reasons.append("MACD bullish momentum")
 
     elif (
         latest["MACD"] < latest["MACD_SIGNAL"]
         and latest["MACD_HIST"] < previous["MACD_HIST"]
     ):
-        sell_votes += 1
+        sell += 1
         sell_reasons.append("MACD bearish momentum")
 
     # Stochastic
@@ -405,50 +437,50 @@ def generate_signal(df):
         latest["STOCH_K"] > latest["STOCH_D"]
         and latest["STOCH_K"] < 35
     ):
-        buy_votes += 1
-        buy_reasons.append("Stochastic bullish crossover")
+        buy += 1
+        buy_reasons.append("Stochastic bullish signal")
 
     elif (
         latest["STOCH_K"] < latest["STOCH_D"]
         and latest["STOCH_K"] > 65
     ):
-        sell_votes += 1
-        sell_reasons.append("Stochastic bearish crossover")
+        sell += 1
+        sell_reasons.append("Stochastic bearish signal")
 
-    # Directional movement
-    if latest["PLUS_DI"] > latest["MINUS_DI"] and latest["ADX"] >= 18:
-        buy_votes += 1
-        buy_reasons.append("Positive directional trend")
+    # ADX directional confirmation
+    if latest["ADX"] >= 18:
+        if latest["PLUS_DI"] > latest["MINUS_DI"]:
+            buy += 1
+            buy_reasons.append("Positive directional trend")
+        elif latest["MINUS_DI"] > latest["PLUS_DI"]:
+            sell += 1
+            sell_reasons.append("Negative directional trend")
 
-    elif latest["MINUS_DI"] > latest["PLUS_DI"] and latest["ADX"] >= 18:
-        sell_votes += 1
-        sell_reasons.append("Negative directional trend")
-
-    # Candle and volume confirmation
+    # Volume confirmation
     volume_confirmed = (
         latest["VOLUME_AVG20"] > 0
         and latest["volume"] >= latest["VOLUME_AVG20"]
     )
 
-    if volume_confirmed and latest["CANDLE_GREEN"]:
-        buy_votes += 1
-        buy_reasons.append("Green candle with above-average volume")
+    if volume_confirmed and latest["close"] > latest["open"]:
+        buy += 1
+        buy_reasons.append("Green candle with strong volume")
 
-    elif volume_confirmed and latest["CANDLE_RED"]:
-        sell_votes += 1
-        sell_reasons.append("Red candle with above-average volume")
+    elif volume_confirmed and latest["close"] < latest["open"]:
+        sell += 1
+        sell_reasons.append("Red candle with strong volume")
 
-    margin = abs(buy_votes - sell_votes)
+    margin = abs(buy - sell)
 
-    if buy_votes >= 4 and margin >= 2:
+    if buy >= 4 and margin >= 2:
         signal = "BUY"
         reasons = "; ".join(buy_reasons)
-        confidence = min(95, int(50 + buy_votes * 7 + margin * 3))
+        confidence = min(95, 50 + buy * 7 + margin * 3)
 
-    elif sell_votes >= 4 and margin >= 2:
+    elif sell >= 4 and margin >= 2:
         signal = "SELL"
         reasons = "; ".join(sell_reasons)
-        confidence = min(95, int(50 + sell_votes * 7 + margin * 3))
+        confidence = min(95, 50 + sell * 7 + margin * 3)
 
     else:
         signal = "NO SIGNAL"
@@ -463,34 +495,26 @@ def generate_signal(df):
 
     return {
         "Signal": signal,
-        "Buy Votes": int(buy_votes),
-        "Sell Votes": int(sell_votes),
-        "Reasons": reasons,
-        "Confidence": confidence,
-        "Price": price,
+        "Buy Votes": int(buy),
+        "Sell Votes": int(sell),
+        "Confidence": int(confidence),
         "RSI": float(latest["RSI"]),
         "ADX": float(latest["ADX"]),
         "ATR (%)": atr_percent,
-        "EMA20": float(latest["EMA20"]),
-        "EMA50": float(latest["EMA50"]),
+        "Reasons": reasons,
         "Last Candle (UTC)": str(latest["timestamp"]),
     }
 
 
-# ============================================================
+# =========================================================
 # OPTIONAL TENSORFLOW LSTM
-# ============================================================
+# =========================================================
 
-def lstm_predict_direction(df, epochs=3):
-    """
-    Small per-coin LSTM direction classifier.
-    Returns UP, DOWN, or UNKNOWN.
-    Uses historical close prices only; it is not a guarantee.
-    """
+def predict_lstm(df, epochs=3):
     if not TF_AVAILABLE:
-        return "UNKNOWN", np.nan
+        return "UNAVAILABLE", np.nan
 
-    prices = df["close"].astype(float).values.reshape(-1, 1)
+    prices = df["close"].values.astype(float).reshape(-1, 1)
 
     if len(prices) < 100:
         return "UNKNOWN", np.nan
@@ -499,8 +523,7 @@ def lstm_predict_direction(df, epochs=3):
     scaled = scaler.fit_transform(prices)
 
     window = 30
-    X = []
-    y = []
+    X, y = [], []
 
     for i in range(window, len(scaled) - 1):
         X.append(scaled[i - window:i, 0])
@@ -508,18 +531,16 @@ def lstm_predict_direction(df, epochs=3):
             1 if scaled[i + 1, 0] > scaled[i, 0] else 0
         )
 
-    if len(X) < 40:
+    if len(X) < 50:
         return "UNKNOWN", np.nan
 
     X = np.asarray(X, dtype=np.float32).reshape(-1, window, 1)
     y = np.asarray(y, dtype=np.float32)
 
-    # Use a chronological split; do not shuffle future and past data.
     split = int(len(X) * 0.85)
+
     if split < 30 or len(X) - split < 5:
         return "UNKNOWN", np.nan
-
-    X_train, y_train = X[:split], y[:split]
 
     try:
         tf.keras.backend.clear_session()
@@ -539,32 +560,168 @@ def lstm_predict_direction(df, epochs=3):
         )
 
         model.fit(
-            X_train,
-            y_train,
+            X[:split],
+            y[:split],
             epochs=int(epochs),
             batch_size=32,
             verbose=0,
+            shuffle=False,
         )
 
-        prediction = float(
-            model.predict(X[-1:].astype(np.float32), verbose=0)[0][0]
+        probability = float(
+            model.predict(X[-1:], verbose=0)[0][0]
         )
 
-        if prediction >= 0.55:
-            return "UP", prediction
+        if probability >= 0.55:
+            return "UP", probability
 
-        if prediction <= 0.45:
-            return "DOWN", prediction
+        if probability <= 0.45:
+            return "DOWN", probability
 
-        return "UNKNOWN", prediction
+        return "UNCERTAIN", probability
 
     except Exception:
-        return "UNKNOWN", np.nan
+        return "ERROR", np.nan
 
 
-# ============================================================
+# =========================================================
+# SCAN
+# =========================================================
+
+def scan_market(
+    timeframe,
+    coin_limit,
+    candle_count,
+    minimum_volume,
+    use_lstm,
+    lstm_epochs,
+):
+    universe = get_coin_universe(coin_limit)
+
+    universe = universe[
+        universe["24h Volume (USDT)"] >= minimum_volume
+    ].copy()
+
+    if universe.empty:
+        return pd.DataFrame()
+
+    records = universe.to_dict("records")
+    results = []
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    lstm_count = 0
+    max_lstm_models = 10
+
+    for index, coin in enumerate(records, start=1):
+        symbol = coin["Symbol"]
+
+        status.write(
+            f"Scanning {symbol} — {index}/{len(records)}"
+        )
+
+        row = dict(coin)
+        row.update({
+            "Signal": "NO SIGNAL",
+            "Buy Votes": 0,
+            "Sell Votes": 0,
+            "Confidence": 0,
+            "RSI": np.nan,
+            "ADX": np.nan,
+            "ATR (%)": np.nan,
+            "LSTM": "OFF" if not use_lstm else "PENDING",
+            "Reasons": "",
+        })
+
+        try:
+            candles = get_candles(
+                symbol,
+                timeframe=timeframe,
+                limit=candle_count,
+            )
+
+            indicators = add_indicators(candles)
+            signal_data = analyze_signal(indicators)
+            row.update(signal_data)
+
+            if use_lstm and signal_data["Signal"] in ("BUY", "SELL"):
+                if not TF_AVAILABLE:
+                    row["LSTM"] = "UNAVAILABLE"
+                    row["Reasons"] += "; TensorFlow unavailable"
+
+                elif lstm_count < max_lstm_models:
+                    lstm_count += 1
+
+                    direction, probability = predict_lstm(
+                        indicators,
+                        epochs=lstm_epochs,
+                    )
+
+                    row["LSTM"] = direction
+                    row["LSTM Probability"] = probability
+
+                    # Do not accept a signal if the model confidently
+                    # predicts the opposite direction.
+                    if (
+                        row["Signal"] == "BUY"
+                        and direction == "DOWN"
+                    ):
+                        row["Signal"] = "NO SIGNAL"
+                        row["Reasons"] += "; LSTM disagrees"
+
+                    elif (
+                        row["Signal"] == "SELL"
+                        and direction == "UP"
+                    ):
+                        row["Signal"] = "NO SIGNAL"
+                        row["Reasons"] += "; LSTM disagrees"
+
+                else:
+                    row["LSTM"] = "SKIPPED"
+
+        except Exception as exc:
+            row["Signal"] = "NO SIGNAL"
+            row["Reasons"] = f"Data error: {str(exc)[:120]}"
+
+        results.append(row)
+        progress.progress(index / len(records))
+
+        # Small delay to reduce request pressure.
+        time.sleep(0.08)
+
+    progress.empty()
+    status.empty()
+
+    result_df = pd.DataFrame(results)
+
+    result_df["Vote Margin"] = (
+        result_df["Buy Votes"].fillna(0)
+        - result_df["Sell Votes"].fillna(0)
+    ).abs()
+
+    result_df["Priority"] = result_df["Signal"].map({
+        "BUY": 0,
+        "SELL": 1,
+        "NO SIGNAL": 2,
+    }).fillna(3)
+
+    result_df = result_df.sort_values(
+        [
+            "Priority",
+            "Confidence",
+            "Vote Margin",
+            "24h Volume (USDT)",
+        ],
+        ascending=[True, False, False, False],
+    ).reset_index(drop=True)
+
+    return result_df
+
+
+# =========================================================
 # SIDEBAR
-# ============================================================
+# =========================================================
 
 st.sidebar.header("Scanner Settings")
 
@@ -575,7 +732,7 @@ timeframe = st.sidebar.selectbox(
 )
 
 coin_limit = st.sidebar.slider(
-    "Number of coins to scan",
+    "Coins to scan",
     min_value=10,
     max_value=100,
     value=50,
@@ -588,23 +745,23 @@ candle_count = st.sidebar.selectbox(
     index=2,
 )
 
-use_lstm = st.sidebar.checkbox(
-    "Enable TensorFlow LSTM confirmation",
-    value=False,
-)
-
-lstm_epochs = st.sidebar.selectbox(
-    "LSTM training epochs",
-    [2, 3, 5],
-    index=1,
-    disabled=not use_lstm,
-)
-
-min_volume = st.sidebar.number_input(
+minimum_volume = st.sidebar.number_input(
     "Minimum 24h volume (USDT)",
     min_value=0,
     value=1_000_000,
     step=500_000,
+)
+
+use_lstm = st.sidebar.checkbox(
+    "Enable TensorFlow LSTM",
+    value=False,
+)
+
+lstm_epochs = st.sidebar.selectbox(
+    "LSTM epochs",
+    [2, 3, 5],
+    index=1,
+    disabled=not use_lstm,
 )
 
 scan_button = st.sidebar.button(
@@ -614,391 +771,214 @@ scan_button = st.sidebar.button(
 )
 
 st.sidebar.caption(
-    "The LSTM option may significantly increase scan time. "
-    "No exchange orders are placed."
+    "LSTM training can take additional time. "
+    "The app never submits exchange orders."
 )
 
 
-# ============================================================
-# SCAN FUNCTION
-# ============================================================
+# =========================================================
+# MAIN DASHBOARD
+# =========================================================
 
-def run_scan(exchange, timeframe, coin_limit, candle_count,
-             min_volume, use_lstm, lstm_epochs):
-
-    universe = get_spot_universe(exchange, limit=coin_limit)
-    universe = universe[
-        universe["24h Volume (USDT)"] >= float(min_volume)
-    ].copy()
-
-    if universe.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    results = []
-    progress = st.progress(0)
-    status = st.empty()
-
-    records = universe.to_dict("records")
-    total = len(records)
-
-    # Limit expensive LSTM training to the first 10 coins by volume
-    # that produce an actionable technical signal.
-    lstm_candidates_used = 0
-    max_lstm_candidates = 10
-
-    for i, item in enumerate(records, start=1):
-        symbol = item["Symbol"]
-
-        status.write(f"Scanning {symbol} ({i}/{total})...")
-
-        row = {
-            "Coin": item["Coin"],
-            "Symbol": symbol,
-            "Price": item["Price"],
-            "24h Volume (USDT)": item["24h Volume (USDT)"],
-            "24h Change (%)": item["24h Change (%)"],
-            "Signal": "NO SIGNAL",
-            "Buy Votes": 0,
-            "Sell Votes": 0,
-            "Confidence": 0,
-            "RSI": np.nan,
-            "ADX": np.nan,
-            "ATR (%)": np.nan,
-            "LSTM": "OFF" if not use_lstm else "PENDING",
-            "Reasons": "",
-            "Last Candle (UTC)": "",
-        }
-
-        try:
-            candles = fetch_candles(
-                exchange,
-                symbol,
-                timeframe,
-                requested=candle_count,
-            )
-
-            df = add_indicators(candles)
-            signal_info = generate_signal(df)
-
-            row.update(signal_info)
-
-            # Keep original universe price and volume values.
-            row["Coin"] = item["Coin"]
-            row["Symbol"] = symbol
-            row["24h Volume (USDT)"] = item["24h Volume (USDT)"]
-            row["24h Change (%)"] = item["24h Change (%)"]
-
-            if use_lstm and signal_info["Signal"] in ("BUY", "SELL"):
-                if lstm_candidates_used < max_lstm_candidates:
-                    lstm_candidates_used += 1
-
-                    direction, probability = lstm_predict_direction(
-                        df,
-                        epochs=lstm_epochs,
-                    )
-
-                    row["LSTM"] = direction
-                    row["LSTM Probability"] = probability
-
-                    # Require model agreement if the model produced
-                    # a confident direction.
-                    if (
-                        signal_info["Signal"] == "BUY"
-                        and direction == "DOWN"
-                    ):
-                        row["Signal"] = "NO SIGNAL"
-                        row["Reasons"] = (
-                            str(row.get("Reasons", ""))
-                            + "; LSTM disagrees"
-                        )
-
-                    elif (
-                        signal_info["Signal"] == "SELL"
-                        and direction == "UP"
-                    ):
-                        row["Signal"] = "NO SIGNAL"
-                        row["Reasons"] = (
-                            str(row.get("Reasons", ""))
-                            + "; LSTM disagrees"
-                        )
-
-                    elif direction == "UNKNOWN":
-                        row["Reasons"] = (
-                            str(row.get("Reasons", ""))
-                            + "; LSTM uncertain"
-                        )
-                else:
-                    row["LSTM"] = "SKIPPED (limit)"
-
-            results.append(row)
-
-        except Exception as exc:
-            row["Reasons"] = f"Data error: {str(exc)[:160]}"
-            results.append(row)
-
-        progress.progress(i / total)
-        time.sleep(0.05)
-
-    status.empty()
-    progress.empty()
-
-    results_df = pd.DataFrame(results)
-
-    if results_df.empty:
-        return universe, results_df
-
-    # Priority: actionable signals first, then stronger vote margin,
-    # then higher 24h volume.
-    results_df["Vote Margin"] = (
-        results_df["Buy Votes"].fillna(0)
-        - results_df["Sell Votes"].fillna(0)
-    ).abs()
-
-    results_df["Priority"] = results_df["Signal"].map({
-        "BUY": 0,
-        "SELL": 1,
-        "NO SIGNAL": 2,
-    }).fillna(3)
-
-    results_df = results_df.sort_values(
-        by=[
-            "Priority",
-            "Confidence",
-            "Vote Margin",
-            "24h Volume (USDT)",
-        ],
-        ascending=[True, False, False, False],
-    ).reset_index(drop=True)
-
-    return universe, results_df
-
-
-# ============================================================
-# MAIN PANEL
-# ============================================================
-
-if "scan_results" not in st.session_state:
-    st.session_state["scan_results"] = None
-
-if "scan_universe" not in st.session_state:
-    st.session_state["scan_universe"] = None
+if "velora_results" not in st.session_state:
+    st.session_state["velora_results"] = None
 
 if scan_button:
     try:
-        with st.spinner("Connecting to Binance public market data..."):
-            exchange = get_exchange()
-
-            universe, results = run_scan(
-                exchange=exchange,
+        with st.spinner("Connecting to Binance public API..."):
+            st.session_state["velora_results"] = scan_market(
                 timeframe=timeframe,
                 coin_limit=coin_limit,
                 candle_count=candle_count,
-                min_volume=min_volume,
+                minimum_volume=float(minimum_volume),
                 use_lstm=use_lstm,
                 lstm_epochs=lstm_epochs,
             )
 
-            st.session_state["scan_universe"] = universe
-            st.session_state["scan_results"] = results
-
     except Exception as exc:
         st.error(
-            "Scan failed. Check your internet connection, package "
-            "installation, and whether Binance is accessible from "
-            f"your network. Details: {str(exc)}"
+            "Unable to retrieve Binance data. Check your network, "
+            "API access, and requirements.txt. "
+            f"Details: {str(exc)}"
         )
 
-results = st.session_state.get("scan_results")
+results = st.session_state["velora_results"]
 
 if results is None:
-    st.info(
-        "Choose your settings in the sidebar and click **Scan coins** "
-        "to begin."
-    )
-
+    st.info("Choose your settings and click **Scan coins**.")
     st.markdown(
         """
-        **Signal logic**
-        - BUY: bullish technical votes exceed bearish votes sufficiently.
-        - SELL: bearish technical votes exceed bullish votes sufficiently.
-        - NO SIGNAL: indicators are mixed or the signal is too weak.
+        **How signals are generated**
+
+        - **BUY:** enough bullish indicator votes, with a clear margin.
+        - **SELL:** enough bearish indicator votes, with a clear margin.
+        - **NO SIGNAL:** indicators are mixed or insufficient.
         """
+    )
+
+elif results.empty:
+    st.warning(
+        "No eligible coins found. Lower the volume filter and scan again."
     )
 
 else:
-    if results.empty:
+    buys = int((results["Signal"] == "BUY").sum())
+    sells = int((results["Signal"] == "SELL").sum())
+    neutral = int((results["Signal"] == "NO SIGNAL").sum())
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Coins scanned", len(results))
+    col2.metric("BUY", buys)
+    col3.metric("SELL", sells)
+    col4.metric("NO SIGNAL", neutral)
+
+    st.subheader("⭐ Priority coins")
+
+    priority = results[
+        results["Signal"].isin(["BUY", "SELL"])
+    ].copy()
+
+    priority_columns = [
+        "Coin",
+        "Symbol",
+        "Signal",
+        "Price",
+        "24h Change (%)",
+        "24h Volume (USDT)",
+        "Confidence",
+        "Buy Votes",
+        "Sell Votes",
+        "RSI",
+        "ADX",
+        "LSTM",
+    ]
+
+    if priority.empty:
         st.warning(
-            "No results were returned. Lower the minimum volume filter "
-            "or try another timeframe."
+            "No actionable signals were found in this scan. "
+            "Do not force a trade when the conditions are unclear."
         )
     else:
-        buy_count = int((results["Signal"] == "BUY").sum())
-        sell_count = int((results["Signal"] == "SELL").sum())
-        no_signal_count = int((results["Signal"] == "NO SIGNAL").sum())
-
-        c1, c2, c3, c4 = st.columns(4)
-
-        c1.metric("Coins scanned", len(results))
-        c2.metric("BUY signals", buy_count)
-        c3.metric("SELL signals", sell_count)
-        c4.metric("NO SIGNAL", no_signal_count)
-
-        st.subheader("⭐ Priority coins")
-
-        actionable = results[
-            results["Signal"].isin(["BUY", "SELL"])
-        ].copy()
-
-        if actionable.empty:
-            st.warning(
-                "No coins currently meet the signal threshold. "
-                "This is not a reason to force a trade."
-            )
-        else:
-            display_columns = [
-                "Coin",
-                "Signal",
-                "Price",
-                "24h Change (%)",
-                "24h Volume (USDT)",
-                "Confidence",
-                "Buy Votes",
-                "Sell Votes",
-                "RSI",
-                "ADX",
-                "LSTM",
-            ]
-
-            display_columns = [
-                col for col in display_columns
-                if col in actionable.columns
-            ]
-
-            st.dataframe(
-                actionable[display_columns],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        st.subheader("All scanned coins")
-
-        filter_signal = st.multiselect(
-            "Filter by signal",
-            options=["BUY", "SELL", "NO SIGNAL"],
-            default=["BUY", "SELL", "NO SIGNAL"],
-        )
-
-        filtered = results[
-            results["Signal"].isin(filter_signal)
-        ].copy()
-
-        all_columns = [
-            "Coin",
-            "Signal",
-            "Price",
-            "24h Change (%)",
-            "24h Volume (USDT)",
-            "Confidence",
-            "Buy Votes",
-            "Sell Votes",
-            "RSI",
-            "ADX",
-            "ATR (%)",
-            "LSTM",
-            "Reasons",
-            "Last Candle (UTC)",
-        ]
-
-        all_columns = [
-            col for col in all_columns if col in filtered.columns
-        ]
-
         st.dataframe(
-            filtered[all_columns],
+            priority[
+                [c for c in priority_columns if c in priority.columns]
+            ],
             use_container_width=True,
             hide_index=True,
         )
 
-        st.subheader("Coin details")
+    st.subheader("All scanned coins")
 
-        selected_symbol = st.selectbox(
-            "Choose a coin",
-            options=results["Symbol"].tolist(),
+    selected_signals = st.multiselect(
+        "Filter signals",
+        ["BUY", "SELL", "NO SIGNAL"],
+        default=["BUY", "SELL", "NO SIGNAL"],
+    )
+
+    filtered = results[
+        results["Signal"].isin(selected_signals)
+    ].copy()
+
+    table_columns = [
+        "Coin",
+        "Symbol",
+        "Signal",
+        "Price",
+        "24h Change (%)",
+        "24h Volume (USDT)",
+        "Confidence",
+        "Buy Votes",
+        "Sell Votes",
+        "RSI",
+        "ADX",
+        "ATR (%)",
+        "LSTM",
+        "Reasons",
+    ]
+
+    st.dataframe(
+        filtered[
+            [c for c in table_columns if c in filtered.columns]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.subheader("Selected coin details")
+
+    selected_symbol = st.selectbox(
+        "Select a coin",
+        results["Symbol"].tolist(),
+    )
+
+    selected = results[
+        results["Symbol"] == selected_symbol
+    ].iloc[0]
+
+    left, right = st.columns(2)
+
+    with left:
+        st.write(f"**Signal:** {selected['Signal']}")
+        st.write(f"**Price:** {selected['Price']}")
+        st.write(f"**RSI:** {selected.get('RSI', np.nan)}")
+        st.write(f"**ADX:** {selected.get('ADX', np.nan)}")
+
+    with right:
+        st.write(
+            f"**24h change:** {selected['24h Change (%)']:.2f}%"
+        )
+        st.write(
+            f"**24h volume:** "
+            f"{selected['24h Volume (USDT)']:,.0f} USDT"
+        )
+        st.write(
+            f"**Confidence score:** {selected.get('Confidence', 0)}"
+        )
+        st.write(f"**LSTM:** {selected.get('LSTM', 'OFF')}")
+
+    st.write("**Signal explanation**")
+    st.write(selected.get("Reasons", ""))
+
+    st.subheader("Price and indicator chart")
+
+    try:
+        chart = get_candles(
+            selected_symbol,
+            timeframe=timeframe,
+            limit=candle_count,
         )
 
-        selected_row = results[
-            results["Symbol"] == selected_symbol
-        ].iloc[0]
+        chart = add_indicators(chart)
+        chart = chart.set_index("timestamp")
 
-        left, right = st.columns(2)
-
-        with left:
-            st.write(f"**Signal:** {selected_row['Signal']}")
-            st.write(f"**Price:** {selected_row['Price']}")
-            st.write(f"**RSI:** {selected_row.get('RSI', np.nan)}")
-            st.write(f"**ADX:** {selected_row.get('ADX', np.nan)}")
-
-        with right:
-            st.write(
-                f"**24h change:** "
-                f"{selected_row['24h Change (%)']:.2f}%"
-            )
-            st.write(
-                f"**24h volume:** "
-                f"{selected_row['24h Volume (USDT)']:,.0f} USDT"
-            )
-            st.write(
-                f"**Confidence score:** "
-                f"{selected_row.get('Confidence', 0)}"
-            )
-
-        st.write("**Signal explanation**")
-        st.write(selected_row.get("Reasons", ""))
-
-        st.subheader("Price chart")
-
-        try:
-            exchange = get_exchange()
-            chart_df = fetch_candles(
-                exchange,
-                selected_symbol,
-                timeframe,
-                requested=candle_count,
-            )
-
-            chart_df = add_indicators(chart_df)
-            chart_df = chart_df.set_index("timestamp")
-
-            chart_columns = [
-                "close", "EMA20", "EMA50",
-                "BB_UPPER", "BB_LOWER",
+        st.line_chart(
+            chart[
+                ["close", "EMA20", "EMA50", "BB_UPPER", "BB_LOWER"]
             ]
-
-            st.line_chart(chart_df[chart_columns])
-
-        except Exception as exc:
-            st.warning(f"Chart could not be loaded: {exc}")
-
-        csv_data = results.to_csv(index=False).encode("utf-8-sig")
-
-        st.download_button(
-            label="⬇️ Download scan results (CSV)",
-            data=csv_data,
-            file_name="crypto_signal_scan.csv",
-            mime="text/csv",
         )
 
+    except Exception as exc:
+        st.warning(f"Could not load chart: {exc}")
 
-# ============================================================
+    csv_bytes = results.to_csv(index=False).encode("utf-8-sig")
+
+    st.download_button(
+        "⬇️ Download results CSV",
+        data=csv_bytes,
+        file_name="velora_crypto_signals.csv",
+        mime="text/csv",
+    )
+
+
+# =========================================================
 # DISCLAIMER
-# ============================================================
+# =========================================================
 
 st.divider()
 
 st.caption(
-    "Important: This application is for informational and educational "
-    "analysis only. It does not execute orders or connect to a Binomo "
-    "account. Technical indicators and machine-learning predictions can "
-    "be wrong. Public Binance market prices may differ from OTC prices, "
-    "and no signal guarantees profit. Verify market conditions independently."
+    "Educational analysis only. This application does not execute trades "
+    or connect to Binomo. Binance public prices can differ from Binomo OTC "
+    prices. Technical analysis and machine-learning estimates can be wrong; "
+    "no signal guarantees profit."
 )
