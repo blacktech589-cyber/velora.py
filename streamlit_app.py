@@ -2,702 +2,429 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import accuracy_score
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import io
+import warnings
+
+warnings.filterwarnings("ignore")
 
 st.set_page_config(
-    page_title="Binomo VIP BUY SELL AI",
+    page_title="Velora AI Signal Scanner",
     page_icon="📈",
     layout="wide"
 )
 
-st.title("VIP | Binomo BUY / SELL AI Scanner")
-st.caption("5M | EMA 15 | Bollinger Bands (20,2) | LSTM")
-
+st.title("📈 Velora AI Signal Scanner")
+st.caption("EMA 15 + Bollinger Bands (20, 2) + LSTM | 5-minute candles")
 st.warning(
-    "Bu uygulama sinyal üretir; otomatik emir açmaz ve Binomo'ya "
-    "doğrudan bağlanmaz. Sonuçlar garanti değildir."
+    "This application provides experimental signals only. "
+    "It does not connect to Binomo or execute trades."
 )
 
-# Kullanıcının gönderdiği varlık listesi.
-ASSETS = [
-    ("Crypto IDX", 83, 85),
-    ("Bitcoin (OTC)", 80, 82),
-    ("Ethereum (OTC)", 80, 82),
-    ("Solana (OTC)", 80, 82),
-    ("EUR/USD", 80, 82),
-    ("EUR/HUF", 80, 82),
-    ("GBP/NOK", 80, 82),
-    ("CAD/JPY", 80, 82),
-    ("FC Barcelona Token (OTC)", 80, 82),
-    ("AUD/ZAR", 80, 82),
-    ("CAD/DKK", 80, 82),
-    ("EUR/ILS", 80, 82),
-    ("GBP/SGD", 80, 82),
-    ("USD/MXN", 80, 82),
-    ("Cardano (OTC)", 80, 82),
-    ("EUR/ZAR", 80, 82),
-    ("AUD/USD", 80, 82),
-    ("GBP/HKD", 80, 82),
-    ("CAD/MXN", 80, 82),
-    ("EUR/NOK", 80, 82),
-    ("EUR/MXN", 80, 82),
-    ("CHF/JPY", 80, 82),
-    ("USD/ILS", 80, 82),
-    ("USD/SEK", 80, 82),
-    ("CAD/NOK", 80, 82),
-    ("CAD/SEK", 80, 82),
-    ("USD/PLN", 80, 82),
-    ("AUD/JPY", 80, 82),
-    ("EUR/SEK", 80, 82),
-    ("AUD/SGD", 80, 82),
-    ("Chainlink (OTC)", 80, 82),
-    ("GBP/MXN", 80, 82),
-    ("CAD/SGD", 80, 82),
-    ("AUD/DKK", 80, 82),
-    ("EUR/SGD", 80, 82),
-    ("CHF/DKK", 80, 82),
-    ("GBP/PLN", 80, 82),
-    ("GBP/CZK", 80, 82),
-    ("EUR/NZD", 80, 82),
-    ("AUD/HUF", 80, 82),
-    ("USD/HUF", 80, 82),
-    ("GBP/DKK", 80, 82),
-    ("AUD/NOK", 80, 82),
-    ("NZD/JPY", 80, 82),
-    ("CHF/NOK", 80, 82),
-    ("USD/JPY", 80, 82),
-    ("CHF/PLN", 80, 82),
-    ("GBP/TRY", 80, 82),
-    ("USD/CAD", 80, 82),
-    ("AUD/SEK", 80, 82),
-    ("CHF/SEK", 80, 82),
-    ("CHF/SGD", 80, 82),
-    ("NOK/JPY", 80, 82),
-    ("NOK/SEK", 80, 82),
-    ("NZD/CAD", 80, 82),
-    ("NZD/DKK", 80, 82),
-    ("EUR/GBP (OTC)", 80, 82),
-    ("GBP/NZD", 80, 82),
-    ("NZD/USD", 80, 82),
-    ("NZD/HUF", 80, 82),
-    ("NZD/NOK", 80, 82),
-    ("NZD/SEK", 80, 82),
-    ("NZD/SGD", 80, 82),
-    ("SEK/JPY", 80, 82),
-    ("SGD/JPY", 80, 82),
-    ("SGD/HKD", 80, 82),
-    ("USD/CHF", 80, 82),
-    ("AUD/CAD", 80, 82),
-    ("USD/NOK", 80, 82),
-    ("USD/CZK", 80, 82),
-    ("Bitcoin Cash (OTC)", 80, 82),
-    ("Kusama (OTC)", 80, 82),
-    ("Aave (OTC)", 80, 82),
-    ("GBP/JPY", 80, 82),
-    ("Pancake Swap (OTC)", 80, 82),
-    ("Uniswap (OTC)", 80, 82),
-    ("EUR/CAD", 80, 82),
-    ("NZD/CHF", 80, 82),
-    ("GBP/CAD", 80, 82),
-    ("AUD/NZD", 80, 82),
-    ("USD/ZAR", 80, 82),
-    ("AUD/CHF", 80, 82),
-    ("French CAC 40 Index", 70, 72),
-    ("GBP/USD", 70, 72),
-    ("Vodafone", 65, 67),
-    ("Gold", 60, 62),
-    ("GBP/HUF", 50, 52),
-    ("EUR/PLN", 50, 52),
-    ("ZAR/JPY", 50, 52),
-    ("CHF/HUF", 50, 52),
-    ("Silver", 50, 52),
-    ("Litecoin", 30, 32),
-    ("USD/DKK (Gold)", 81, 82),
-    ("GBP/CHF (Gold)", 81, 82),
-    ("Yum Brands (Gold)", 76, 77),
-    ("Nvidia (Gold)", 76, 77),
-    ("Visa (Gold)", 71, 72),
-    ("Starbucks (Gold)", 71, 72),
-    ("Weibo (Gold)", 71, 72),
-    ("Qualcomm (Gold)", 71, 72),
-    ("Intel (Gold)", 71, 72),
-    ("JPMorgan C (Gold)", 66, 67),
-    ("Oil (Gold)", 66, 67),
-    ("Ferrari (Gold)", 31, 32),
-]
-
-# Sidebar settings
-with st.sidebar:
-    st.header("VIP Settings")
-
-    selected_asset = st.selectbox(
-        "Varlık seç",
-        [asset[0] for asset in ASSETS]
-    )
-
-    payout = next(
-        (a[1:] for a in ASSETS if a[0] == selected_asset),
-        (80, 82)
-    )
-
-    st.write(f"Paylaşılan oranlar: {payout[0]}% / {payout[1]}%")
-    st.caption("Bunlar canlı doğrulanmış oranlar değildir.")
-
-    lookback = st.number_input(
-        "LSTM geçmiş mum sayısı",
-        min_value=20,
-        max_value=200,
-        value=60,
-        step=5
-    )
-
-    epochs = st.number_input(
-        "Eğitim epoch",
-        min_value=1,
-        max_value=50,
-        value=8
-    )
-
-    confidence = st.slider(
-        "Minimum model olasılığı",
-        min_value=0.50,
-        max_value=0.90,
-        value=0.60,
-        step=0.01
-    )
-
-    min_rows = st.number_input(
-        "Minimum veri satırı",
-        min_value=150,
-        max_value=10000,
-        value=400,
-        step=50
-    )
-
-st.subheader("Varlık listesi")
-
-st.dataframe(
-    pd.DataFrame(
-        ASSETS,
-        columns=["Varlık", "Oran A (%)", "Oran B (%)"]
-    ),
-    use_container_width=True,
-    height=220
-)
-
-uploaded_file = st.file_uploader(
-    f"{selected_asset} için 5 dakikalık CSV yükle",
-    type=["csv"]
-)
-
-st.markdown("### CSV formatı")
-
-st.code(
-    "timestamp,open,high,low,close,volume\n"
-    "2026-01-01 10:00:00,1.1000,1.1010,1.0990,1.1005,120",
-    language="csv"
-)
-
-if uploaded_file is None:
-    st.info(
-        "Sinyal üretmek için seçtiğin varlığın geçmiş 5 dakikalık "
-        "mum verilerini CSV olarak yükle."
-    )
-    st.stop()
-
-# Read data
+# --------------------------------------------------
+# Optional Plotly import
+# --------------------------------------------------
 try:
-    df = pd.read_csv(uploaded_file)
-except Exception as exc:
-    st.error(f"CSV okunamadı: {exc}")
-    st.stop()
+    import plotly.graph_objects as go
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
 
-df.columns = [str(c).strip().lower() for c in df.columns]
+# --------------------------------------------------
+# LSTM import
+# --------------------------------------------------
+try:
+    from sklearn.preprocessing import MinMaxScaler
+    from sklearn.metrics import accuracy_score
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import LSTM, Dense, Dropout
+    from tensorflow.keras.callbacks import EarlyStopping
+    ML_AVAILABLE = True
+    ML_ERROR = ""
+except Exception as e:
+    ML_AVAILABLE = False
+    ML_ERROR = str(e)
 
-aliases = {
-    "datetime": "timestamp",
-    "date": "timestamp",
-    "time": "timestamp",
-    "tick_volume": "volume"
-}
-
-rename_map = {
-    old: new
-    for old, new in aliases.items()
-    if old in df.columns and new not in df.columns
-}
-
-df = df.rename(columns=rename_map)
-
-required_columns = ["open", "high", "low", "close"]
-missing = [
-    c for c in required_columns
-    if c not in df.columns
+# --------------------------------------------------
+# Asset list
+# --------------------------------------------------
+ASSETS = [
+    "EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF",
+    "AUD/USD", "USD/CAD", "NZD/USD", "EUR/GBP",
+    "EUR/JPY", "GBP/JPY", "EUR/CHF", "AUD/JPY",
+    "GBP/CHF", "CAD/JPY", "CHF/JPY", "EUR/AUD",
+    "GBP/AUD", "AUD/CAD", "AUD/CHF", "EUR/CAD",
+    "NZD/JPY", "GBP/CAD", "CAD/CHF", "NZD/CAD",
+    "NZD/CHF", "EUR/NZD", "GBP/NZD", "AUD/NZD"
 ]
 
-if missing:
-    st.error(
-        "CSV'de eksik sütunlar var: " + ", ".join(missing)
-    )
-    st.stop()
-
-for column in required_columns:
-    df[column] = pd.to_numeric(
-        df[column],
-        errors="coerce"
-    )
-
-if "volume" not in df.columns:
-    df["volume"] = 0.0
-else:
-    df["volume"] = pd.to_numeric(
-        df["volume"],
-        errors="coerce"
-    ).fillna(0)
-
-if "timestamp" in df.columns:
-    df["timestamp"] = pd.to_datetime(
-        df["timestamp"],
-        errors="coerce"
-    )
-    df = df.sort_values("timestamp")
-
-df = df.dropna(
-    subset=required_columns
-).reset_index(drop=True)
-
-if len(df) < max(int(min_rows), int(lookback) + 100):
-    st.error(
-        f"Yeterli veri yok. Kullanılabilir mum: {len(df)}. "
-        f"En az {max(int(min_rows), int(lookback) + 100)} mum yükle."
-    )
-    st.stop()
-
-if (df["close"] <= 0).any():
-    st.error("Kapanış fiyatları pozitif olmalıdır.")
-    st.stop()
-
+# --------------------------------------------------
 # Indicators
-df["ema15"] = df["close"].ewm(
-    span=15,
-    adjust=False
-).mean()
+# --------------------------------------------------
+def calculate_indicators(df):
+    df = df.copy()
 
-df["bb_mid"] = df["close"].rolling(20).mean()
+    # Normalize column names
+    df.columns = [str(c).strip().lower() for c in df.columns]
 
-df["bb_std"] = df["close"].rolling(20).std(ddof=0)
+    aliases = {
+        "timestamp": ["timestamp", "time", "date", "datetime"],
+        "open": ["open", "o"],
+        "high": ["high", "h"],
+        "low": ["low", "l"],
+        "close": ["close", "c", "price"],
+        "volume": ["volume", "vol", "v"]
+    }
 
-df["bb_upper"] = df["bb_mid"] + 2 * df["bb_std"]
+    rename = {}
+    for target, choices in aliases.items():
+        for choice in choices:
+            if choice in df.columns:
+                rename[choice] = target
+                break
 
-df["bb_lower"] = df["bb_mid"] - 2 * df["bb_std"]
+    df = df.rename(columns=rename)
 
-# LSTM features
-df["return1"] = df["close"].pct_change()
+    required = ["open", "high", "low", "close"]
+    missing = [c for c in required if c not in df.columns]
 
-df["range_pct"] = (
-    (df["high"] - df["low"])
-    / df["close"].replace(0, np.nan)
-)
+    if missing:
+        raise ValueError(
+            "CSV must contain Open, High, Low and Close columns. "
+            f"Missing: {', '.join(missing)}"
+        )
 
-df["ema_gap"] = (
-    (df["close"] - df["ema15"])
-    / df["close"].replace(0, np.nan)
-)
+    for col in required:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-df["bb_position"] = (
-    (df["close"] - df["bb_lower"])
-    / (df["bb_upper"] - df["bb_lower"]).replace(0, np.nan)
-)
+    df = df.dropna(subset=required).reset_index(drop=True)
 
-# Target: whether the next candle closes higher
-df["target"] = (
-    df["close"].shift(-1) > df["close"]
-).astype(int)
+    if len(df) < 100:
+        raise ValueError(
+            "At least 100 valid candles are required. "
+            "More historical candles are recommended."
+        )
 
-feature_columns = [
+    # EMA 15
+    df["ema15"] = df["close"].ewm(
+        span=15, adjust=False
+    ).mean()
+
+    # Bollinger Bands: period 20, standard deviation 2
+    df["bb_mid"] = df["close"].rolling(20).mean()
+    rolling_std = df["close"].rolling(20).std(ddof=0)
+
+    df["bb_upper"] = df["bb_mid"] + 2 * rolling_std
+    df["bb_lower"] = df["bb_mid"] - 2 * rolling_std
+
+    # Model features
+    df["return1"] = df["close"].pct_change()
+    df["range_pct"] = (
+        (df["high"] - df["low"]) /
+        df["close"].replace(0, np.nan)
+    )
+    df["ema_gap"] = (
+        (df["close"] - df["ema15"]) /
+        df["close"].replace(0, np.nan)
+    )
+    band_width = (
+        df["bb_upper"] - df["bb_lower"]
+    ).replace(0, np.nan)
+
+    df["bb_position"] = (
+        (df["close"] - df["bb_lower"]) / band_width
+    )
+
+    df = df.replace([np.inf, -np.inf], np.nan)
+    return df
+
+
+# --------------------------------------------------
+# Prepare supervised sequences
+# Target: direction of the next candle
+# --------------------------------------------------
+FEATURES = [
     "return1",
     "range_pct",
     "ema_gap",
     "bb_position"
 ]
 
-data = df.dropna(
-    subset=feature_columns
-).copy()
 
-if len(data) < int(lookback) + 80:
-    st.error("Gösterge hesaplamasından sonra yeterli veri kalmadı.")
-    st.stop()
+def make_sequences(data, lookback=20):
+    x_data = data[FEATURES].values
+    close_values = data["close"].values
 
-# Load deep-learning dependencies
-try:
-    from tensorflow.keras.models import Sequential
-    from tensorflow.keras.layers import LSTM, Dense, Dropout
-    from tensorflow.keras.callbacks import EarlyStopping
+    scaler = MinMaxScaler()
+    scaled = scaler.fit_transform(x_data)
 
-except Exception as exc:
-    st.error(
-        "TensorFlow yüklenemedi. Uyumlu Python sürümü kullanıp "
-        "'pip install -r requirements.txt' komutunu çalıştır."
+    X, y = [], []
+
+    for i in range(lookback, len(data) - 1):
+        X.append(scaled[i - lookback:i])
+
+        # Next candle closes above current candle = 1
+        y.append(
+            1 if close_values[i + 1] > close_values[i] else 0
+        )
+
+    return np.asarray(X, dtype=np.float32), np.asarray(y), scaler
+
+
+def build_model(input_shape):
+    model = Sequential([
+        LSTM(32, input_shape=input_shape, return_sequences=True),
+        Dropout(0.2),
+        LSTM(16),
+        Dropout(0.2),
+        Dense(8, activation="relu"),
+        Dense(1, activation="sigmoid")
+    ])
+
+    model.compile(
+        optimizer="adam",
+        loss="binary_crossentropy",
+        metrics=["accuracy"]
     )
-    st.code(str(exc))
-    st.stop()
 
-# Train and generate a signal
-if st.button(
-    "LSTM Eğit ve BUY / SELL Sinyali Üret",
-    type="primary"
-):
+    return model
 
-    with st.spinner("LSTM modeli eğitiliyor..."):
 
-        # The final candle has no known next-candle outcome.
-        supervised = data.iloc[:-1].copy()
+# --------------------------------------------------
+# Sidebar
+# --------------------------------------------------
+st.sidebar.header("Settings")
 
-        split_index = int(len(supervised) * 0.80)
+asset = st.sidebar.selectbox("Asset", ASSETS)
+lookback = st.sidebar.slider(
+    "LSTM lookback candles",
+    min_value=10,
+    max_value=60,
+    value=20
+)
+epochs = st.sidebar.slider(
+    "Training epochs",
+    min_value=1,
+    max_value=20,
+    value=5
+)
+confidence_threshold = st.sidebar.slider(
+    "Minimum signal confidence",
+    min_value=0.50,
+    max_value=0.90,
+    value=0.60,
+    step=0.05
+)
 
-        if split_index <= int(lookback) + 20:
+uploaded_file = st.file_uploader(
+    f"Upload {asset} 5-minute OHLCV CSV",
+    type=["csv"]
+)
+
+st.info(
+    "CSV format: Open, High, Low, Close. "
+    "A Timestamp/Time column is optional. "
+    "Use candles from the selected asset only."
+)
+
+# --------------------------------------------------
+# Main application
+# --------------------------------------------------
+if uploaded_file is not None:
+    try:
+        raw = pd.read_csv(uploaded_file)
+        df = calculate_indicators(raw)
+
+        st.subheader(f"{asset} — Data preview")
+        st.dataframe(df.tail(10), use_container_width=True)
+
+        if PLOTLY_AVAILABLE:
+            fig = go.Figure()
+
+            fig.add_trace(go.Scatter(
+                x=df.index,
+                y=df["close"],
+                name="Close"
+            ))
+            fig.add_trace(go.Scatter(
+                x=df.index,
+                y=df["ema15"],
+                name="EMA 15"
+            ))
+            fig.add_trace(go.Scatter(
+                x=df.index,
+                y=df["bb_upper"],
+                name="BB Upper"
+            ))
+            fig.add_trace(go.Scatter(
+                x=df.index,
+                y=df["bb_lower"],
+                name="BB Lower"
+            ))
+
+            fig.update_layout(
+                title=f"{asset} — Indicators",
+                xaxis_title="Candle",
+                yaxis_title="Price",
+                height=500
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.warning(
+                "Plotly is not installed. The scanner can still "
+                "calculate indicators and signals without the chart."
+            )
+            st.line_chart(
+                df[["close", "ema15", "bb_upper", "bb_lower"]].tail(200)
+            )
+
+        if not ML_AVAILABLE:
             st.error(
-                "Eğitim ve test için daha fazla geçmiş veri yükle."
+                "LSTM dependencies could not be loaded. "
+                "Check requirements.txt and Streamlit Cloud logs."
+            )
+            st.code(ML_ERROR)
+            st.stop()
+
+        model_data = df.dropna(subset=FEATURES + ["close"]).reset_index(
+            drop=True
+        )
+
+        if len(model_data) <= lookback + 50:
+            st.error(
+                "Not enough usable data after calculating indicators. "
+                "Upload more 5-minute candles."
             )
             st.stop()
 
-        # Fit scaler on the training period only.
-        scaler = MinMaxScaler()
+        X, y, scaler = make_sequences(model_data, lookback)
 
-        scaler.fit(
-            supervised[feature_columns].iloc[:split_index]
-        )
-
-        scaled_data = scaler.transform(
-            data[feature_columns]
-        )
-
-        X, y, indices = [], [], []
-
-        for i in range(int(lookback), len(data) - 1):
-            X.append(
-                scaled_data[i - int(lookback):i]
-            )
-
-            y.append(
-                int(data["target"].iloc[i])
-            )
-
-            indices.append(i)
-
-        X = np.asarray(X, dtype=np.float32)
-        y = np.asarray(y, dtype=np.float32)
-        indices = np.asarray(indices)
-
-        train_mask = indices < split_index
-        test_mask = indices >= split_index
-
-        X_train = X[train_mask]
-        y_train = y[train_mask]
-
-        X_test = X[test_mask]
-        y_test = y[test_mask]
-
-        if len(X_train) < 50 or len(X_test) < 10:
+        if len(X) < 50 or len(np.unique(y)) < 2:
             st.error(
-                "Eğitim veya test dizisi yetersiz. Daha fazla mum yükle."
+                "Not enough samples or only one target class. "
+                "Upload a longer history with price movements."
             )
             st.stop()
 
-        # LSTM neural network
-        model = Sequential([
-            LSTM(
-                32,
-                input_shape=(
-                    int(lookback),
-                    len(feature_columns)
-                )
-            ),
-            Dropout(0.20),
-            Dense(16, activation="relu"),
-            Dense(1, activation="sigmoid")
-        ])
+        split = int(len(X) * 0.8)
 
-        model.compile(
-            optimizer="adam",
-            loss="binary_crossentropy",
-            metrics=["accuracy"]
+        X_train, X_test = X[:split], X[split:]
+        y_train, y_test = y[:split], y[split:]
+
+        if len(X_test) == 0:
+            st.error("Not enough test samples.")
+            st.stop()
+
+        st.subheader("LSTM training")
+
+        with st.spinner("Training LSTM model..."):
+            model = build_model(
+                (X_train.shape[1], X_train.shape[2])
+            )
+
+            early_stop = EarlyStopping(
+                monitor="val_loss",
+                patience=3,
+                restore_best_weights=True
+            )
+
+            validation_data = None
+            callbacks = []
+
+            if len(X_train) >= 20:
+                validation_data = (X_test, y_test)
+                callbacks.append(early_stop)
+
+            model.fit(
+                X_train,
+                y_train,
+                epochs=epochs,
+                batch_size=32,
+                verbose=0,
+                validation_data=validation_data,
+                callbacks=callbacks
+            )
+
+            test_probs = model.predict(X_test, verbose=0).ravel()
+            test_preds = (test_probs >= 0.5).astype(int)
+            test_accuracy = accuracy_score(y_test, test_preds)
+
+            # Latest available feature window
+            latest_x = scaler.transform(
+                model_data[FEATURES].values
+            )[-lookback:]
+
+            latest_x = np.expand_dims(
+                latest_x.astype(np.float32), axis=0
+            )
+
+            probability_up = float(
+                model.predict(latest_x, verbose=0)[0][0]
+            )
+
+        st.metric(
+            "Chronological holdout accuracy",
+            f"{test_accuracy * 100:.2f}%"
         )
 
-        early_stopping = EarlyStopping(
-            monitor="val_loss",
-            patience=3,
-            restore_best_weights=True
+        st.caption(
+            "Historical test accuracy is not a guaranteed win rate "
+            "and does not establish profitability."
         )
 
-        model.fit(
-            X_train,
-            y_train,
-            validation_split=0.15,
-            epochs=int(epochs),
-            batch_size=32,
-            shuffle=False,
-            callbacks=[early_stopping],
-            verbose=0
-        )
+        last = model_data.iloc[-1]
+        price = float(last["close"])
 
-        # Historical holdout evaluation
-        test_probabilities = model.predict(
-            X_test,
-            verbose=0
-        ).reshape(-1)
-
-        test_predictions = (
-            test_probabilities >= 0.50
-        ).astype(int)
-
-        test_accuracy = accuracy_score(
-            y_test.astype(int),
-            test_predictions
-        )
-
-        # Predict direction for the next candle
-        latest_sequence = scaled_data[
-            -int(lookback):
-        ].reshape(
-            1,
-            int(lookback),
-            len(feature_columns)
-        )
-
-        probability_up = float(
-            model.predict(
-                latest_sequence,
-                verbose=0
-            )[0][0]
-        )
-
-        last = data.iloc[-1]
-
-        close = float(last["close"])
-        ema15 = float(last["ema15"])
-        bb_mid = float(last["bb_mid"])
-        bb_upper = float(last["bb_upper"])
-        bb_lower = float(last["bb_lower"])
-
-        # Indicator confirmation filters
-        buy_context = (
-            close > ema15
-            and close > bb_mid
-            and close < bb_upper
-        )
-
-        sell_context = (
-            close < ema15
-            and close < bb_mid
-            and close > bb_lower
-        )
+        # Indicator context plus LSTM direction
+        above_ema = price > float(last["ema15"])
+        below_ema = price < float(last["ema15"])
+        near_lower = price <= float(last["bb_lower"])
+        near_upper = price >= float(last["bb_upper"])
 
         signal = "NO SIGNAL"
+        confidence = max(probability_up, 1 - probability_up)
 
-        reason = (
-            "Model and indicators do not agree. "
-            "No directional signal."
+        if confidence >= confidence_threshold:
+            if probability_up >= confidence_threshold and above_ema:
+                signal = "BUY"
+            elif (
+                probability_up <= 1 - confidence_threshold
+                and below_ema
+            ):
+                signal = "SELL"
+
+        st.subheader("Latest signal")
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Last close", f"{price:.6g}")
+        col2.metric("LSTM probability UP", f"{probability_up:.1%}")
+        col3.metric("Signal confidence", f"{confidence:.1%}")
+
+        if signal == "BUY":
+            st.success("🟢 BUY — experimental model signal")
+        elif signal == "SELL":
+            st.error("🔴 SELL — experimental model signal")
+        else:
+            st.warning("⚪ NO SIGNAL — filters do not agree")
+
+        st.write("**Indicator context**")
+        st.write(f"- EMA 15: {float(last['ema15']):.6g}")
+        st.write(f"- Bollinger upper: {float(last['bb_upper']):.6g}")
+        st.write(f"- Bollinger lower: {float(last['bb_lower']):.6g}")
+        st.write(f"- Price near lower band: {'Yes' if near_lower else 'No'}")
+        st.write(f"- Price near upper band: {'Yes' if near_upper else 'No'}")
+
+        st.caption(
+            "This is an experimental analysis, not financial advice. "
+            "Signals do not guarantee the next candle direction. "
+            "The app does not connect to Binomo or place trades."
         )
 
-        if (
-            probability_up >= confidence
-            and buy_context
-        ):
-            signal = "BUY"
+    except Exception as e:
+        st.error(f"Could not process the uploaded CSV: {e}")
+        st.info(
+            "Check the CSV column names and ensure OHLC values are numeric."
+        )
 
-            reason = (
-                "LSTM upward probability passed the threshold; "
-                "EMA 15 and Bollinger conditions confirm the direction."
-            )
-
-        elif (
-            probability_up <= 1.0 - confidence
-            and sell_context
-        ):
-            signal = "SELL"
-
-            reason = (
-                "LSTM downward probability passed the threshold; "
-                "EMA 15 and Bollinger conditions confirm the direction."
-            )
-
-        st.session_state["vip_result"] = {
-            "asset": selected_asset,
-            "signal": signal,
-            "reason": reason,
-            "probability_up": probability_up,
-            "accuracy": float(test_accuracy),
-            "close": close,
-            "ema15": ema15,
-            "bb_mid": bb_mid,
-            "bb_upper": bb_upper,
-            "bb_lower": bb_lower,
-            "data": data.copy()
-        }
-
-# Display latest signal
-if (
-    "vip_result" in st.session_state
-    and st.session_state["vip_result"]["asset"] == selected_asset
-):
-
-    result = st.session_state["vip_result"]
-
-    st.subheader(
-        f"Son sinyal: {result['asset']}"
-    )
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    col1.metric(
-        "Sinyal",
-        result["signal"]
-    )
-
-    col2.metric(
-        "LSTM yükseliş tahmini",
-        f"{result['probability_up'] * 100:.1f}%"
-    )
-
-    col3.metric(
-        "Geçmiş test doğruluğu",
-        f"{result['accuracy'] * 100:.1f}%"
-    )
-
-    col4.metric(
-        "Son kapanış",
-        f"{result['close']:.8g}"
-    )
-
-    st.write(
-        "**Sinyal nedeni:** " + result["reason"]
-    )
-
-    st.caption(
-        "Model olasılığı kazanma oranı değildir. "
-        "Geçmiş test doğruluğu gelecekteki kârlılığı garanti etmez."
-    )
-
-    # Price and indicator chart
-    chart_data = result["data"].tail(180)
-
-    if "timestamp" in chart_data.columns:
-        x_axis = chart_data["timestamp"]
-    else:
-        x_axis = chart_data.index
-
-    fig = make_subplots(
-        rows=2,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.04,
-        row_heights=[0.75, 0.25]
-    )
-
-    fig.add_trace(
-        go.Candlestick(
-            x=x_axis,
-            open=chart_data["open"],
-            high=chart_data["high"],
-            low=chart_data["low"],
-            close=chart_data["close"],
-            name="Price"
-        ),
-        row=1,
-        col=1
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=x_axis,
-            y=chart_data["ema15"],
-            name="EMA 15"
-        ),
-        row=1,
-        col=1
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=x_axis,
-            y=chart_data["bb_upper"],
-            name="BB Upper",
-            line=dict(dash="dot")
-        ),
-        row=1,
-        col=1
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=x_axis,
-            y=chart_data["bb_mid"],
-            name="BB Middle",
-            line=dict(dash="dot")
-        ),
-        row=1,
-        col=1
-    )
-
-    fig.add_trace(
-        go.Scatter(
-            x=x_axis,
-            y=chart_data["bb_lower"],
-            name="BB Lower",
-            line=dict(dash="dot")
-        ),
-        row=1,
-        col=1
-    )
-
-    fig.add_trace(
-        go.Bar(
-            x=x_axis,
-            y=chart_data["volume"],
-            name="Volume"
-        ),
-        row=2,
-        col=1
-    )
-
-    fig.update_layout(
-        height=650,
-        xaxis_rangeslider_visible=False,
-        legend_orientation="h"
-    )
-
-    st.plotly_chart(
-        fig,
-        use_container_width=True
-    )
-
-    st.subheader("Gösterge değerleri")
-
-    st.dataframe(
-        pd.DataFrame([{
-            "Varlık": result["asset"],
-            "Close": result["close"],
-            "EMA 15": result["ema15"],
-            "BB Middle": result["bb_mid"],
-            "BB Upper": result["bb_upper"],
-            "BB Lower": result["bb_lower"],
-            "P(UP)": result["probability_up"],
-            "Sinyal": result["signal"]
-        }]),
-        use_container_width=True
-    )
-
-st.subheader("Sinyal açıklamaları")
-
-st.markdown("""
-- **BUY:** LSTM yükseliş olasılığı eşiği geçer ve göstergeler yükselişi destekler.
-- **SELL:** LSTM düşüş olasılığı eşiği geçer ve göstergeler düşüşü destekler.
-- **NO SIGNAL:** Koşullar uyuşmuyorsa sinyal üretilmez.
-- **5 dakika:** Yüklediğin mumlar 5 dakikalık olmalıdır.
-- **Otomatik işlem:** Bu uygulama emir göndermez.
-""")
+else:
+    st.info("Upload a CSV file containing historical 5-minute candles to begin.")
