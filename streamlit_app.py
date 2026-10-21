@@ -1,364 +1,703 @@
-import time
-import threading
-import requests
-import pandas as pd
-import streamlit as st
 
-BASE_URL = "https://www.okx.com"
-TIMEOUT = 20
-MIN_REQUEST_INTERVAL = 0.45
-LOOKBACK_DAYS = 30
-DAY_MS = 24 * 60 * 60 * 1000
-MIN_HISTORY_CANDLES = 20
+import streamlit as st
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import accuracy_score
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 st.set_page_config(
-    page_title="OKX 30-Day Low Scanner",
-    page_icon="📉",
-    layout="wide",
+    page_title="Binomo VIP BUY SELL AI",
+    page_icon="📈",
+    layout="wide"
 )
 
-st.title("📉 Son 30 Günün Dibine En Yakın Coinler")
-st.caption(
-    "OKX Spot USDT | Son 30 günlük tamamlanmış günlük mumlar | "
-    "Yalnızca aktif pariteler | Otomatik emir yok"
+st.title("VIP | Binomo BUY / SELL AI Scanner")
+st.caption("5M | EMA 15 | Bollinger Bands (20,2) | LSTM")
+
+st.warning(
+    "Bu uygulama sinyal üretir; otomatik emir açmaz ve Binomo'ya "
+    "doğrudan bağlanmaz. Sonuçlar garanti değildir."
 )
 
-session = requests.Session()
-session.headers.update({"User-Agent": "OKX-30D-Low-Scanner/3.0"})
-rate_lock = threading.Lock()
-last_request_time = 0.0
+# Kullanıcının gönderdiği varlık listesi.
+ASSETS = [
+    ("Crypto IDX", 83, 85),
+    ("Bitcoin (OTC)", 80, 82),
+    ("Ethereum (OTC)", 80, 82),
+    ("Solana (OTC)", 80, 82),
+    ("EUR/USD", 80, 82),
+    ("EUR/HUF", 80, 82),
+    ("GBP/NOK", 80, 82),
+    ("CAD/JPY", 80, 82),
+    ("FC Barcelona Token (OTC)", 80, 82),
+    ("AUD/ZAR", 80, 82),
+    ("CAD/DKK", 80, 82),
+    ("EUR/ILS", 80, 82),
+    ("GBP/SGD", 80, 82),
+    ("USD/MXN", 80, 82),
+    ("Cardano (OTC)", 80, 82),
+    ("EUR/ZAR", 80, 82),
+    ("AUD/USD", 80, 82),
+    ("GBP/HKD", 80, 82),
+    ("CAD/MXN", 80, 82),
+    ("EUR/NOK", 80, 82),
+    ("EUR/MXN", 80, 82),
+    ("CHF/JPY", 80, 82),
+    ("USD/ILS", 80, 82),
+    ("USD/SEK", 80, 82),
+    ("CAD/NOK", 80, 82),
+    ("CAD/SEK", 80, 82),
+    ("USD/PLN", 80, 82),
+    ("AUD/JPY", 80, 82),
+    ("EUR/SEK", 80, 82),
+    ("AUD/SGD", 80, 82),
+    ("Chainlink (OTC)", 80, 82),
+    ("GBP/MXN", 80, 82),
+    ("CAD/SGD", 80, 82),
+    ("AUD/DKK", 80, 82),
+    ("EUR/SGD", 80, 82),
+    ("CHF/DKK", 80, 82),
+    ("GBP/PLN", 80, 82),
+    ("GBP/CZK", 80, 82),
+    ("EUR/NZD", 80, 82),
+    ("AUD/HUF", 80, 82),
+    ("USD/HUF", 80, 82),
+    ("GBP/DKK", 80, 82),
+    ("AUD/NOK", 80, 82),
+    ("NZD/JPY", 80, 82),
+    ("CHF/NOK", 80, 82),
+    ("USD/JPY", 80, 82),
+    ("CHF/PLN", 80, 82),
+    ("GBP/TRY", 80, 82),
+    ("USD/CAD", 80, 82),
+    ("AUD/SEK", 80, 82),
+    ("CHF/SEK", 80, 82),
+    ("CHF/SGD", 80, 82),
+    ("NOK/JPY", 80, 82),
+    ("NOK/SEK", 80, 82),
+    ("NZD/CAD", 80, 82),
+    ("NZD/DKK", 80, 82),
+    ("EUR/GBP (OTC)", 80, 82),
+    ("GBP/NZD", 80, 82),
+    ("NZD/USD", 80, 82),
+    ("NZD/HUF", 80, 82),
+    ("NZD/NOK", 80, 82),
+    ("NZD/SEK", 80, 82),
+    ("NZD/SGD", 80, 82),
+    ("SEK/JPY", 80, 82),
+    ("SGD/JPY", 80, 82),
+    ("SGD/HKD", 80, 82),
+    ("USD/CHF", 80, 82),
+    ("AUD/CAD", 80, 82),
+    ("USD/NOK", 80, 82),
+    ("USD/CZK", 80, 82),
+    ("Bitcoin Cash (OTC)", 80, 82),
+    ("Kusama (OTC)", 80, 82),
+    ("Aave (OTC)", 80, 82),
+    ("GBP/JPY", 80, 82),
+    ("Pancake Swap (OTC)", 80, 82),
+    ("Uniswap (OTC)", 80, 82),
+    ("EUR/CAD", 80, 82),
+    ("NZD/CHF", 80, 82),
+    ("GBP/CAD", 80, 82),
+    ("AUD/NZD", 80, 82),
+    ("USD/ZAR", 80, 82),
+    ("AUD/CHF", 80, 82),
+    ("French CAC 40 Index", 70, 72),
+    ("GBP/USD", 70, 72),
+    ("Vodafone", 65, 67),
+    ("Gold", 60, 62),
+    ("GBP/HUF", 50, 52),
+    ("EUR/PLN", 50, 52),
+    ("ZAR/JPY", 50, 52),
+    ("CHF/HUF", 50, 52),
+    ("Silver", 50, 52),
+    ("Litecoin", 30, 32),
+    ("USD/DKK (Gold)", 81, 82),
+    ("GBP/CHF (Gold)", 81, 82),
+    ("Yum Brands (Gold)", 76, 77),
+    ("Nvidia (Gold)", 76, 77),
+    ("Visa (Gold)", 71, 72),
+    ("Starbucks (Gold)", 71, 72),
+    ("Weibo (Gold)", 71, 72),
+    ("Qualcomm (Gold)", 71, 72),
+    ("Intel (Gold)", 71, 72),
+    ("JPMorgan C (Gold)", 66, 67),
+    ("Oil (Gold)", 66, 67),
+    ("Ferrari (Gold)", 31, 32),
+]
 
+# Sidebar settings
+with st.sidebar:
+    st.header("VIP Settings")
 
-class MarketAPIError(Exception):
-    pass
-
-
-class RateLimitError(MarketAPIError):
-    pass
-
-
-class RestrictedError(MarketAPIError):
-    pass
-
-
-def api_get(path, params=None, retries=5):
-    global last_request_time
-
-    for attempt in range(retries + 1):
-        with rate_lock:
-            wait = MIN_REQUEST_INTERVAL - (time.monotonic() - last_request_time)
-            if wait > 0:
-                time.sleep(wait)
-            last_request_time = time.monotonic()
-
-        try:
-            response = session.get(BASE_URL + path, params=params, timeout=TIMEOUT)
-        except requests.RequestException as exc:
-            if attempt < retries:
-                time.sleep(min(2 ** (attempt + 1), 30))
-                continue
-            raise MarketAPIError(f"Bağlantı hatası: {exc}") from exc
-
-        if response.status_code == 451:
-            raise RestrictedError(
-                "HTTP 451: OKX API bu bağlantı konumundan erişimi kısıtlıyor. "
-                "Tarama durduruldu; bölgesel kısıtlamayı aşmaya çalışılmadı."
-            )
-
-        if response.status_code == 429:
-            if attempt < retries:
-                retry_after = response.headers.get("Retry-After")
-                try:
-                    delay = float(retry_after) if retry_after else 2 ** (attempt + 1)
-                except ValueError:
-                    delay = 2 ** (attempt + 1)
-                time.sleep(min(max(delay, 2), 60))
-                continue
-            raise RateLimitError(
-                "HTTP 429: OKX istek sınırı aşıldı. Bir süre sonra yeniden deneyin."
-            )
-
-        if not response.ok:
-            raise MarketAPIError(f"HTTP {response.status_code}: {response.text[:250]}")
-
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise MarketAPIError("OKX API geçerli JSON döndürmedi.") from exc
-
-        if isinstance(payload, dict) and payload.get("code") not in (None, "0"):
-            raise MarketAPIError(
-                f"OKX API hatası {payload.get('code')}: {payload.get('msg', '')}"
-            )
-        return payload
-
-    raise MarketAPIError("API isteği tamamlanamadı.")
-
-
-@st.cache_data(ttl=900, show_spinner=False)
-def get_active_symbols():
-    payload = api_get("/api/v5/public/instruments", {"instType": "SPOT"})
-    # OKX instrument listesinde state='live' olan aktif Spot USDT çiftlerini al.
-    return sorted({
-        item["instId"]
-        for item in payload.get("data", [])
-        if item.get("state") == "live"
-        and item.get("quoteCcy") == "USDT"
-        and item.get("instId", "").endswith("-USDT")
-    })
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def get_tickers():
-    payload = api_get("/api/v5/market/tickers", {"instType": "SPOT"})
-    return {
-        item["instId"]: item
-        for item in payload.get("data", [])
-        if item.get("instId")
-    }
-
-
-def confirmed_candles(rows):
-    # OKX candle schema: [ts, open, high, low, close, vol, volCcy, volCcyQuote, confirm]
-    valid = []
-    for row in rows:
-        try:
-            if len(row) > 8 and str(row[8]) == "1":
-                valid.append(row)
-        except (TypeError, IndexError):
-            continue
-    return valid
-
-
-def get_last_30d_candles(symbol):
-    """Fetch confirmed daily candles covering the most recent 30 days."""
-    now_ms = int(time.time() * 1000)
-    cutoff_ms = now_ms - LOOKBACK_DAYS * DAY_MS
-
-    payload = api_get(
-        "/api/v5/market/candles",
-        {"instId": symbol, "bar": "1Dutc", "limit": "100"},
+    selected_asset = st.selectbox(
+        "Varlık seç",
+        [asset[0] for asset in ASSETS]
     )
-    rows = confirmed_candles(payload.get("data", []))
 
-    unique = {}
-    for row in rows:
-        try:
-            ts = int(row[0])
-            if cutoff_ms <= ts <= now_ms:
-                unique[ts] = row
-        except (ValueError, TypeError, IndexError):
-            continue
+    payout = next(
+        (a[1:] for a in ASSETS if a[0] == selected_asset),
+        (80, 82)
+    )
 
-    return [unique[ts] for ts in sorted(unique)]
+    st.write(f"Paylaşılan oranlar: {payout[0]}% / {payout[1]}%")
+    st.caption("Bunlar canlı doğrulanmış oranlar değildir.")
 
+    lookback = st.number_input(
+        "LSTM geçmiş mum sayısı",
+        min_value=20,
+        max_value=200,
+        value=60,
+        step=5
+    )
 
-def analyze_coin(symbol, ticker, low_tolerance_pct):
-    try:
-        current_price = float((ticker or {}).get("last", 0) or 0)
-        open_24h = float((ticker or {}).get("open24h", 0) or 0)
-        volume_24h = float((ticker or {}).get("volCcy24h", 0) or 0)
-    except (ValueError, TypeError):
-        return None, "bad_ticker"
+    epochs = st.number_input(
+        "Eğitim epoch",
+        min_value=1,
+        max_value=50,
+        value=8
+    )
 
-    if current_price <= 0:
-        return None, "no_price"
+    confidence = st.slider(
+        "Minimum model olasılığı",
+        min_value=0.50,
+        max_value=0.90,
+        value=0.60,
+        step=0.01
+    )
 
-    candles = get_last_30d_candles(symbol)
-    if len(candles) < MIN_HISTORY_CANDLES:
-        return None, "insufficient_history"
+    min_rows = st.number_input(
+        "Minimum veri satırı",
+        min_value=150,
+        max_value=10000,
+        value=400,
+        step=50
+    )
 
-    try:
-        high_30d = max(float(row[2]) for row in candles)
-        low_30d = min(float(row[3]) for row in candles)
-    except (ValueError, TypeError, IndexError):
-        return None, "bad_candle_data"
+st.subheader("Varlık listesi")
 
-    if high_30d <= 0 or low_30d <= 0:
-        return None, "bad_candle_data"
-
-    drop_from_high_pct = (1.0 - current_price / high_30d) * 100.0
-    distance_from_low_pct = (current_price / low_30d - 1.0) * 100.0
-    change_24h = (current_price / open_24h - 1.0) * 100.0 if open_24h > 0 else 0.0
-
-    if distance_from_low_pct < 0:
-        low_status = "YENİ 30G DİBİNİN ALTINDA"
-    elif distance_from_low_pct <= 0.1:
-        low_status = "30G DİBİNDE"
-    elif distance_from_low_pct <= low_tolerance_pct:
-        low_status = "30G DİBİNE YAKIN"
-    else:
-        low_status = "30G DİBİNDEN UZAK"
-
-    return {
-        "Coin": symbol,
-        "Dip Durumu": low_status,
-        "Güncel Fiyat": current_price,
-        "30G En Yüksek": high_30d,
-        "30G En Düşük": low_30d,
-        "Zirveden Düşüş (%)": round(drop_from_high_pct, 2),
-        "Dibe Uzaklık (%)": round(distance_from_low_pct, 3),
-        "24S Değişim (%)": round(change_24h, 2),
-        "24S Hacim (USDT)": round(volume_24h, 2),
-        "Tamamlanmış Günlük Mum": len(candles),
-        "Dip Toleransında": distance_from_low_pct <= low_tolerance_pct,
-    }, "ok"
-
-
-st.sidebar.header("Filtreler")
-low_tolerance_pct = st.sidebar.slider(
-    "30 günlük dibin üstünde izin verilen uzaklık (%)",
-    min_value=0.0,
-    max_value=10.0,
-    value=2.0,
-    step=0.25,
-    help="0% = fiyat 30 günlük dipte veya altında olmalı. 2% = dip fiyatının en fazla %2 üzerinde olabilir.",
+st.dataframe(
+    pd.DataFrame(
+        ASSETS,
+        columns=["Varlık", "Oran A (%)", "Oran B (%)"]
+    ),
+    use_container_width=True,
+    height=220
 )
 
-st.sidebar.info(
-    "Tüm aktif Spot USDT pariteleri taranır. Yeni listelenen ve yeterli 30 günlük "
-    "geçmişi olmayan pariteler dışarıda bırakılır. Tarama birkaç dakika sürebilir."
+uploaded_file = st.file_uploader(
+    f"{selected_asset} için 5 dakikalık CSV yükle",
+    type=["csv"]
 )
 
-if st.sidebar.button("Önbelleği temizle"):
-    get_active_symbols.clear()
-    get_tickers.clear()
-    st.rerun()
+st.markdown("### CSV formatı")
 
-if st.button("Tüm aktif coinleri tara", type="primary"):
-    st.session_state["run_scan"] = True
+st.code(
+    "timestamp,open,high,low,close,volume\n"
+    "2026-01-01 10:00:00,1.1000,1.1010,1.0990,1.1005,120",
+    language="csv"
+)
 
-if not st.session_state.get("run_scan", False):
-    st.info("Tarama başlatmak için düğmeye basın.")
+if uploaded_file is None:
+    st.info(
+        "Sinyal üretmek için seçtiğin varlığın geçmiş 5 dakikalık "
+        "mum verilerini CSV olarak yükle."
+    )
     st.stop()
 
+# Read data
 try:
-    with st.spinner("Aktif Spot pariteler ve güncel fiyatlar alınıyor..."):
-        api_get("/api/v5/public/time")
-        symbols = get_active_symbols()
-        tickers = get_tickers()
-except MarketAPIError as exc:
-    st.error(str(exc))
+    df = pd.read_csv(uploaded_file)
+except Exception as exc:
+    st.error(f"CSV okunamadı: {exc}")
     st.stop()
 
-st.write(f"**Aktif OKX Spot USDT paritesi:** {len(symbols)}")
-st.caption(
-    "Son 30 gündeki tamamlanmış günlük mumların en düşük fiyatı hesaplanır. "
-    "Sonuçlar güncel fiyatın bu dip seviyesine uzaklığına göre sıralanır. "
-    "Sadece OKX'te şu anda `live` görünen pariteler taranır."
-)
+df.columns = [str(c).strip().lower() for c in df.columns]
 
-results = []
-error_count = 0
-no_ticker_count = 0
-short_history_count = 0
-fatal_error = None
-progress = st.progress(0)
-status = st.empty()
+aliases = {
+    "datetime": "timestamp",
+    "date": "timestamp",
+    "time": "timestamp",
+    "tick_volume": "volume"
+}
 
-for idx, symbol in enumerate(symbols, start=1):
-    ticker = tickers.get(symbol)
-    if not ticker:
-        no_ticker_count += 1
-        progress.progress(idx / max(len(symbols), 1))
-        status.text(f"{idx}/{len(symbols)} — {symbol}: ticker yok")
-        continue
+rename_map = {
+    old: new
+    for old, new in aliases.items()
+    if old in df.columns and new not in df.columns
+}
 
-    try:
-        result, reason = analyze_coin(symbol, ticker, low_tolerance_pct)
-        if result is not None:
-            results.append(result)
-        elif reason == "insufficient_history":
-            short_history_count += 1
-        else:
-            error_count += 1
-    except RestrictedError as exc:
-        fatal_error = str(exc)
-        break
-    except RateLimitError as exc:
-        fatal_error = str(exc)
-        break
-    except MarketAPIError:
-        error_count += 1
-    except (ValueError, TypeError, KeyError, IndexError):
-        error_count += 1
-    except Exception:
-        error_count += 1
+df = df.rename(columns=rename_map)
 
-    progress.progress(idx / max(len(symbols), 1))
-    status.text(f"Taranıyor: {idx}/{len(symbols)} — {symbol} | Bulunan: {len(results)}")
+required_columns = ["open", "high", "low", "close"]
+missing = [
+    c for c in required_columns
+    if c not in df.columns
+]
 
-progress.empty()
-status.empty()
-
-if fatal_error:
-    st.error(fatal_error)
-    st.warning(f"Tarama {idx}/{len(symbols)} paritede durdu. Bulunan sonuçlar aşağıda gösterilebilir.")
-
-st.caption(
-    f"Aktif parite: {len(symbols)} | Ticker olmayan: {no_ticker_count} | "
-    f"30 günlük geçmişi yetersiz: {short_history_count} | Veri/API hatası: {error_count}"
-)
-
-if not results:
-    st.warning(
-        "Sonuç bulunamadı. API erişimini, aktif pariteleri veya yeterli geçmiş veriyi kontrol edin."
+if missing:
+    st.error(
+        "CSV'de eksik sütunlar var: " + ", ".join(missing)
     )
     st.stop()
 
-results_df = pd.DataFrame(results).sort_values(
-    ["Dibe Uzaklık (%)", "Zirveden Düşüş (%)"],
-    ascending=[True, False],
+for column in required_columns:
+    df[column] = pd.to_numeric(
+        df[column],
+        errors="coerce"
+    )
+
+if "volume" not in df.columns:
+    df["volume"] = 0.0
+else:
+    df["volume"] = pd.to_numeric(
+        df["volume"],
+        errors="coerce"
+    ).fillna(0)
+
+if "timestamp" in df.columns:
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"],
+        errors="coerce"
+    )
+    df = df.sort_values("timestamp")
+
+df = df.dropna(
+    subset=required_columns
 ).reset_index(drop=True)
 
-near_low_df = results_df[results_df["Dip Toleransında"]].copy()
-new_lows = results_df[results_df["Dibe Uzaklık (%)"] < 0].copy()
+if len(df) < max(int(min_rows), int(lookback) + 100):
+    st.error(
+        f"Yeterli veri yok. Kullanılabilir mum: {len(df)}. "
+        f"En az {max(int(min_rows), int(lookback) + 100)} mum yükle."
+    )
+    st.stop()
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Aktif parite", len(symbols))
-c2.metric("Yeterli geçmişi olan", len(results_df))
-c3.metric("Seçilen dip toleransında", len(near_low_df))
-c4.metric("Yeni 30G dibi yapan", len(new_lows))
+if (df["close"] <= 0).any():
+    st.error("Kapanış fiyatları pozitif olmalıdır.")
+    st.stop()
 
-st.subheader("30 günlük kendi dibine en yakın coinler")
-st.dataframe(results_df, use_container_width=True, hide_index=True)
+# Indicators
+df["ema15"] = df["close"].ewm(
+    span=15,
+    adjust=False
+).mean()
 
-st.subheader(f"30 günlük dibin en fazla %{low_tolerance_pct:g} üzerinde olanlar")
-if near_low_df.empty:
-    st.info("Seçilen toleransta coin bulunamadı. Toleransı artırabilir veya tüm sonuçları inceleyebilirsiniz.")
-else:
-    st.dataframe(near_low_df, use_container_width=True, hide_index=True)
+df["bb_mid"] = df["close"].rolling(20).mean()
 
-st.subheader("Son 30 günlük dip seviyesinin altındaki coinler")
-if new_lows.empty:
-    st.info("Güncel fiyatı hesaplanan 30 günlük en düşük seviyenin altında olan coin yok.")
-else:
-    st.dataframe(new_lows, use_container_width=True, hide_index=True)
+df["bb_std"] = df["close"].rolling(20).std(ddof=0)
 
-st.subheader("30 günlük fiyat grafiği")
-selected = st.selectbox("Coin seçin", results_df["Coin"].tolist())
+df["bb_upper"] = df["bb_mid"] + 2 * df["bb_std"]
+
+df["bb_lower"] = df["bb_mid"] - 2 * df["bb_std"]
+
+# LSTM features
+df["return1"] = df["close"].pct_change()
+
+df["range_pct"] = (
+    (df["high"] - df["low"])
+    / df["close"].replace(0, np.nan)
+)
+
+df["ema_gap"] = (
+    (df["close"] - df["ema15"])
+    / df["close"].replace(0, np.nan)
+)
+
+df["bb_position"] = (
+    (df["close"] - df["bb_lower"])
+    / (df["bb_upper"] - df["bb_lower"]).replace(0, np.nan)
+)
+
+# Target: whether the next candle closes higher
+df["target"] = (
+    df["close"].shift(-1) > df["close"]
+).astype(int)
+
+feature_columns = [
+    "return1",
+    "range_pct",
+    "ema_gap",
+    "bb_position"
+]
+
+data = df.dropna(
+    subset=feature_columns
+).copy()
+
+if len(data) < int(lookback) + 80:
+    st.error("Gösterge hesaplamasından sonra yeterli veri kalmadı.")
+    st.stop()
+
+# Load deep-learning dependencies
 try:
-    chart_rows = get_last_30d_candles(selected)
-    chart = pd.DataFrame({
-        "Zaman (UTC)": pd.to_datetime([int(row[0]) for row in chart_rows], unit="ms", utc=True),
-        "Kapanış": [float(row[4]) for row in chart_rows],
-    })
-    if not chart.empty:
-        st.line_chart(chart.set_index("Zaman (UTC)")["Kapanış"], use_container_width=True)
-except MarketAPIError as exc:
-    st.warning(f"Grafik alınamadı: {exc}")
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import LSTM, Dense, Dropout
+    from tensorflow.keras.callbacks import EarlyStopping
 
-st.download_button(
-    "CSV indir",
-    data=results_df.to_csv(index=False).encode("utf-8-sig"),
-    file_name="okx_active_spot_usdt_30d_lows.csv",
-    mime="text/csv",
-)
+except Exception as exc:
+    st.error(
+        "TensorFlow yüklenemedi. Uyumlu Python sürümü kullanıp "
+        "'pip install -r requirements.txt' komutunu çalıştır."
+    )
+    st.code(str(exc))
+    st.stop()
 
-st.caption(
-    "Yalnızca OKX'te tarama anında `state='live'` olan Spot USDT pariteleri dahil edilir. "
-    "Bu filtre şu anda aktif olmayan/delist edilmiş pariteleri dışarıda bırakır; "
-    "geçmişte hiç delist edilip yeniden listelenmediğini garanti etmez. "
-    "Hesaplamada son 30 günlük tamamlanmış UTC günlük mumlar kullanılır. "
-    "Bu araç otomatik BUY/SELL emri vermez; dipte olmak fiyatın yükselmesini garanti etmez."
-)
+# Train and generate a signal
+if st.button(
+    "LSTM Eğit ve BUY / SELL Sinyali Üret",
+    type="primary"
+):
+
+    with st.spinner("LSTM modeli eğitiliyor..."):
+
+        # The final candle has no known next-candle outcome.
+        supervised = data.iloc[:-1].copy()
+
+        split_index = int(len(supervised) * 0.80)
+
+        if split_index <= int(lookback) + 20:
+            st.error(
+                "Eğitim ve test için daha fazla geçmiş veri yükle."
+            )
+            st.stop()
+
+        # Fit scaler on the training period only.
+        scaler = MinMaxScaler()
+
+        scaler.fit(
+            supervised[feature_columns].iloc[:split_index]
+        )
+
+        scaled_data = scaler.transform(
+            data[feature_columns]
+        )
+
+        X, y, indices = [], [], []
+
+        for i in range(int(lookback), len(data) - 1):
+            X.append(
+                scaled_data[i - int(lookback):i]
+            )
+
+            y.append(
+                int(data["target"].iloc[i])
+            )
+
+            indices.append(i)
+
+        X = np.asarray(X, dtype=np.float32)
+        y = np.asarray(y, dtype=np.float32)
+        indices = np.asarray(indices)
+
+        train_mask = indices < split_index
+        test_mask = indices >= split_index
+
+        X_train = X[train_mask]
+        y_train = y[train_mask]
+
+        X_test = X[test_mask]
+        y_test = y[test_mask]
+
+        if len(X_train) < 50 or len(X_test) < 10:
+            st.error(
+                "Eğitim veya test dizisi yetersiz. Daha fazla mum yükle."
+            )
+            st.stop()
+
+        # LSTM neural network
+        model = Sequential([
+            LSTM(
+                32,
+                input_shape=(
+                    int(lookback),
+                    len(feature_columns)
+                )
+            ),
+            Dropout(0.20),
+            Dense(16, activation="relu"),
+            Dense(1, activation="sigmoid")
+        ])
+
+        model.compile(
+            optimizer="adam",
+            loss="binary_crossentropy",
+            metrics=["accuracy"]
+        )
+
+        early_stopping = EarlyStopping(
+            monitor="val_loss",
+            patience=3,
+            restore_best_weights=True
+        )
+
+        model.fit(
+            X_train,
+            y_train,
+            validation_split=0.15,
+            epochs=int(epochs),
+            batch_size=32,
+            shuffle=False,
+            callbacks=[early_stopping],
+            verbose=0
+        )
+
+        # Historical holdout evaluation
+        test_probabilities = model.predict(
+            X_test,
+            verbose=0
+        ).reshape(-1)
+
+        test_predictions = (
+            test_probabilities >= 0.50
+        ).astype(int)
+
+        test_accuracy = accuracy_score(
+            y_test.astype(int),
+            test_predictions
+        )
+
+        # Predict direction for the next candle
+        latest_sequence = scaled_data[
+            -int(lookback):
+        ].reshape(
+            1,
+            int(lookback),
+            len(feature_columns)
+        )
+
+        probability_up = float(
+            model.predict(
+                latest_sequence,
+                verbose=0
+            )[0][0]
+        )
+
+        last = data.iloc[-1]
+
+        close = float(last["close"])
+        ema15 = float(last["ema15"])
+        bb_mid = float(last["bb_mid"])
+        bb_upper = float(last["bb_upper"])
+        bb_lower = float(last["bb_lower"])
+
+        # Indicator confirmation filters
+        buy_context = (
+            close > ema15
+            and close > bb_mid
+            and close < bb_upper
+        )
+
+        sell_context = (
+            close < ema15
+            and close < bb_mid
+            and close > bb_lower
+        )
+
+        signal = "NO SIGNAL"
+
+        reason = (
+            "Model and indicators do not agree. "
+            "No directional signal."
+        )
+
+        if (
+            probability_up >= confidence
+            and buy_context
+        ):
+            signal = "BUY"
+
+            reason = (
+                "LSTM upward probability passed the threshold; "
+                "EMA 15 and Bollinger conditions confirm the direction."
+            )
+
+        elif (
+            probability_up <= 1.0 - confidence
+            and sell_context
+        ):
+            signal = "SELL"
+
+            reason = (
+                "LSTM downward probability passed the threshold; "
+                "EMA 15 and Bollinger conditions confirm the direction."
+            )
+
+        st.session_state["vip_result"] = {
+            "asset": selected_asset,
+            "signal": signal,
+            "reason": reason,
+            "probability_up": probability_up,
+            "accuracy": float(test_accuracy),
+            "close": close,
+            "ema15": ema15,
+            "bb_mid": bb_mid,
+            "bb_upper": bb_upper,
+            "bb_lower": bb_lower,
+            "data": data.copy()
+        }
+
+# Display latest signal
+if (
+    "vip_result" in st.session_state
+    and st.session_state["vip_result"]["asset"] == selected_asset
+):
+
+    result = st.session_state["vip_result"]
+
+    st.subheader(
+        f"Son sinyal: {result['asset']}"
+    )
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    col1.metric(
+        "Sinyal",
+        result["signal"]
+    )
+
+    col2.metric(
+        "LSTM yükseliş tahmini",
+        f"{result['probability_up'] * 100:.1f}%"
+    )
+
+    col3.metric(
+        "Geçmiş test doğruluğu",
+        f"{result['accuracy'] * 100:.1f}%"
+    )
+
+    col4.metric(
+        "Son kapanış",
+        f"{result['close']:.8g}"
+    )
+
+    st.write(
+        "**Sinyal nedeni:** " + result["reason"]
+    )
+
+    st.caption(
+        "Model olasılığı kazanma oranı değildir. "
+        "Geçmiş test doğruluğu gelecekteki kârlılığı garanti etmez."
+    )
+
+    # Price and indicator chart
+    chart_data = result["data"].tail(180)
+
+    if "timestamp" in chart_data.columns:
+        x_axis = chart_data["timestamp"]
+    else:
+        x_axis = chart_data.index
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.04,
+        row_heights=[0.75, 0.25]
+    )
+
+    fig.add_trace(
+        go.Candlestick(
+            x=x_axis,
+            open=chart_data["open"],
+            high=chart_data["high"],
+            low=chart_data["low"],
+            close=chart_data["close"],
+            name="Price"
+        ),
+        row=1,
+        col=1
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=x_axis,
+            y=chart_data["ema15"],
+            name="EMA 15"
+        ),
+        row=1,
+        col=1
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=x_axis,
+            y=chart_data["bb_upper"],
+            name="BB Upper",
+            line=dict(dash="dot")
+        ),
+        row=1,
+        col=1
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=x_axis,
+            y=chart_data["bb_mid"],
+            name="BB Middle",
+            line=dict(dash="dot")
+        ),
+        row=1,
+        col=1
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=x_axis,
+            y=chart_data["bb_lower"],
+            name="BB Lower",
+            line=dict(dash="dot")
+        ),
+        row=1,
+        col=1
+    )
+
+    fig.add_trace(
+        go.Bar(
+            x=x_axis,
+            y=chart_data["volume"],
+            name="Volume"
+        ),
+        row=2,
+        col=1
+    )
+
+    fig.update_layout(
+        height=650,
+        xaxis_rangeslider_visible=False,
+        legend_orientation="h"
+    )
+
+    st.plotly_chart(
+        fig,
+        use_container_width=True
+    )
+
+    st.subheader("Gösterge değerleri")
+
+    st.dataframe(
+        pd.DataFrame([{
+            "Varlık": result["asset"],
+            "Close": result["close"],
+            "EMA 15": result["ema15"],
+            "BB Middle": result["bb_mid"],
+            "BB Upper": result["bb_upper"],
+            "BB Lower": result["bb_lower"],
+            "P(UP)": result["probability_up"],
+            "Sinyal": result["signal"]
+        }]),
+        use_container_width=True
+    )
+
+st.subheader("Sinyal açıklamaları")
+
+st.markdown("""
+- **BUY:** LSTM yükseliş olasılığı eşiği geçer ve göstergeler yükselişi destekler.
+- **SELL:** LSTM düşüş olasılığı eşiği geçer ve göstergeler düşüşü destekler.
+- **NO SIGNAL:** Koşullar uyuşmuyorsa sinyal üretilmez.
+- **5 dakika:** Yüklediğin mumlar 5 dakikalık olmalıdır.
+- **Otomatik işlem:** Bu uygulama emir göndermez.
+""")
