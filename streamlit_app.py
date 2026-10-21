@@ -134,7 +134,16 @@ for line in RAW_ASSETS.splitlines():
     })
 
 
+# Optional key entered in the sidebar. This value is kept in Streamlit's
+# widget session state, not written to disk or shown in the interface.
+API_KEY_OVERRIDE = ""
+
+
 def get_api_key():
+    manual_key = str(API_KEY_OVERRIDE or "").strip()
+    if manual_key:
+        return manual_key
+
     try:
         key = st.secrets.get("TWELVE_DATA_API_KEY", "")
         if key:
@@ -587,11 +596,25 @@ else:
     chosen = list(ASSETS)
 chosen = chosen[:int(asset_limit)]
 
+manual_api_key = st.sidebar.text_input(
+    "Twelve Data API Key",
+    type="password",
+    key="velora_twelve_data_key",
+    help=(
+        "API anahtarınızı buraya yapıştırın. İsterseniz bunun yerine "
+        "Streamlit Secrets içinde TWELVE_DATA_API_KEY tanımlayabilirsiniz."
+    ),
+)
+API_KEY_OVERRIDE = manual_api_key.strip()
+
 api_key = get_api_key()
 if api_key:
     st.sidebar.success("Twelve Data API anahtarı bulundu.")
 else:
-    st.sidebar.error("TWELVE_DATA_API_KEY tanımlı değil.")
+    st.sidebar.error(
+        "API anahtarı eksik. Anahtarı yukarıdaki alana yapıştırın "
+        "veya Streamlit Secrets bölümüne ekleyin."
+    )
 
 if "velora_results" not in st.session_state:
     st.session_state.velora_results = []
@@ -603,7 +626,10 @@ st.write(f"Her varlık için hedef: **{TARGET_CANDLES:,} tamamlanmış 1 dakikal
 
 if st.button("🔍 100.000 MUM İLE TARAMAYI BAŞLAT", type="primary", use_container_width=True):
     if not api_key:
-        st.error("Önce Streamlit Secrets bölümüne TWELVE_DATA_API_KEY ekleyin.")
+        st.error(
+            "Önce Twelve Data API anahtarını sol menüdeki alana yapıştırın "
+            "veya Streamlit Secrets bölümüne TWELVE_DATA_API_KEY ekleyin."
+        )
         st.stop()
 
     results = []
