@@ -1,7 +1,6 @@
-import os
-import time
+
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -10,271 +9,171 @@ import requests
 import streamlit as st
 
 # ============================================================
-# VELORA 1M HISTORICAL SCANNER
-# - Targets 100,000 completed one-minute candles per asset
-# - BUY / SELL signals only (NO SIGNAL is used internally)
-# - No trade execution
-# - Does not depend on Binance
-# - Does not claim proxy data is Binomo OTC data
+# VELORA — EMA 15 + BOLLINGER BANDS
+# 1-minute scanner | BUY / SELL only | No order execution
+# API key not required
 # ============================================================
 
-st.set_page_config(page_title="Velora 1M Scanner", page_icon="📊", layout="wide")
+st.set_page_config(
+    page_title="Velora — EMA15 Bollinger Scanner",
+    page_icon="📊",
+    layout="wide",
+)
 
-TARGET_CANDLES = 100_000
-INTERVAL_MINUTES = 1
 DB_PATH = "velora_history.sqlite3"
+TARGET_CANDLES = 100_000
 YAHOO_BASE = "https://query1.finance.yahoo.com/v8/finance/chart"
-HTTP_TIMEOUT = 30
+TIMEOUT = 20
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
-    "Accept": "application/json,text/plain,*/*",
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json",
 })
 
-
-# Asset format: display name | category | provider symbol | OTC label
-RAW_ASSETS = """
-Crypto IDX|index||0
-Bitcoin (OTC)|crypto|BTC/USD|1
-Ethereum (OTC)|crypto|ETH/USD|1
-Solana (OTC)|crypto|SOL/USD|1
-FC Barcelona Token (OTC)|crypto|BAR/USD|1
-Cardano (OTC)|crypto|ADA/USD|1
-Chainlink (OTC)|crypto|LINK/USD|1
-Bitcoin Cash (OTC)|crypto|BCH/USD|1
-Kusama (OTC)|crypto|KSM/USD|1
-Aave (OTC)|crypto|AAVE/USD|1
-Pancake Swap (OTC)|crypto|CAKE/USD|1
-Uniswap (OTC)|crypto|UNI/USD|1
-EUR/USD|forex|EUR/USD|0
-EUR/HUF|forex|EUR/HUF|0
-GBP/NOK|forex|GBP/NOK|0
-CAD/JPY|forex|CAD/JPY|0
-AUD/ZAR|forex|AUD/ZAR|0
-CAD/DKK|forex|CAD/DKK|0
-EUR/ILS|forex|EUR/ILS|0
-GBP/SGD|forex|GBP/SGD|0
-USD/MXN|forex|USD/MXN|0
-EUR/ZAR|forex|EUR/ZAR|0
-AUD/USD|forex|AUD/USD|0
-GBP/HKD|forex|GBP/HKD|0
-CAD/MXN|forex|CAD/MXN|0
-EUR/NOK|forex|EUR/NOK|0
-EUR/MXN|forex|EUR/MXN|0
-CHF/JPY|forex|CHF/JPY|0
-USD/ILS|forex|USD/ILS|0
-USD/SEK|forex|USD/SEK|0
-CAD/NOK|forex|CAD/NOK|0
-CAD/SEK|forex|CAD/SEK|0
-USD/PLN|forex|USD/PLN|0
-AUD/JPY|forex|AUD/JPY|0
-EUR/SEK|forex|EUR/SEK|0
-AUD/SGD|forex|AUD/SGD|0
-GBP/MXN|forex|GBP/MXN|0
-CAD/SGD|forex|CAD/SGD|0
-AUD/DKK|forex|AUD/DKK|0
-EUR/SGD|forex|EUR/SGD|0
-CHF/DKK|forex|CHF/DKK|0
-GBP/PLN|forex|GBP/PLN|0
-GBP/CZK|forex|GBP/CZK|0
-EUR/NZD|forex|EUR/NZD|0
-AUD/HUF|forex|AUD/HUF|0
-USD/HUF|forex|USD/HUF|0
-GBP/DKK|forex|GBP/DKK|0
-AUD/NOK|forex|AUD/NOK|0
-NZD/JPY|forex|NZD/JPY|0
-CHF/NOK|forex|CHF/NOK|0
-USD/JPY|forex|USD/JPY|0
-CHF/PLN|forex|CHF/PLN|0
-GBP/TRY|forex|GBP/TRY|0
-USD/CAD|forex|USD/CAD|0
-AUD/SEK|forex|AUD/SEK|0
-CHF/SEK|forex|CHF/SEK|0
-CHF/SGD|forex|CHF/SGD|0
-NOK/JPY|forex|NOK/JPY|0
-NOK/SEK|forex|NOK/SEK|0
-NZD/CAD|forex|NZD/CAD|0
-NZD/DKK|forex|NZD/DKK|0
-EUR/GBP (OTC)|forex|EUR/GBP|1
-GBP/NZD|forex|GBP/NZD|0
-NZD/USD|forex|NZD/USD|0
-NZD/HUF|forex|NZD/HUF|0
-NZD/NOK|forex|NZD/NOK|0
-NZD/SEK|forex|NZD/SEK|0
-NZD/SGD|forex|NZD/SGD|0
-SEK/JPY|forex|SEK/JPY|0
-SGD/JPY|forex|SGD/JPY|0
-SGD/HKD|forex|SGD/HKD|0
-USD/CHF|forex|USD/CHF|0
-AUD/CAD|forex|AUD/CAD|0
-USD/CZK|forex|USD/CZK|0
-NZD/CHF|forex|NZD/CHF|0
-GBP/CAD|forex|GBP/CAD|0
-AUD/NZD|forex|AUD/NZD|0
-USD/ZAR|forex|USD/ZAR|0
-AUD/CHF|forex|AUD/CHF|0
-GBP/USD|forex|GBP/USD|0
-GBP/HUF|forex|GBP/HUF|0
-EUR/PLN|forex|EUR/PLN|0
-ZAR/JPY|forex|ZAR/JPY|0
-CHF/HUF|forex|CHF/HUF|0
-USD/DKK|forex|USD/DKK|0
-GBP/CHF|forex|GBP/CHF|0
-Gold|metal|XAU/USD|0
-Yum Brands|stock|YUM|0
-""".strip()
-
-ASSETS = []
-for line in RAW_ASSETS.splitlines():
-    name, category, symbol, otc = line.split("|")
-    ASSETS.append({
-        "name": name,
-        "category": category,
-        "symbol": symbol or None,
-        "otc": otc == "1",
-    })
+# Yahoo Finance symbols. These are market-data proxies,
+# NOT actual Binomo OTC prices.
+ASSETS = [
+    {"name": "Bitcoin", "symbol": "BTC-USD", "category": "Crypto"},
+    {"name": "Ethereum", "symbol": "ETH-USD", "category": "Crypto"},
+    {"name": "Solana", "symbol": "SOL-USD", "category": "Crypto"},
+    {"name": "Cardano", "symbol": "ADA-USD", "category": "Crypto"},
+    {"name": "Chainlink", "symbol": "LINK-USD", "category": "Crypto"},
+    {"name": "Bitcoin Cash", "symbol": "BCH-USD", "category": "Crypto"},
+    {"name": "Avalanche", "symbol": "AVAX-USD", "category": "Crypto"},
+    {"name": "Dogecoin", "symbol": "DOGE-USD", "category": "Crypto"},
+    {"name": "XRP", "symbol": "XRP-USD", "category": "Crypto"},
+    {"name": "Polkadot", "symbol": "DOT-USD", "category": "Crypto"},
+    {"name": "EUR/USD", "symbol": "EURUSD=X", "category": "Forex"},
+    {"name": "GBP/USD", "symbol": "GBPUSD=X", "category": "Forex"},
+    {"name": "USD/JPY", "symbol": "JPY=X", "category": "Forex"},
+    {"name": "USD/CHF", "symbol": "CHF=X", "category": "Forex"},
+    {"name": "AUD/USD", "symbol": "AUDUSD=X", "category": "Forex"},
+    {"name": "USD/CAD", "symbol": "CAD=X", "category": "Forex"},
+    {"name": "NZD/USD", "symbol": "NZDUSD=X", "category": "Forex"},
+    {"name": "EUR/GBP", "symbol": "EURGBP=X", "category": "Forex"},
+    {"name": "Gold Futures (proxy)", "symbol": "GC=F", "category": "Other"},
+    {"name": "Apple", "symbol": "AAPL", "category": "Other"},
+    {"name": "Microsoft", "symbol": "MSFT", "category": "Other"},
+    {"name": "NVIDIA", "symbol": "NVDA", "category": "Other"},
+]
 
 
-def get_yahoo_symbol(asset):
-    """Convert the app's display symbol to a Yahoo Finance chart ticker."""
-    symbol = asset.get("symbol")
-    category = asset.get("category")
-
-    if not symbol:
-        return None
-
-    if category == "crypto":
-        return symbol.replace("/", "-")
-
-    if category == "forex":
-        # Yahoo FX ticker format, for example EURUSD=X
-        return symbol.replace("/", "") + "=X"
-
-    if category == "metal":
-        # Gold futures is a proxy, not a spot quote and not Binomo OTC.
-        return "GC=F" if symbol == "XAU/USD" else symbol
-
-    if category == "stock":
-        return symbol
-
-    return None
-
+# --------------------------- DATABASE ---------------------------
 
 def init_db():
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS candles (
                 symbol TEXT NOT NULL,
-                ts TEXT NOT NULL,
+                time TEXT NOT NULL,
                 open REAL NOT NULL,
                 high REAL NOT NULL,
                 low REAL NOT NULL,
                 close REAL NOT NULL,
                 volume REAL DEFAULT 0,
-                PRIMARY KEY(symbol, ts)
+                PRIMARY KEY (symbol, time)
             )
         """)
         conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_candles_symbol_ts
-            ON candles(symbol, ts)
+            CREATE INDEX IF NOT EXISTS idx_candles_symbol_time
+            ON candles(symbol, time)
         """)
         conn.commit()
 
 
-def db_read(symbol, start_iso, end_iso):
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        df = pd.read_sql_query(
-            """
-            SELECT ts AS time, open, high, low, close, volume
-            FROM candles
-            WHERE symbol = ? AND ts >= ? AND ts < ?
-            ORDER BY ts ASC
-            """,
-            conn,
-            params=(symbol, start_iso, end_iso),
-        )
-    if not df.empty:
-        df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
-    return df
-
-
-def db_read_all(symbol):
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        df = pd.read_sql_query(
-            """
-            SELECT ts AS time, open, high, low, close, volume
-            FROM candles
-            WHERE symbol = ?
-            ORDER BY ts ASC
-            """,
-            conn,
-            params=(symbol,),
-        )
-    if not df.empty:
-        df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
-    return df
-
-
-def db_write(symbol, df):
+def save_candles(symbol, df):
     if df is None or df.empty:
         return
-    records = []
+
+    rows = []
     for row in df.itertuples(index=False):
-        records.append((
+        timestamp = pd.Timestamp(row.time)
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize("UTC")
+        else:
+            timestamp = timestamp.tz_convert("UTC")
+
+        rows.append((
             symbol,
-            pd.Timestamp(row.time).tz_convert("UTC").strftime("%Y-%m-%d %H:%M:%S"),
-            float(row.open), float(row.high), float(row.low),
-            float(row.close), float(getattr(row, "volume", 0) or 0),
+            timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            float(row.open),
+            float(row.high),
+            float(row.low),
+            float(row.close),
+            float(row.volume),
         ))
+
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.executemany("""
             INSERT OR REPLACE INTO candles
-            (symbol, ts, open, high, low, close, volume)
+            (symbol, time, open, high, low, close, volume)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, records)
+        """, rows)
         conn.commit()
 
 
-def yahoo_fetch_recent_1m(yahoo_symbol):
-    """Fetch recent one-minute OHLCV bars from Yahoo's unauthenticated chart endpoint.
+def load_candles(symbol):
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        df = pd.read_sql_query("""
+            SELECT time, open, high, low, close, volume
+            FROM candles
+            WHERE symbol = ?
+            ORDER BY time ASC
+        """, conn, params=(symbol,))
 
-    This is an unofficial endpoint. Intraday history is limited and may be
-    unavailable for some symbols/regions; there is no guarantee of 100K bars.
-    """
-    if not yahoo_symbol:
-        raise RuntimeError("Bu varlık için desteklenen Yahoo sembolü yok.")
-
-    url = f"{YAHOO_BASE}/{requests.utils.quote(yahoo_symbol, safe='')}"
-    params = {
-        "range": "7d",
-        "interval": "1m",
-        "includePrePost": "false",
-        "events": "history",
-    }
-    response = SESSION.get(url, params=params, timeout=HTTP_TIMEOUT)
-    response.raise_for_status()
-    payload = response.json()
-
-    chart = payload.get("chart", {})
-    if chart.get("error"):
-        error = chart["error"] or {}
-        raise RuntimeError(
-            str(error.get("description") or error.get("code") or "Yahoo Finance veri hatası")
+    if not df.empty:
+        df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(
+            subset=["time", "open", "high", "low", "close"]
         )
+
+    return df
+
+
+# --------------------------- DATA SOURCE ---------------------------
+
+def fetch_yahoo_1m(symbol):
+    """
+    Fetch recent 1-minute candles without an API key.
+    Yahoo's unofficial endpoint has history and symbol limitations.
+    """
+
+    url = f"{YAHOO_BASE}/{requests.utils.quote(symbol, safe='')}"
+
+    response = SESSION.get(
+        url,
+        params={
+            "range": "7d",
+            "interval": "1m",
+            "includePrePost": "false",
+        },
+        timeout=TIMEOUT,
+    )
+    response.raise_for_status()
+
+    payload = response.json()
+    chart = payload.get("chart", {})
+
+    if chart.get("error"):
+        message = chart["error"].get("description", "Yahoo data error")
+        raise RuntimeError(message)
 
     results = chart.get("result") or []
     if not results:
-        raise RuntimeError("Yahoo Finance bu sembol için veri döndürmedi.")
+        raise RuntimeError("No data returned for this symbol.")
 
     item = results[0]
     timestamps = item.get("timestamp") or []
-    indicators = item.get("indicators", {})
-    quotes = indicators.get("quote") or []
+
+    quotes = item.get("indicators", {}).get("quote") or []
     if not timestamps or not quotes:
-        raise RuntimeError("Yanıtta mum verisi bulunamadı.")
+        raise RuntimeError("No candle data in provider response.")
 
     quote = quotes[0]
+
     df = pd.DataFrame({
         "time": pd.to_datetime(timestamps, unit="s", utc=True),
         "open": quote.get("open", []),
@@ -284,470 +183,556 @@ def yahoo_fetch_recent_1m(yahoo_symbol):
         "volume": quote.get("volume", []),
     })
 
-    for col in ("open", "high", "low", "close", "volume"):
-        if col not in df:
-            df[col] = 0.0
+    for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df["volume"] = df["volume"].fillna(0)
     df = df.dropna(subset=["time", "open", "high", "low", "close"])
     df = df.drop_duplicates(subset=["time"]).sort_values("time")
 
-    # Current forming minute is excluded.
-    cutoff = pd.Timestamp(datetime.now(timezone.utc).replace(second=0, microsecond=0))
-    df = df[df["time"] < cutoff]
+    # Exclude the current, unfinished minute candle.
+    current_minute = pd.Timestamp.now(tz="UTC").floor("min")
+    df = df[df["time"] < current_minute]
 
     if df.empty:
-        raise RuntimeError("Son 7 günlük aralıkta tamamlanmış 1 dakikalık mum bulunamadı.")
+        raise RuntimeError("No completed 1-minute candles available.")
 
-    return df[["time", "open", "high", "low", "close", "volume"]]
+    return df.reset_index(drop=True)
 
 
-def fetch_history_100k(asset, progress_callback=None):
-    """Collect recent no-key Yahoo 1m bars and combine with locally cached history.
-
-    100,000 candles is the target, not a promise: a no-key source usually only
-    provides a short recent intraday window. Repeated scans can accumulate bars
-    in SQLite over time, but cannot backfill unavailable history.
+def get_history(asset):
     """
+    Combine recently fetched candles with the local SQLite cache.
+    100,000 candles is a target, not a guaranteed data-provider result.
+    """
+
     init_db()
-    yahoo_symbol = get_yahoo_symbol(asset)
-    if not yahoo_symbol:
-        raise RuntimeError("Bu varlık için veri sağlayıcı sembolü tanımlı değil.")
+    symbol = asset["symbol"]
 
-    recent = yahoo_fetch_recent_1m(yahoo_symbol)
-    if not recent.empty:
-        db_write(yahoo_symbol, recent)
+    recent = fetch_yahoo_1m(symbol)
+    save_candles(symbol, recent)
 
-    stored = db_read_all(yahoo_symbol)
-    frames = [frame for frame in (stored, recent) if frame is not None and not frame.empty]
-    if not frames:
-        raise RuntimeError("Anahtarsız veri kaynağından mum alınamadı.")
+    cached = load_candles(symbol)
+    combined = pd.concat([cached, recent], ignore_index=True)
 
-    combined = pd.concat(frames, ignore_index=True)
-    combined["time"] = pd.to_datetime(combined["time"], utc=True, errors="coerce")
-    combined = combined.dropna(subset=["time", "open", "high", "low", "close"])
-    combined = combined.drop_duplicates(subset=["time"]).sort_values("time")
-    combined = combined[combined["time"] < pd.Timestamp(datetime.now(timezone.utc).replace(second=0, microsecond=0))]
-    combined = combined.tail(TARGET_CANDLES).reset_index(drop=True)
+    if combined.empty:
+        raise RuntimeError("No candle history available.")
 
-    if len(combined) < 60:
-        raise RuntimeError(
-            f"Yalnızca {len(combined):,} tamamlanmış mum alındı; sinyal için en az 60 mum gerekli."
-        )
+    combined = combined.drop_duplicates(subset=["time"], keep="last")
+    combined = combined.sort_values("time").reset_index(drop=True)
 
-    source = f"Yahoo Finance (anahtarsız, {yahoo_symbol}) + yerel SQLite önbelleği"
-    return combined, source
+    # Exclude unfinished candles even if they exist in the local cache.
+    current_minute = pd.Timestamp.now(tz="UTC").floor("min")
+    combined = combined[combined["time"] < current_minute]
+
+    return combined.reset_index(drop=True)
 
 
-def rsi_calc(close, period=14):
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - 100 / (1 + rs)
-    rsi = rsi.mask((avg_loss == 0) & (avg_gain > 0), 100)
-    rsi = rsi.mask((avg_gain == 0) & (avg_loss > 0), 0)
-    return rsi
+# --------------------------- INDICATORS ---------------------------
 
-
-def calculate_indicators(df):
+def add_indicators(df):
     df = df.copy()
-    if len(df) < 60:
-        return pd.DataFrame()
 
-    close, high, low = df["close"], df["high"], df["low"]
-    df["ema9"] = close.ewm(span=9, adjust=False).mean()
-    df["ema20"] = close.ewm(span=20, adjust=False).mean()
-    df["ema50"] = close.ewm(span=50, adjust=False).mean()
+    # EMA 15
+    df["ema15"] = df["close"].ewm(
+        span=15,
+        adjust=False,
+        min_periods=15,
+    ).mean()
 
-    df["bb_mid"] = close.rolling(20).mean()
-    std = close.rolling(20).std(ddof=0)
-    df["bb_upper"] = df["bb_mid"] + 2 * std
-    df["bb_lower"] = df["bb_mid"] - 2 * std
-    df["rsi"] = rsi_calc(close, 14)
+    # Bollinger Bands: 20-period SMA, 2 standard deviations
+    df["bb_mid"] = df["close"].rolling(
+        window=20,
+        min_periods=20,
+    ).mean()
 
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    df["macd"] = ema12 - ema26
-    df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
-    df["macd_hist"] = df["macd"] - df["macd_signal"]
+    rolling_std = df["close"].rolling(
+        window=20,
+        min_periods=20,
+    ).std(ddof=0)
 
-    low14, high14 = low.rolling(14).min(), high.rolling(14).max()
-    denom = (high14 - low14).replace(0, np.nan)
-    df["stoch_k"] = (close - low14) / denom * 100
-    df["stoch_d"] = df["stoch_k"].rolling(3).mean()
+    df["bb_upper"] = df["bb_mid"] + (2 * rolling_std)
+    df["bb_lower"] = df["bb_mid"] - (2 * rolling_std)
 
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        high - low,
-        (high - prev_close).abs(),
-        (low - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    df["atr"] = tr.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
-    df["atr_pct"] = df["atr"] / close.replace(0, np.nan) * 100
-
-    up, down = high.diff(), -low.diff()
-    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
-    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
-    plus_sm = plus_dm.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
-    minus_sm = minus_dm.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
-    atr_safe = df["atr"].replace(0, np.nan)
-    df["plus_di"] = 100 * plus_sm / atr_safe
-    df["minus_di"] = 100 * minus_sm / atr_safe
-    di_sum = (df["plus_di"] + df["minus_di"]).replace(0, np.nan)
-    df["dx"] = 100 * (df["plus_di"] - df["minus_di"]).abs() / di_sum
-    df["adx"] = df["dx"].ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
-
-    df["volume_sma"] = df["volume"].rolling(20).mean()
-    df["volume_ratio"] = df["volume"] / df["volume_sma"].replace(0, np.nan)
-    df["momentum_3m"] = (close / close.shift(3) - 1) * 100
     return df
 
 
-def make_signal(df, min_votes=4, min_margin=2):
-    if df is None or len(df) < 60:
-        return {"signal": "NO SIGNAL", "buy_score": 0, "sell_score": 0, "score": 0, "reason": "Yetersiz mum"}
+# --------------------------- SIGNAL LOGIC ---------------------------
 
-    row = df.iloc[-1]
+def generate_signal(df, lookback=15, band_mode="Touch or cross"):
+    """
+    SELL:
+      1. Price rose over the selected 15-17 candle period.
+      2. Close is above EMA 15.
+      3. Bollinger upper-band condition is satisfied.
+
+    BUY:
+      1. Price fell over the selected 15-17 candle period.
+      2. Close is below EMA 15.
+      3. Bollinger lower-band condition is satisfied.
+
+    Signals are analysis outputs, not trade instructions or guarantees.
+    """
+
+    empty = {
+        "signal": "NO SIGNAL",
+        "reason": "Not enough data or conditions not met.",
+        "change_pct": np.nan,
+        "trend": "Unknown",
+        "price": np.nan,
+        "ema15": np.nan,
+        "bb_upper": np.nan,
+        "bb_lower": np.nan,
+    }
+
+    if df is None or len(df) < max(lookback + 20, 40):
+        return empty
+
+    data = add_indicators(df)
+    last = data.iloc[-1]
+    start = data.iloc[-(lookback + 1)]
+
     required = [
-        "close", "ema20", "ema50", "rsi", "bb_upper", "bb_lower",
-        "macd", "macd_signal", "stoch_k", "stoch_d", "adx",
-        "plus_di", "minus_di",
+        last["close"], last["ema15"], last["bb_upper"],
+        last["bb_lower"], start["close"],
     ]
-    if any(pd.isna(row[k]) for k in required):
-        return {"signal": "NO SIGNAL", "buy_score": 0, "sell_score": 0, "score": 0, "reason": "İndikatör eksik"}
 
-    buy = sell = 0
-    reasons = []
-    close = float(row["close"])
+    if any(pd.isna(x) for x in required):
+        return empty
 
-    if close > row["ema20"] > row["ema50"]:
-        buy += 1
-        reasons.append("EMA trendi yukarı")
-    elif close < row["ema20"] < row["ema50"]:
-        sell += 1
-        reasons.append("EMA trendi aşağı")
+    start_price = float(start["close"])
+    price = float(last["close"])
+    ema15 = float(last["ema15"])
+    upper = float(last["bb_upper"])
+    lower = float(last["bb_lower"])
 
-    if close <= row["bb_lower"] * 1.01:
-        buy += 1
-        reasons.append("Alt Bollinger bandı")
-    elif close >= row["bb_upper"] * 0.99:
-        sell += 1
-        reasons.append("Üst Bollinger bandı")
+    if start_price == 0:
+        return empty
 
-    if row["rsi"] < 30:
-        buy += 1
-        reasons.append("RSI aşırı satım")
-    elif row["rsi"] > 70:
-        sell += 1
-        reasons.append("RSI aşırı alım")
-    elif 50 < row["rsi"] < 68:
-        buy += 1
-    elif 32 < row["rsi"] < 50:
-        sell += 1
+    change_pct = (price - start_price) / start_price * 100
 
-    if row["macd"] > row["macd_signal"] and row["macd_hist"] > 0:
-        buy += 1
-        reasons.append("MACD pozitif")
-    elif row["macd"] < row["macd_signal"] and row["macd_hist"] < 0:
-        sell += 1
-        reasons.append("MACD negatif")
+    rising = price > start_price
+    falling = price < start_price
 
-    if row["stoch_k"] < 20 and row["stoch_k"] > row["stoch_d"]:
-        buy += 1
-        reasons.append("Stochastic yukarı kesişim")
-    elif row["stoch_k"] > 80 and row["stoch_k"] < row["stoch_d"]:
-        sell += 1
-        reasons.append("Stochastic aşağı kesişim")
+    if rising:
+        trend = "Rising"
+    elif falling:
+        trend = "Falling"
+    else:
+        trend = "Flat"
 
-    if row["adx"] >= 20:
-        if row["plus_di"] > row["minus_di"]:
-            buy += 1
-            reasons.append("ADX yönü yukarı")
-        elif row["minus_di"] > row["plus_di"]:
-            sell += 1
-            reasons.append("ADX yönü aşağı")
+    if band_mode == "Touch or cross":
+        upper_condition = float(last["high"]) >= upper
+        lower_condition = float(last["low"]) <= lower
+    else:
+        upper_condition = price >= upper
+        lower_condition = price <= lower
 
-    if pd.notna(row.get("volume_ratio")) and row["volume_ratio"] >= 1.2:
-        if row["close"] > row["open"]:
-            buy += 1
-            reasons.append("Hacimli yeşil mum")
-        elif row["close"] < row["open"]:
-            sell += 1
-            reasons.append("Hacimli kırmızı mum")
+    # SELL: rising period + EMA15 confirmation + upper band
+    sell_condition = (
+        rising
+        and price > ema15
+        and upper_condition
+    )
 
-    if pd.notna(row.get("momentum_3m")):
-        if row["momentum_3m"] > 0:
-            buy += 1
-        elif row["momentum_3m"] < 0:
-            sell += 1
+    # BUY: falling period + EMA15 confirmation + lower band
+    buy_condition = (
+        falling
+        and price < ema15
+        and lower_condition
+    )
 
-    if buy >= min_votes and buy - sell >= min_margin:
-        signal = "BUY"
-    elif sell >= min_votes and sell - buy >= min_margin:
+    if sell_condition and not buy_condition:
         signal = "SELL"
+        reason = (
+            f"Last {lookback} candles rose by {change_pct:.3f}%; "
+            "close is above EMA 15 and upper Bollinger condition is met."
+        )
+    elif buy_condition and not sell_condition:
+        signal = "BUY"
+        reason = (
+            f"Last {lookback} candles fell by {change_pct:.3f}%; "
+            "close is below EMA 15 and lower Bollinger condition is met."
+        )
     else:
         signal = "NO SIGNAL"
-        reasons.append("Gösterge uyumu yetersiz")
+        reason = (
+            f"No complete setup. Trend={trend}; "
+            f"change={change_pct:.3f}%; "
+            f"close={price:.6g}; EMA15={ema15:.6g}."
+        )
 
-    score = min(100, round(max(buy, sell) / 8 * 100))
     return {
         "signal": signal,
-        "buy_score": buy,
-        "sell_score": sell,
-        "score": score,
-        "reason": "; ".join(reasons),
+        "reason": reason,
+        "change_pct": change_pct,
+        "trend": trend,
+        "price": price,
+        "ema15": ema15,
+        "bb_upper": upper,
+        "bb_lower": lower,
     }
 
 
-def scan_one(asset, min_votes, min_margin):
-    if asset["category"] == "index" or not asset["symbol"]:
-        return {
-            **asset, "signal": "NO SIGNAL", "score": 0,
-            "buy_score": 0, "sell_score": 0, "price": np.nan,
-            "rsi": np.nan, "adx": np.nan, "count": 0,
-            "source": "Desteklenen fiyat kaynağı yok",
-            "reason": "Crypto IDX için doğrudan sağlayıcı sembolü tanımlı değil.",
-            "candles": None, "error": "Desteklenen sembol yok",
-        }
+# --------------------------- SCANNER ---------------------------
 
+def scan_asset(asset, lookback, band_mode):
     try:
-        candles, source = fetch_history_100k(asset)
-        indicators = calculate_indicators(candles)
-        if indicators.empty:
-            raise RuntimeError("İndikatör hesaplamak için yeterli veri yok.")
+        candles = get_history(asset)
 
-        signal = make_signal(indicators, min_votes, min_margin)
-        last = indicators.iloc[-1]
+        if len(candles) < 40:
+            raise RuntimeError(
+                f"Only {len(candles)} candles available; more data is needed."
+            )
 
-        if asset["otc"]:
-            source += " — OTС DEĞİL; temel piyasa proxy verisi"
+        indicators = add_indicators(candles)
+        signal = generate_signal(indicators, lookback, band_mode)
 
         return {
             **asset,
-            "signal": signal["signal"],
-            "score": signal["score"],
-            "buy_score": signal["buy_score"],
-            "sell_score": signal["sell_score"],
-            "price": float(last["close"]),
-            "rsi": float(last["rsi"]) if pd.notna(last["rsi"]) else np.nan,
-            "adx": float(last["adx"]) if pd.notna(last["adx"]) else np.nan,
-            "momentum_3m": float(last["momentum_3m"]) if pd.notna(last["momentum_3m"]) else np.nan,
-            "count": len(candles),
-            "source": source,
-            "reason": signal["reason"],
+            **signal,
+            "count": len(indicators),
+            "progress_pct": min(
+                100.0,
+                len(indicators) / TARGET_CANDLES * 100,
+            ),
             "candles": indicators,
             "error": None,
+            "source": "Yahoo Finance + local SQLite cache",
         }
+
     except Exception as exc:
         return {
             **asset,
-            "signal": "NO SIGNAL", "score": 0,
-            "buy_score": 0, "sell_score": 0,
-            "price": np.nan, "rsi": np.nan, "adx": np.nan,
-            "momentum_3m": np.nan, "count": 0,
-            "source": "Veri alınamadı",
-            "reason": "Sinyal oluşturulmadı; veri hatası.",
-            "candles": None, "error": str(exc),
+            "signal": "NO SIGNAL",
+            "reason": "Signal not calculated because data was unavailable.",
+            "change_pct": np.nan,
+            "trend": "Unknown",
+            "price": np.nan,
+            "ema15": np.nan,
+            "bb_upper": np.nan,
+            "bb_lower": np.nan,
+            "count": 0,
+            "progress_pct": 0.0,
+            "candles": None,
+            "error": str(exc),
+            "source": "Unavailable",
         }
 
 
-# ================================ UI ================================
+# --------------------------- USER INTERFACE ---------------------------
 
-st.title("📊 Velora — 100K Mum / 1 Dakika")
-st.caption("BUY / SELL teknik tarayıcı • Binance kullanmaz • Emir göndermez")
+st.title("📊 Velora — EMA 15 + Bollinger Bands")
+st.caption(
+    "1-minute market scanner | BUY / SELL signals only | "
+    "No automatic order execution"
+)
 
 st.warning(
-    "Bu sürüm API anahtarı istemez; Yahoo Finance'in anahtarsız, resmi olmayan "
-    "grafik uç noktasından son 7 günlük 1 dakikalık veriyi dener. Bu kaynak "
-    "100.000 tarihsel mumu tek seferde sağlayamaz ve tüm sembolleri desteklemez. "
-    "Gerçek Binomo OTC mumları burada bulunmaz. OTC etiketi yalnızca gösterim etiketidir."
+    "API key is not required. This app attempts to retrieve recent 1-minute "
+    "candles from Yahoo Finance's unofficial chart endpoint. Data availability "
+    "depends on the symbol and provider. These are not actual Binomo OTC quotes."
 )
 
 st.info(
-    "100.000 adet 1 dakikalık mum yaklaşık 69,4 gün kesintisiz veridir. "
-    "Anahtarsız kaynak sadece sınırlı yakın geçmiş sağlayabilir; SQLite önbelleği "
-    "verileri taramalar arasında biriktirir, ancak geçmişte hiç sunulmayan mumları "
-    "oluşturamaz. Streamlit Cloud yeniden dağıtımlarında yerel önbellek silinebilir."
+    "100,000 one-minute candles represent about 69.4 days of continuous data. "
+    "The free source usually cannot provide this much intraday history. "
+    "The SQLite cache can accumulate data over time, but it cannot recreate "
+    "historical candles that the provider never supplied. Cloud redeployments "
+    "may also reset local files."
 )
 
-st.sidebar.header("Tarama ayarları")
-group = st.sidebar.selectbox("Varlık kapsamı", ["Tümü", "Kripto", "Forex", "Diğer"])
-min_votes = st.sidebar.slider("Minimum gösterge puanı", 3, 7, 4)
-min_margin = st.sidebar.slider("BUY/SELL puan farkı", 1, 4, 2)
+st.sidebar.header("Scanner settings")
+
+category = st.sidebar.selectbox(
+    "Asset category",
+    ["All", "Crypto", "Forex", "Other"],
+)
+
+lookback = st.sidebar.select_slider(
+    "Candles used to measure rise/fall",
+    options=[15, 16, 17],
+    value=15,
+)
+
+band_mode = st.sidebar.radio(
+    "Bollinger confirmation",
+    ["Touch or cross", "Close outside band"],
+    index=0,
+)
+
 asset_limit = st.sidebar.number_input(
-    "Bu taramada en fazla kaç varlık?", min_value=1, max_value=len(ASSETS),
-    value=min(10, len(ASSETS)), step=1,
+    "Maximum assets per scan",
+    min_value=1,
+    max_value=len(ASSETS),
+    value=min(10, len(ASSETS)),
+    step=1,
 )
-include_no_signal = st.sidebar.checkbox("NO SIGNAL sonuçlarını göster", value=True)
 
-if group == "Kripto":
-    chosen = [a for a in ASSETS if a["category"] == "crypto"]
-elif group == "Forex":
-    chosen = [a for a in ASSETS if a["category"] == "forex"]
-elif group == "Diğer":
-    chosen = [a for a in ASSETS if a["category"] in ("metal", "stock", "index")]
+show_no_signal = st.sidebar.checkbox(
+    "Show NO SIGNAL results",
+    value=True,
+)
+
+if category == "Crypto":
+    selected_assets = [a for a in ASSETS if a["category"] == "Crypto"]
+elif category == "Forex":
+    selected_assets = [a for a in ASSETS if a["category"] == "Forex"]
+elif category == "Other":
+    selected_assets = [a for a in ASSETS if a["category"] == "Other"]
 else:
-    chosen = list(ASSETS)
-chosen = chosen[:int(asset_limit)]
+    selected_assets = list(ASSETS)
 
-st.sidebar.success("Anahtar gerekmiyor — Yahoo Finance anahtarsız veri kaynağı")
-st.sidebar.caption(
-    "Not: 1 dakikalık tarihçe sınırlıdır; tüm forex/kripto sembolleri bulunmayabilir."
+selected_assets = selected_assets[:int(asset_limit)]
+
+st.sidebar.success("No API key required")
+
+st.markdown("### Strategy rules")
+st.markdown(
+    f"""
+- **SELL:** The last {lookback} completed candles rose, the close is above
+  EMA 15, and the Bollinger upper-band condition is met.
+- **BUY:** The last {lookback} completed candles fell, the close is below
+  EMA 15, and the Bollinger lower-band condition is met.
+- **NO SIGNAL:** The complete setup is not present.
+- The current unfinished 1-minute candle is excluded.
+"""
 )
 
-if "velora_results" not in st.session_state:
-    st.session_state.velora_results = []
-if "velora_scan_time" not in st.session_state:
-    st.session_state.velora_scan_time = None
+st.write(f"Assets selected: **{len(selected_assets)}**")
+st.write(f"History target per asset: **{TARGET_CANDLES:,} completed candles**")
 
-st.write(f"Bu taramada seçilen varlık: **{len(chosen)}**")
-st.write(f"Her varlık için hedef: **{TARGET_CANDLES:,} tamamlanmış 1 dakikalık mum**")
-
-if st.button("🔍 100.000 MUM İLE TARAMAYI BAŞLAT", type="primary", use_container_width=True):
+if st.button(
+    "🔍 START SCAN",
+    type="primary",
+    use_container_width=True,
+):
     results = []
     progress = st.progress(0)
     status = st.empty()
 
-    # Keep low concurrency because the history job can make many API requests.
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    # Low concurrency to reduce provider errors.
+    with ThreadPoolExecutor(max_workers=2) as executor:
         futures = {
-            pool.submit(scan_one, asset, min_votes, min_margin): asset["name"]
-            for asset in chosen
+            executor.submit(scan_asset, asset, lookback, band_mode): asset
+            for asset in selected_assets
         }
+
         total = len(futures)
 
-        for i, future in enumerate(as_completed(futures), start=1):
+        for index, future in enumerate(as_completed(futures), start=1):
             try:
                 results.append(future.result())
             except Exception as exc:
+                asset = futures[future]
                 results.append({
-                    "name": futures[future], "signal": "NO SIGNAL",
-                    "error": str(exc), "reason": "Tarama hatası",
-                    "candles": None, "count": 0,
+                    **asset,
+                    "signal": "NO SIGNAL",
+                    "reason": "Scanner error.",
+                    "count": 0,
+                    "progress_pct": 0.0,
+                    "candles": None,
+                    "error": str(exc),
+                    "source": "Unavailable",
                 })
-            progress.progress(i / max(total, 1))
-            status.write(f"Tamamlanan varlık: {i}/{total}")
 
-    st.session_state.velora_results = results
-    st.session_state.velora_scan_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            progress.progress(index / max(total, 1))
+            status.write(f"Scanned {index} of {total} assets")
+
+    st.session_state["velora_results"] = results
+    st.session_state["velora_scan_time"] = datetime.now(
+        timezone.utc
+    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+
     progress.empty()
     status.empty()
 
-results = st.session_state.velora_results
+results = st.session_state.get("velora_results", [])
+
 if not results:
-    st.info("Tarama henüz başlatılmadı. Anahtarsız veri kaynağını denemek için taramayı başlat.")
+    st.info("Click START SCAN to retrieve data and calculate signals.")
     st.stop()
 
-valid = [r for r in results if r.get("candles") is not None and not r.get("error")]
-errors = [r for r in results if r.get("error")]
-buy = [r for r in valid if r.get("signal") == "BUY"]
-sell = [r for r in valid if r.get("signal") == "SELL"]
-no_signal = [r for r in valid if r.get("signal") == "NO SIGNAL"]
+valid_results = [
+    result for result in results
+    if result.get("candles") is not None and not result.get("error")
+]
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("100K geçmişi tamamlanan", sum(1 for r in valid if r.get("count") == TARGET_CANDLES))
-c2.metric("BUY", len(buy))
-c3.metric("SELL", len(sell))
-c4.metric("Veri hatası / eksik geçmiş", len(errors))
+errors = [result for result in results if result.get("error")]
 
-if st.session_state.velora_scan_time:
-    st.caption("Son tarama: " + st.session_state.velora_scan_time)
+buy_results = [
+    result for result in valid_results if result["signal"] == "BUY"
+]
+sell_results = [
+    result for result in valid_results if result["signal"] == "SELL"
+]
+no_signal_results = [
+    result for result in valid_results if result["signal"] == "NO SIGNAL"
+]
 
-st.subheader("🚨 BUY / SELL sinyalleri")
-signals = sorted(buy + sell, key=lambda r: r.get("score", 0), reverse=True)
+st.caption(
+    "Last scan: " + st.session_state.get("velora_scan_time", "Unknown")
+)
+
+col1, col2, col3, col4 = st.columns(4)
+col1.metric(
+    "Assets with 100K candles",
+    sum(1 for r in valid_results if r["count"] >= TARGET_CANDLES),
+)
+col2.metric("BUY", len(buy_results))
+col3.metric("SELL", len(sell_results))
+col4.metric("Data errors", len(errors))
+
+st.subheader("🚨 BUY / SELL signals")
+
+signals = buy_results + sell_results
+
 if signals:
-    st.dataframe(pd.DataFrame([{
-        "Varlık": r.get("name"),
-        "Sinyal": r.get("signal"),
-        "Fiyat": r.get("price"),
-        "Skor": r.get("score"),
-        "BUY puanı": r.get("buy_score"),
-        "SELL puanı": r.get("sell_score"),
-        "RSI": r.get("rsi"),
-        "ADX": r.get("adx"),
-        "Mum sayısı": r.get("count"),
-        "100K ilerleme %": round(min(100, r.get("count", 0) / TARGET_CANDLES * 100), 2),
-        "Kaynak": r.get("source"),
-        "Gerekçe": r.get("reason"),
-    } for r in signals]), use_container_width=True, hide_index=True)
+    signal_table = pd.DataFrame([{
+        "Asset": r["name"],
+        "Signal": r["signal"],
+        "Price": r["price"],
+        f"{lookback}-candle trend": r["trend"],
+        f"{lookback}-candle change (%)": r["change_pct"],
+        "EMA 15": r["ema15"],
+        "Bollinger upper": r["bb_upper"],
+        "Bollinger lower": r["bb_lower"],
+        "Candles stored": r["count"],
+        "100K progress (%)": round(r["progress_pct"], 2),
+        "Reason": r["reason"],
+    } for r in signals])
+
+    st.dataframe(
+        signal_table,
+        use_container_width=True,
+        hide_index=True,
+    )
 else:
-    st.info("Eşik koşullarını sağlayan BUY/SELL sinyali yok.")
+    st.info("No BUY or SELL setups currently meet all selected conditions.")
 
-st.subheader("📋 Tüm analiz sonuçları")
-shown = valid if include_no_signal else [r for r in valid if r.get("signal") != "NO SIGNAL"]
-if shown:
-    st.dataframe(pd.DataFrame([{
-        "Varlık": r.get("name"),
-        "Kategori": r.get("category"),
-        "Sinyal": r.get("signal"),
-        "Fiyat": r.get("price"),
-        "Skor": r.get("score"),
-        "Mum sayısı": r.get("count"),
-        "100K tamamlandı": r.get("count") == TARGET_CANDLES,
-        "100K ilerleme %": round(min(100, r.get("count", 0) / TARGET_CANDLES * 100), 2),
-        "Kaynak": r.get("source"),
-    } for r in shown]), use_container_width=True, hide_index=True)
+st.subheader("📋 All scan results")
 
-st.subheader("🔬 Varlık grafiği")
-chartable = [r for r in valid if r.get("candles") is not None]
+shown_results = (
+    valid_results
+    if show_no_signal
+    else [r for r in valid_results if r["signal"] != "NO SIGNAL"]
+)
+
+if shown_results:
+    all_table = pd.DataFrame([{
+        "Asset": r["name"],
+        "Category": r["category"],
+        "Signal": r["signal"],
+        "Price": r["price"],
+        "Trend": r["trend"],
+        "Candles stored": r["count"],
+        "100K complete": r["count"] >= TARGET_CANDLES,
+        "100K progress (%)": round(r["progress_pct"], 2),
+        "Source": r["source"],
+        "Reason": r["reason"],
+    } for r in shown_results])
+
+    st.dataframe(
+        all_table,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+st.subheader("📈 Asset chart")
+
+chartable = [
+    r for r in valid_results
+    if r.get("candles") is not None
+    and len(r["candles"]) > 0
+]
+
 if chartable:
-    selected_name = st.selectbox("Detaylı inceleme", [r["name"] for r in chartable])
-    selected = next(r for r in chartable if r["name"] == selected_name)
-    candles = selected["candles"]
-    st.write(f"**Veri kaynağı:** {selected['source']}")
-    st.write(f"**Alınan tamamlanmış mum:** {selected['count']:,} / {TARGET_CANDLES:,}")
-    st.write(f"**Sinyal:** {selected['signal']} — {selected['reason']}")
-    st.line_chart(candles.set_index("time")[["close", "ema20", "ema50"]].rename(
-        columns={"close": "Kapanış", "ema20": "EMA 20", "ema50": "EMA 50"}
-    ))
-    st.line_chart(candles.set_index("time")[["close", "bb_upper", "bb_mid", "bb_lower"]].rename(
-        columns={"close": "Kapanış", "bb_upper": "BB üst", "bb_mid": "BB orta", "bb_lower": "BB alt"}
-    ))
-    st.line_chart(candles.set_index("time")[["rsi"]].rename(columns={"rsi": "RSI"}))
-else:
-    st.info("Grafik için yeterli tarihsel veri bulunamadı.")
+    selected_name = st.selectbox(
+        "Choose an asset",
+        [r["name"] for r in chartable],
+    )
 
-st.subheader("⚠️ Verisi alınamayan veya 100K mum tamamlayamayan varlıklar")
-if errors:
-    st.dataframe(pd.DataFrame([{
-        "Varlık": r.get("name"),
-        "Alınan mum": r.get("count", 0),
-        "Hata": r.get("error"),
-    } for r in errors]), use_container_width=True, hide_index=True)
+    selected = next(
+        r for r in chartable if r["name"] == selected_name
+    )
+
+    chart_df = selected["candles"].tail(500).copy()
+    chart_df = chart_df.set_index("time")
+
+    st.write(f"**Signal:** {selected['signal']}")
+    st.write(f"**Reason:** {selected['reason']}")
+    st.write(
+        f"**Candles available:** {selected['count']:,} / "
+        f"{TARGET_CANDLES:,} target"
+    )
+
+    st.markdown("**Close price and EMA 15**")
+    st.line_chart(
+        chart_df[["close", "ema15"]].rename(columns={
+            "close": "Close",
+            "ema15": "EMA 15",
+        })
+    )
+
+    st.markdown("**Bollinger Bands**")
+    st.line_chart(
+        chart_df[["close", "bb_upper", "bb_mid", "bb_lower"]].rename(
+            columns={
+                "close": "Close",
+                "bb_upper": "Upper band",
+                "bb_mid": "Middle band",
+                "bb_lower": "Lower band",
+            }
+        )
+    )
 else:
-    st.success("Bu taramada veri hatası yok.")
+    st.info("No chart available because candle data could not be retrieved.")
+
+st.subheader("⚠️ Data errors")
+
+if errors:
+    st.dataframe(
+        pd.DataFrame([{
+            "Asset": r["name"],
+            "Symbol": r["symbol"],
+            "Error": r.get("error", "Unknown error"),
+        } for r in errors]),
+        use_container_width=True,
+        hide_index=True,
+    )
+else:
+    st.success("No data errors in this scan.")
 
 if results:
-    export = pd.DataFrame([{
+    export_df = pd.DataFrame([{
         "asset": r.get("name"),
         "symbol": r.get("symbol"),
         "category": r.get("category"),
         "signal": r.get("signal"),
         "price": r.get("price"),
-        "score": r.get("score"),
-        "buy_score": r.get("buy_score"),
-        "sell_score": r.get("sell_score"),
+        "trend": r.get("trend"),
+        "change_pct": r.get("change_pct"),
+        "ema15": r.get("ema15"),
+        "bb_upper": r.get("bb_upper"),
+        "bb_lower": r.get("bb_lower"),
         "candle_count": r.get("count"),
         "source": r.get("source"),
         "reason": r.get("reason"),
         "error": r.get("error"),
     } for r in results])
+
     st.download_button(
-        "📥 CSV sonuçlarını indir",
-        data=export.to_csv(index=False).encode("utf-8-sig"),
-        file_name="velora_100k_1m_scan.csv",
+        "📥 Download CSV results",
+        data=export_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="velora_scan_results.csv",
         mime="text/csv",
         use_container_width=True,
     )
 
 st.divider()
 st.caption(
-    "Velora yalnızca teknik analiz yapar; emir göndermez. Anahtarsız intraday kaynak "
-    "resmi olmayan ve sınırlı olabilir; 100.000 mum hedefi garanti değildir. "
-    "Sinyal skoru kazanma olasılığı değildir. OTC etiketli varlıklarda gerçek "
-    "Binomo OTC fiyatı kullanılmıyor."
+    "Velora only analyzes market data and does not place trades. "
+    "A signal is not a guarantee of a profitable outcome. Yahoo Finance "
+    "intraday history is limited and may fail for some symbols. The 100,000 "
+    "candle target is not guaranteed. Prices are not actual Binomo OTC quotes."
 )
