@@ -1,33 +1,25 @@
 
 import re
 import time
-import random
-from pathlib import Path
 from urllib.parse import urlparse, urljoin, parse_qs, unquote
 
 import requests
+import streamlit as st
 from bs4 import BeautifulSoup
 
-OUTPUT_FILE = "yacht_broker_emails.txt"
-MAX_SEARCH_PAGES = 10
-MAX_SITES = 150
-MAX_PAGES_PER_SITE = 5
+# --------------------------------------------------
+# AYARLAR
+# --------------------------------------------------
 
-SEARCH_QUERIES = [
-    '"yacht broker" contact email',
-    '"yacht brokerage" contact',
-    '"yacht sales" yacht broker email',
-    '"yacht broker" "contact us"',
-    '"yacht charter broker" contact email',
-    'yacht brokerage company Europe contact',
-    'yacht brokers USA contact',
-    'yacht brokers UK contact',
-    'yacht brokers Spain contact',
-    'yacht brokers Italy contact',
-    'yacht brokers Germany contact',
-    'yacht brokers France contact',
-    'yacht brokers Australia contact',
-]
+st.set_page_config(
+    page_title="Yacht Broker Email Extractor",
+    page_icon="🛥️",
+    layout="wide"
+)
+
+EMAIL_PATTERN = re.compile(
+    r"(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b"
+)
 
 HEADERS = {
     "User-Agent": (
@@ -36,27 +28,49 @@ HEADERS = {
     )
 }
 
-EMAIL_PATTERN = re.compile(
-    r"(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}\b"
-)
+SEARCH_QUERIES = [
+    '"yacht broker" contact email',
+    '"yacht brokerage" contact',
+    '"yacht sales" broker contact',
+    '"yacht charter broker" contact',
+    'yacht brokers Europe contact',
+    'yacht brokers United States contact',
+    'yacht brokers United Kingdom contact',
+    'yacht brokers Spain contact',
+    'yacht brokers Italy contact',
+    'yacht brokers Germany contact',
+    'yacht brokers France contact',
+    'yacht brokers Australia contact',
+]
 
 SKIP_EXTENSIONS = (
-    ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".zip",
-    ".webp", ".svg", ".mp4", ".mp3", ".doc", ".docx"
+    ".pdf", ".jpg", ".jpeg", ".png", ".gif",
+    ".zip", ".webp", ".svg", ".mp4", ".mp3"
 )
 
-session = requests.Session()
-session.headers.update(HEADERS)
+CONTACT_KEYWORDS = (
+    "contact", "about", "team", "broker", "office",
+    "impressum", "kontakt", "our-company"
+)
 
 
-def search_web(query, max_results=20):
-    """DuckDuckGo HTML sonuçlarından web adreslerini alır."""
-    urls = []
+# --------------------------------------------------
+# HTTP VE ARAMA FONKSİYONLARI
+# --------------------------------------------------
+
+def get_domain(url):
+    return urlparse(url).netloc.lower().removeprefix("www.")
+
+
+def search_web(query, max_results=15):
+    """DuckDuckGo HTML arama sonuçlarından URL toplar."""
+    results = []
 
     try:
-        response = session.get(
+        response = requests.get(
             "https://html.duckduckgo.com/html/",
             params={"q": query},
+            headers=HEADERS,
             timeout=20
         )
         response.raise_for_status()
@@ -64,17 +78,17 @@ def search_web(query, max_results=20):
         soup = BeautifulSoup(response.text, "html.parser")
 
         for link in soup.select("a.result__a"):
-            href = link.get("href", "")
+            href = link.get("href", "").strip()
+
             if not href:
                 continue
 
             parsed = urlparse(href)
 
-            # DuckDuckGo yönlendirme adreslerini çöz
             if "duckduckgo.com" in parsed.netloc:
-                target = parse_qs(parsed.query).get("uddg", [])
-                if target:
-                    href = unquote(target[0])
+                targets = parse_qs(parsed.query).get("uddg", [])
+                if targets:
+                    href = unquote(targets[0])
 
             parsed = urlparse(href)
 
@@ -85,31 +99,33 @@ def search_web(query, max_results=20):
                    for ext in SKIP_EXTENSIONS):
                 continue
 
-            urls.append(href)
+            if href not in results:
+                results.append(href)
+
+            if len(results) >= max_results:
+                break
 
     except requests.RequestException as exc:
-        print(f"Arama hatası: {exc}")
+        st.warning(f"Arama yapılamadı: {exc}")
 
-    return urls[:max_results]
-
-
-def get_domain(url):
-    return urlparse(url).netloc.lower().removeprefix("www.")
+    return results
 
 
-def get_page(url):
-    """HTML sayfasını indirir; desteklenmeyen içerikleri atlar."""
+def fetch_html(url):
+    """Yalnızca HTML sayfalarını indirir."""
     try:
-        response = session.get(
+        response = requests.get(
             url,
-            timeout=15,
-            allow_redirects=True
+            headers=HEADERS,
+            timeout=15
         )
-
-        content_type = response.headers.get("Content-Type", "").lower()
 
         if response.status_code != 200:
             return None
+
+        content_type = response.headers.get(
+            "Content-Type", ""
+        ).lower()
 
         if "text/html" not in content_type:
             return None
@@ -120,34 +136,37 @@ def get_page(url):
         return None
 
 
+# --------------------------------------------------
+# E-POSTA ÇIKARMA
+# --------------------------------------------------
+
 def extract_emails(html):
     soup = BeautifulSoup(html, "html.parser")
     found = set()
 
-    # Sayfa metnindeki e-postalar
+    # Sayfa metninden
     text = soup.get_text(" ", strip=True)
     found.update(EMAIL_PATTERN.findall(text))
 
-    # mailto bağlantıları
+    # mailto bağlantılarından
     for link in soup.select('a[href^="mailto:"]'):
-        address = link.get("href", "").split(":", 1)[1]
-        address = address.split("?", 1)[0].strip()
+        href = link.get("href", "")
+        address = href.split(":", 1)[-1].split("?", 1)[0]
         found.update(EMAIL_PATTERN.findall(address))
 
-    # Bariz örnek ve dosya uzantısı hatalarını ele
     cleaned = set()
 
     for email in found:
         email = email.strip(".,;:()[]{}<>").lower()
         domain = email.rsplit("@", 1)[-1]
 
-        if domain.endswith((".png", ".jpg", ".gif", ".webp")):
-            continue
-
         if ".." in email or ".." in domain:
             continue
 
-        if email.endswith((".example", ".invalid", ".test")):
+        if domain.endswith((
+            ".png", ".jpg", ".jpeg", ".gif",
+            ".webp", ".example", ".invalid", ".test"
+        )):
             continue
 
         cleaned.add(email)
@@ -155,21 +174,18 @@ def extract_emails(html):
     return cleaned
 
 
-def find_contact_pages(base_url, html):
+def find_contact_pages(base_url, html, limit=4):
     soup = BeautifulSoup(html, "html.parser")
-    candidates = []
-
-    keywords = (
-        "contact", "about", "team", "broker", "office",
-        "impressum", "kontakt", "contact-us", "our-company"
-    )
+    pages = []
 
     for link in soup.find_all("a", href=True):
         href = link["href"].strip()
         label = link.get_text(" ", strip=True).lower()
-        combined = (href + " " + label).lower()
 
-        if not any(word in combined for word in keywords):
+        if not any(
+            word in (href + " " + label).lower()
+            for word in CONTACT_KEYWORDS
+        ):
             continue
 
         absolute = urljoin(base_url, href)
@@ -185,83 +201,260 @@ def find_contact_pages(base_url, html):
                for ext in SKIP_EXTENSIONS):
             continue
 
-        if absolute not in candidates:
-            candidates.append(absolute)
+        if absolute not in pages:
+            pages.append(absolute)
 
-    return candidates
+        if len(pages) >= limit:
+            break
+
+    return pages
 
 
-def main():
-    all_urls = []
+# --------------------------------------------------
+# STREAMLIT ARAYÜZÜ
+# --------------------------------------------------
+
+st.title("🛥️ Yacht Broker Email Extractor")
+
+st.write(
+    "Yat brokerları ve yat satış şirketlerinin herkese açık "
+    "web sayfalarını araştırın, bulunan e-posta adreslerini "
+    "TXT veya CSV olarak dışa aktarın."
+)
+
+with st.sidebar:
+    st.header("Arama ayarları")
+
+    max_sites = st.slider(
+        "İncelenecek maksimum web sitesi",
+        min_value=5,
+        max_value=100,
+        value=25,
+        step=5
+    )
+
+    queries_to_use = st.slider(
+        "Arama sorgusu sayısı",
+        min_value=1,
+        max_value=len(SEARCH_QUERIES),
+        value=6
+    )
+
+    pages_per_site = st.slider(
+        "Her sitedeki ek iletişim sayfası",
+        min_value=0,
+        max_value=4,
+        value=2
+    )
+
+    custom_query = st.text_input(
+        "Ek arama terimi (isteğe bağlı)",
+        placeholder="Örn. yacht brokers Greece contact"
+    )
+
+st.caption(
+    "Not: Sonuç sayısı arama motorunun erişimine, "
+    "web sitelerinin içeriğine ve engellemelerine bağlıdır."
+)
+
+if "emails" not in st.session_state:
+    st.session_state.emails = set()
+
+if "visited_sites" not in st.session_state:
+    st.session_state.visited_sites = []
+
+if "scan_complete" not in st.session_state:
+    st.session_state.scan_complete = False
+
+col1, col2 = st.columns(2)
+
+with col1:
+    start_scan = st.button(
+        "🔎 İnternette Ara",
+        type="primary",
+        use_container_width=True
+    )
+
+with col2:
+    clear_results = st.button(
+        "🗑️ Sonuçları Temizle",
+        use_container_width=True
+    )
+
+if clear_results:
+    st.session_state.emails = set()
+    st.session_state.visited_sites = []
+    st.session_state.scan_complete = False
+    st.rerun()
+
+
+# --------------------------------------------------
+# TARAMA İŞLEMİ
+# --------------------------------------------------
+
+if start_scan:
+    st.session_state.emails = set()
+    st.session_state.visited_sites = []
+    st.session_state.scan_complete = False
+
+    queries = SEARCH_QUERIES[:queries_to_use]
+
+    if custom_query.strip():
+        queries.append(custom_query.strip())
+
+    discovered_urls = []
     seen_domains = set()
-    emails = set()
 
-    print("=" * 55)
-    print("     YACHT BROKER EMAIL EXTRACTOR")
-    print("=" * 55)
+    progress = st.progress(0)
+    status = st.empty()
 
-    # 1. İnternet araması
-    for query in SEARCH_QUERIES[:MAX_SEARCH_PAGES]:
-        print(f"\nAranıyor: {query}")
+    status.info("Arama motorunda web siteleri aranıyor...")
 
-        urls = search_web(query, max_results=20)
+    for query_index, query in enumerate(queries):
+        status.write(
+            f"Arama {query_index + 1}/{len(queries)}: {query}"
+        )
+
+        urls = search_web(query, max_results=15)
 
         for url in urls:
             domain = get_domain(url)
 
             if domain and domain not in seen_domains:
                 seen_domains.add(domain)
-                all_urls.append(url)
+                discovered_urls.append(url)
 
-        print(f"Bulunan farklı web sitesi: {len(all_urls)}")
-        time.sleep(random.uniform(2, 4))
-
-    all_urls = all_urls[:MAX_SITES]
-
-    # 2. Şirket sitelerini incele
-    for index, url in enumerate(all_urls, start=1):
-        print(f"\n[{index}/{len(all_urls)}] {url}")
-
-        html = get_page(url)
-        if not html:
-            print("Sayfa okunamadı.")
-            continue
-
-        found = extract_emails(html)
-        emails.update(found)
-
-        # İletişim ve hakkında sayfalarını incele
-        contact_pages = find_contact_pages(url, html)
-
-        for contact_url in contact_pages[:MAX_PAGES_PER_SITE - 1]:
-            time.sleep(random.uniform(1.5, 3))
-
-            contact_html = get_page(contact_url)
-            if contact_html:
-                emails.update(extract_emails(contact_html))
-
-        # Her yeni sonuçtan sonra TXT dosyasını güncelle
-        Path(OUTPUT_FILE).write_text(
-            "".join(email + "\n" for email in sorted(emails)),
-            encoding="utf-8"
+        progress.progress(
+            min((query_index + 1) / len(queries), 1.0)
         )
 
-        print(f"Toplam benzersiz e-posta: {len(emails)}")
-        time.sleep(random.uniform(1.5, 3))
+        time.sleep(1)
 
-    # 3. Son kayıt
-    Path(OUTPUT_FILE).write_text(
-        "".join(email + "\n" for email in sorted(emails)),
-        encoding="utf-8"
+    discovered_urls = discovered_urls[:max_sites]
+
+    if not discovered_urls:
+        st.warning(
+            "Arama sonucu bulunamadı. Arama motoru erişimi "
+            "engellenmiş olabilir. Biraz sonra tekrar deneyin."
+        )
+    else:
+        st.info(
+            f"{len(discovered_urls)} farklı web sitesi incelenecek."
+        )
+
+        site_progress = st.progress(0)
+
+        for index, url in enumerate(discovered_urls, start=1):
+            status.write(
+                f"Site inceleniyor: {index}/{len(discovered_urls)} — {url}"
+            )
+
+            html = fetch_html(url)
+
+            if html:
+                found = extract_emails(html)
+                st.session_state.emails.update(found)
+
+                contact_pages = find_contact_pages(
+                    url,
+                    html,
+                    limit=pages_per_site
+                )
+
+                for contact_url in contact_pages:
+                    time.sleep(0.5)
+                    contact_html = fetch_html(contact_url)
+
+                    if contact_html:
+                        st.session_state.emails.update(
+                            extract_emails(contact_html)
+                        )
+
+            st.session_state.visited_sites.append(url)
+
+            site_progress.progress(
+                index / len(discovered_urls)
+            )
+
+        st.session_state.scan_complete = True
+        status.success("Tarama tamamlandı!")
+
+
+# --------------------------------------------------
+# SONUÇLAR VE İNDİRME
+# --------------------------------------------------
+
+emails = sorted(st.session_state.emails)
+
+st.divider()
+st.subheader("📊 Tarama Sonuçları")
+
+metric1, metric2, metric3 = st.columns(3)
+
+metric1.metric("Benzersiz e-posta", len(emails))
+metric2.metric(
+    "İncelenen site",
+    len(st.session_state.visited_sites)
+)
+metric3.metric(
+    "Tarama durumu",
+    "Tamamlandı" if st.session_state.scan_complete
+    else "Hazır"
+)
+
+if emails:
+    st.success(f"{len(emails)} benzersiz e-posta adresi bulundu.")
+
+    search_filter = st.text_input(
+        "Sonuçlarda ara",
+        placeholder="Örn. info, sales, broker..."
     )
 
-    print("\n" + "=" * 55)
-    print("İŞLEM TAMAMLANDI")
-    print(f"İncelenen web sitesi: {len(all_urls)}")
-    print(f"Bulunan benzersiz e-posta: {len(emails)}")
-    print(f"TXT dosyası: {Path(OUTPUT_FILE).resolve()}")
-    print("=" * 55)
+    filtered_emails = [
+        email for email in emails
+        if search_filter.lower() in email.lower()
+    ]
 
+    st.dataframe(
+        {"Email": filtered_emails},
+        use_container_width=True,
+        hide_index=True
+    )
 
-if __name__ == "__main__":
-    main()
+    txt_content = "\n".join(filtered_emails) + "\n"
+
+    st.download_button(
+        label="📄 TXT olarak indir",
+        data=txt_content,
+        file_name="yacht_broker_emails.txt",
+        mime="text/plain",
+        use_container_width=True
+    )
+
+    csv_content = "email\n" + "\n".join(filtered_emails) + "\n"
+
+    st.download_button(
+        label="📊 CSV olarak indir",
+        data=csv_content,
+        file_name="yacht_broker_emails.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+else:
+    st.info(
+        "Henüz e-posta bulunmadı. Yukarıdaki 'İnternette Ara' "
+        "düğmesine basarak taramayı başlatın."
+    )
+
+if st.session_state.visited_sites:
+    with st.expander("İncelenen web sitelerini göster"):
+        for site in st.session_state.visited_sites:
+            st.write(site)
+
+st.caption(
+    "Yalnızca erişilebilir, herkese açık sayfalar incelenir. "
+    "E-posta adreslerinin geçerliliği ayrıca doğrulanmalıdır. "
+    "Web sitelerinin kullanım koşullarına ve geçerli veri "
+    "koruma kurallarına uyun."
+)
