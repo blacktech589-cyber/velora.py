@@ -338,7 +338,15 @@ if results is not None and len(results) > 0:
 
     if not errors.empty:
         with st.expander(f"Veri alınamayan varlıklar ({len(errors)})"):
-            st.dataframe(errors[["Asset", "Symbol", "Status"]], use_container_width=True, hide_index=True)
+            # Older saved results may not contain all columns; add them safely.
+            for column in ["Asset", "Symbol", "Status"]:
+                if column not in errors.columns:
+                    errors[column] = ""
+            st.dataframe(
+                errors[["Asset", "Symbol", "Status"]],
+                use_container_width=True,
+                hide_index=True,
+            )
 
     if mode == "Tek varlık":
         matching = [item for item in results if item["Asset"] == selected_asset]
