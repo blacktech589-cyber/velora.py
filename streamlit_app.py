@@ -1,112 +1,84 @@
-
-import streamlit as st
-import pandas as pd
-import urllib.request
-import urllib.parse
 import json
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+import pandas as pd
+import streamlit as st
+
 
 st.set_page_config(
-    page_title="400 Candle Market Extremes",
+    page_title="3000 Candle Market Extremes",
     page_icon="📊",
-    layout="wide"
+    layout="wide",
 )
 
+LOOKBACK_DEFAULT = 3000
+
+# These are public-market Yahoo Finance symbols where available.
+# Binomo OTC instruments may not match these external data sources.
 ASSETS = {
-    "Crypto IDX": None,
-    "Booo": None,
-    "Ghosty": None,
-    "Dusky": None,
-    "Bitcoin (OTC)": "BTC-USD",
-    "Ethereum (OTC)": "ETH-USD",
-    "Solana (OTC)": "SOL-USD",
+    "Bitcoin": "BTC-USD",
+    "Ethereum": "ETH-USD",
+    "Solana": "SOL-USD",
+    "Cardano": "ADA-USD",
+    "Chainlink": "LINK-USD",
+    "Litecoin": "LTC-USD",
+    "Bitcoin Cash": "BCH-USD",
     "EUR/USD": "EURUSD=X",
-    "AUD/USD (OTC)": "AUDUSD=X",
-    "GBP/NOK": "GBPNOK=X",
-    "CAD/JPY": "CADJPY=X",
-    "FC Barcelona Token (OTC)": None,
-    "AUD/ZAR": "AUDZAR=X",
-    "CAD/DKK": "CADDKK=X",
-    "GBP/SGD": "GBPSGD=X",
-    "Cardano (OTC)": "ADA-USD",
-    "EUR/ZAR": "EURZAR=X",
-    "GBP/HKD": "GBPHKD=X",
-    "CAD/MXN": "CADMXN=X",
-    "CHF/JPY": "CHFJPY=X",
-    "NZD/USD (OTC)": "NZDUSD=X",
-    "EUR/MXN": "EURMXN=X",
-    "CAD/SEK": "CADSEK=X",
-    "CAD/NOK": "CADNOK=X",
-    "AUD/JPY": "AUDJPY=X",
-    "Chainlink (OTC)": "LINK-USD",
-    "GBP/MXN": "GBPMXN=X",
-    "AUD/SGD": "AUDSGD=X",
-    "AUD/DKK": "AUDDKK=X",
-    "GBP/CZK": "GBPCZK=X",
+    "GBP/USD": "GBPUSD=X",
+    "AUD/USD": "AUDUSD=X",
+    "NZD/USD": "NZDUSD=X",
+    "USD/JPY": "JPY=X",
     "EUR/JPY": "EURJPY=X",
-    "NZD/JPY": "NZDJPY=X",
-    "GBP/TRY": "GBPTRY=X",
-    "AUD/SEK": "AUDSEK=X",
-    "GBP/JPY (OTC)": "GBPJPY=X",
-    "NZD/CAD": "NZDCAD=X",
-    "NZD/DKK": "NZDDKK=X",
-    "EUR/GBP (OTC)": "EURGBP=X",
-    "NZD/SEK": "NZDSEK=X",
-    "SGD/JPY": "SGDJPY=X",
+    "GBP/JPY": "GBPJPY=X",
+    "EUR/GBP": "EURGBP=X",
+    "AUD/JPY": "AUDJPY=X",
     "AUD/CAD": "AUDCAD=X",
-    "USD/NOK": "NOK=X",
-    "USD/CAD (OTC)": "CAD=X",
-    "Bitcoin Cash (OTC)": "BCH-USD",
-    "Kusama (OTC)": "KSM-USD",
-    "Aave (OTC)": "AAVE-USD",
-    "Pancake Swap (OTC)": "CAKE-USD",
-    "Uniswap (OTC)": "UNI-USD",
+    "NZD/CAD": "NZDCAD=X",
+    "GBP/CHF": "GBPCHF=X",
     "NZD/CHF": "NZDCHF=X",
-    "GBP/CAD": "GBPCAD=X",
-    "AUD/CHF": "AUDCHF=X",
     "Microsoft": "MSFT",
     "Boeing": "BA",
-    "US International Group": "AIG",
-    "McDonalds": "MCD",
-    "JD": "JD",
+    "McDonald's": "MCD",
     "PayPal": "PYPL",
-    "NASDAQ 100": "^NDX",
-    "Dow Jones IA": "^DJI",
-    "GBP/USD": "GBPUSD=X",
-    "VOO": "VOO",
-    "iShares Russell 2000 ETF": "IWM",
-    "Invesco Nasdaq 100 ETF": "QQQ",
-    "ProShares UltraPro QQQ": "TQQQ",
     "Google": "GOOGL",
     "IBM": "IBM",
-    "ZAR/JPY": "ZARJPY=X",
-    "Litecoin": "LTC-USD",
-    "USD/DKK": "DKK=X",
-    "GBP/CHF": "GBPCHF=X",
+    "NASDAQ 100": "^NDX",
+    "Dow Jones": "^DJI",
+    "VOO ETF": "VOO",
+    "Russell 2000 ETF": "IWM",
+    "Nasdaq 100 ETF": "QQQ",
     "Yum Brands": "YUM",
 }
 
 TIMEFRAMES = {
-    "1 minute": ("1m", "1d"),
-    "5 minutes": ("5m", "5d"),
-    "15 minutes": ("15m", "60d"),
-    "30 minutes": ("30m", "60d"),
-    "1 hour": ("60m", "730d"),
-    "1 day": ("1d", "max"),
+    "1 minute": {"interval": "1m", "range": "7d", "seconds": 60},
+    "5 minutes": {"interval": "5m", "range": "60d", "seconds": 300},
+    "15 minutes": {"interval": "15m", "range": "60d", "seconds": 900},
+    "30 minutes": {"interval": "30m", "range": "60d", "seconds": 1800},
+    "1 hour": {"interval": "60m", "range": "730d", "seconds": 3600},
+    "1 day": {"interval": "1d", "range": "max", "seconds": 86400},
 }
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_candles(symbol, interval, period, count):
-    ticker = urllib.parse.quote(symbol, safe="^=")
+def fetch_candles(symbol: str, interval: str, period: str, candle_seconds: int) -> pd.DataFrame:
+    """Fetch public Yahoo Finance candles and remove the currently forming candle."""
+    encoded_symbol = urllib.parse.quote(symbol, safe="")
     url = (
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-        f"?range={period}&interval={interval}"
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded_symbol}"
+        f"?range={urllib.parse.quote(period)}&interval={urllib.parse.quote(interval)}"
     )
-
     request = urllib.request.Request(
         url,
-        headers={"User-Agent": "Mozilla/5.0"}
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "Accept": "application/json",
+        },
     )
 
     with urllib.request.urlopen(request, timeout=20) as response:
@@ -114,267 +86,266 @@ def fetch_candles(symbol, interval, period, count):
 
     chart = payload.get("chart", {})
     if chart.get("error"):
-        raise ValueError(str(chart["error"]))
+        raise RuntimeError(str(chart["error"].get("description", "Yahoo Finance data error")))
 
-    results = chart.get("result")
+    results = chart.get("result") or []
     if not results:
-        return pd.DataFrame()
+        raise RuntimeError("Bu sembol için veri bulunamadı.")
 
     result = results[0]
-    timestamps = result.get("timestamp", [])
-    quote = result.get("indicators", {}).get("quote", [{}])[0]
+    timestamps = result.get("timestamp") or []
+    indicators = result.get("indicators", {})
+    quotes = indicators.get("quote") or []
+    if not timestamps or not quotes:
+        raise RuntimeError("Veri kaynağı mum verisi döndürmedi.")
 
-    if not timestamps:
-        return pd.DataFrame()
+    quote = quotes[0]
+    df = pd.DataFrame({
+        "Time": pd.to_datetime(timestamps, unit="s", utc=True),
+        "Open": quote.get("open", []),
+        "High": quote.get("high", []),
+        "Low": quote.get("low", []),
+        "Close": quote.get("close", []),
+        "Volume": quote.get("volume", []),
+    })
 
-    df = pd.DataFrame(
-        {
-            "Open": quote.get("open", []),
-            "High": quote.get("high", []),
-            "Low": quote.get("low", []),
-            "Close": quote.get("close", []),
-        },
-        index=pd.to_datetime(timestamps, unit="s", utc=True)
-    )
+    df = df.dropna(subset=["Open", "High", "Low", "Close"]).copy()
+    if df.empty:
+        raise RuntimeError("Geçerli mum bulunamadı.")
 
-    df.index.name = "Time"
-    df = df.dropna(
-        subset=["Open", "High", "Low", "Close"]
-    ).sort_index()
+    # Exclude the currently forming candle, if the last timestamp is still open.
+    now_ts = int(time.time())
+    last_ts = int(df["Time"].iloc[-1].timestamp())
+    if now_ts < last_ts + candle_seconds:
+        df = df.iloc[:-1].copy()
 
-    seconds = {
-        "1m": 60,
-        "5m": 300,
-        "15m": 900,
-        "30m": 1800,
-        "60m": 3600,
-        "1d": 86400,
-    }[interval]
+    if df.empty:
+        raise RuntimeError("Tamamlanmış mum bulunamadı.")
 
-    now = pd.Timestamp.now(tz="UTC")
-    df = df[
-        (df.index + pd.to_timedelta(seconds, unit="s")) <= now
-    ]
-
-    return df.tail(int(count))
+    df["Time"] = df["Time"].dt.tz_convert("Europe/Istanbul")
+    return df.reset_index(drop=True)
 
 
-def scan_asset(name, symbol, interval, period, lookback):
-    if not symbol:
-        return {
-            "Asset": name,
-            "LOW": None,
-            "LOW time": "-",
-            "HIGH": None,
-            "HIGH time": "-",
-            "Latest": None,
-            "Position %": None,
-            "Status": "No external data symbol"
-        }
-
+def scan_asset(name: str, symbol: str, tf_name: str, lookback: int) -> dict:
+    tf = TIMEFRAMES[tf_name]
     try:
-        df = fetch_candles(symbol, interval, period, lookback)
+        df = fetch_candles(
+            symbol,
+            tf["interval"],
+            tf["range"],
+            tf["seconds"],
+        )
+        df = df.tail(lookback).copy()
 
-        if len(df) < 2:
-            raise ValueError("Insufficient candle data")
+        if len(df) < min(50, lookback):
+            raise RuntimeError(f"Yeterli veri yok: yalnızca {len(df)} tamamlanmış mum.")
 
-        low_time = df["Low"].idxmin()
-        high_time = df["High"].idxmax()
+        low_index = df["Low"].idxmin()
+        high_index = df["High"].idxmax()
+        period_low = float(df.loc[low_index, "Low"])
+        period_high = float(df.loc[high_index, "High"])
+        latest_close = float(df["Close"].iloc[-1])
 
-        low = float(df.loc[low_time, "Low"])
-        high = float(df.loc[high_time, "High"])
-        latest = float(df["Close"].iloc[-1])
-
-        if high > low:
-            position = (latest - low) / (high - low) * 100
-            position = max(0.0, min(100.0, position))
-        else:
+        if period_high <= period_low:
             position = 50.0
+        else:
+            position = (latest_close - period_low) / (period_high - period_low) * 100
+            position = max(0.0, min(100.0, position))
 
         return {
             "Asset": name,
-            "LOW": low,
-            "LOW time": str(low_time),
-            "HIGH": high,
-            "HIGH time": str(high_time),
-            "Latest": latest,
+            "Symbol": symbol,
+            "Candles": len(df),
+            "LOW": period_low,
+            "LOW time": df.loc[low_index, "Time"].strftime("%Y-%m-%d %H:%M"),
+            "HIGH": period_high,
+            "HIGH time": df.loc[high_index, "Time"].strftime("%Y-%m-%d %H:%M"),
+            "Latest": latest_close,
             "Position %": round(position, 2),
-            "Status": f"OK — {len(df)} candles"
+            "Status": "OK",
+            "_data": df,
         }
-
     except Exception as exc:
         return {
             "Asset": name,
+            "Symbol": symbol,
+            "Candles": 0,
             "LOW": None,
-            "LOW time": "-",
+            "LOW time": "",
             "HIGH": None,
-            "HIGH time": "-",
+            "HIGH time": "",
             "Latest": None,
             "Position %": None,
-            "Status": "Data unavailable: " + str(exc)[:100]
+            "Status": f"Data error: {str(exc)[:180]}",
+            "_data": None,
         }
 
 
-def show_extreme_card(row, label, color):
+def price_text(value):
+    if value is None or pd.isna(value):
+        return "N/A"
+    value = float(value)
+    if abs(value) >= 1000:
+        return f"{value:,.2f}"
+    if abs(value) >= 1:
+        return f"{value:,.5f}".rstrip("0").rstrip(".")
+    return f"{value:.8f}".rstrip("0").rstrip(".")
+
+
+def extreme_card(row, kind: str):
+    is_low = kind == "LOW"
+    color = "#dc2626" if is_low else "#16a34a"
+    label = "EN DİBE YAKIN" if is_low else "EN TEPEYE YAKIN"
     st.markdown(
-        f"<div style='border:1px solid {color};padding:16px;"
-        f"border-radius:12px;margin-bottom:8px'>"
-        f"<div style='color:{color};font-size:14px'>{label}</div>"
-        f"<div style='font-size:25px;font-weight:bold'>"
-        f"{row['Asset']}</div>"
-        f"<div>Position in 400-candle range: "
-        f"{row['Position %']:.2f}%</div>"
-        f"<div>LOW: {row['LOW']:.8g}</div>"
-        f"<div>HIGH: {row['HIGH']:.8g}</div>"
-        f"<div>Latest: {row['Latest']:.8g}</div>"
-        f"</div>",
-        unsafe_allow_html=True
+        f"""
+        <div style="border:2px solid {color};border-radius:14px;padding:18px;margin-bottom:8px;">
+          <div style="font-size:13px;font-weight:700;color:{color};">{label}</div>
+          <div style="font-size:25px;font-weight:800;margin:6px 0;">{row['Asset']}</div>
+          <div style="font-size:15px;">Konum: <b>{row['Position %']:.2f}%</b></div>
+          <div style="margin-top:8px;">LOW: <b>{price_text(row['LOW'])}</b></div>
+          <div>HIGH: <b>{price_text(row['HIGH'])}</b></div>
+          <div>Güncel kapanış: <b>{price_text(row['Latest'])}</b></div>
+          <div style="font-size:12px;opacity:.8;margin-top:6px;">{row['Candles']} tamamlanmış mum · {row['Symbol']}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
 
-st.title("400 Candle — Market Extremes")
-
-st.write(
-    "Compare each asset's latest price with its own 400-candle range. "
-    "Position 0% is the bottom of the range; 100% is the top."
+st.title("📊 3.000 Mum — Piyasa Dip / Tepe Tarayıcı")
+st.caption(
+    "Her varlık kendi geçmiş aralığına göre değerlendirilir. "
+    "Bu ekran alım-satım emri göndermez."
 )
 
-st.warning(
-    "External Yahoo Finance prices are not Binomo OTC quotes. "
-    "Unavailable assets are excluded from the ranking."
-)
-
-col1, col2 = st.columns(2)
-
-with col1:
-    timeframe_label = st.selectbox(
-        "Timeframe", list(TIMEFRAMES.keys()), index=2
-    )
-
-with col2:
+with st.sidebar:
+    st.header("Tarama ayarları")
+    tf_name = st.selectbox("Zaman dilimi", list(TIMEFRAMES.keys()), index=2)
     lookback = st.selectbox(
-        "Lookback candles", [100, 200, 300, 400], index=3
+        "Analiz edilecek tamamlanmış mum",
+        [500, 1000, 2000, 3000],
+        index=3,
     )
+    mode = st.radio("Tarama modu", ["Tüm varlıklar", "Tek varlık"], index=0)
+    if mode == "Tek varlık":
+        selected_asset = st.selectbox("Varlık", list(ASSETS.keys()))
+    else:
+        selected_asset = None
+    start_scan = st.button("🔍 Taramayı başlat", type="primary", use_container_width=True)
+    st.caption("Veriler Yahoo Finance'ten alınır; Binomo OTC fiyatlarıyla birebir aynı olmayabilir.")
 
-interval, period = TIMEFRAMES[timeframe_label]
+if "scan_results" not in st.session_state:
+    st.session_state.scan_results = None
+if "scan_tf" not in st.session_state:
+    st.session_state.scan_tf = None
+if "scan_lookback" not in st.session_state:
+    st.session_state.scan_lookback = None
 
-mode = st.radio(
-    "Scanning mode",
-    ["Scan all assets", "Single asset"],
-    horizontal=True
-)
+if start_scan:
+    if mode == "Tek varlık":
+        assets_to_scan = {selected_asset: ASSETS[selected_asset]}
+    else:
+        assets_to_scan = ASSETS
 
-if mode == "Single asset":
-    selected = st.selectbox("Asset", list(ASSETS.keys()))
+    results = []
+    progress = st.progress(0)
+    status_line = st.empty()
 
-    if st.button("Analyze asset", type="primary"):
-        with st.spinner("Loading candles..."):
-            row = scan_asset(
-                selected,
-                ASSETS[selected],
-                interval,
-                period,
-                int(lookback)
-            )
+    for i, (name, symbol) in enumerate(assets_to_scan.items(), start=1):
+        status_line.write(f"Taranıyor: {name} ({i}/{len(assets_to_scan)})")
+        result = scan_asset(name, symbol, tf_name, lookback)
+        results.append(result)
+        progress.progress(i / len(assets_to_scan))
 
-        if row["Position %"] is None:
-            st.error(row["Status"])
-        else:
-            show_extreme_card(
-                row, "ASSET RANGE POSITION", "#64748b"
-            )
+    st.session_state.scan_results = results
+    st.session_state.scan_tf = tf_name
+    st.session_state.scan_lookback = lookback
+    status_line.success("Tarama tamamlandı.")
+    progress.empty()
 
-            df = fetch_candles(
-                ASSETS[selected], interval, period, int(lookback)
-            )
-            st.subheader("Price history")
-            st.line_chart(df[["Close"]], height=350)
+results = st.session_state.scan_results
 
-else:
-    if st.button("Start scan", type="primary"):
-        results = []
-        progress = st.progress(0)
-        status = st.empty()
-        total = len(ASSETS)
+if results:
+    if st.session_state.scan_tf != tf_name or st.session_state.scan_lookback != lookback:
+        st.info("Ayarları değiştirdin. Yeni ayarlarla sonuç almak için 'Taramayı başlat' düğmesine bas.")
+    df_all = pd.DataFrame([
+        {k: v for k, v in item.items() if k != "_data"}
+        for item in results
+    ])
+    valid = df_all[df_all["Status"] == "OK"].copy()
+    errors = df_all[df_all["Status"] != "OK"].copy()
 
-        for i, (name, symbol) in enumerate(ASSETS.items(), start=1):
-            result = scan_asset(
-                name, symbol, interval, period, int(lookback)
-            )
-            results.append(result)
-            progress.progress(i / total)
-            status.write(f"Scanning {i}/{total}: {name}")
-            time.sleep(0.05)
+    if not valid.empty:
+        valid = valid.sort_values("Position %", ascending=True).reset_index(drop=True)
+        lowest = valid.iloc[0]
+        highest = valid.iloc[-1]
 
-        st.session_state["scan_results"] = pd.DataFrame(results)
+        st.subheader("En uç konumdaki varlıklar")
+        left, right = st.columns(2)
+        with left:
+            extreme_card(lowest, "LOW")
+        with right:
+            extreme_card(highest, "HIGH")
 
-    if "scan_results" in st.session_state:
-        table = st.session_state["scan_results"]
-
-        valid = table[
-            table["Position %"].notna()
-            & (table["Status"].str.startswith("OK"))
-        ].copy()
-
-        unavailable = table[
-            ~table.index.isin(valid.index)
+        st.subheader("Tüm başarılı sonuçlar")
+        st.caption("LOW ve HIGH her varlığın seçilen son mum sayısı içindeki en düşük/en yüksek fiyatıdır.")
+        display = valid.copy()
+        display["LOW"] = display["LOW"].map(price_text)
+        display["HIGH"] = display["HIGH"].map(price_text)
+        display["Latest"] = display["Latest"].map(price_text)
+        display = display[
+            ["Asset", "Symbol", "Candles", "LOW", "LOW time", "HIGH", "HIGH time", "Latest", "Position %"]
         ]
+        st.dataframe(display, use_container_width=True, hide_index=True)
 
-        if valid.empty:
-            st.error(
-                "No usable market data was returned. "
-                "Check whether the data provider is accessible."
+        st.subheader("LOW ve HIGH konum sıralaması")
+        st.markdown("**En dibe yakın → en tepeye yakın**")
+        for _, row in valid.iterrows():
+            pos = float(row["Position %"])
+            st.markdown(
+                f"""
+                <div style="margin:8px 0;padding:10px;border:1px solid #8885;border-radius:10px;">
+                  <div style="display:flex;justify-content:space-between;gap:10px;">
+                    <b>{row['Asset']}</b><span>{pos:.2f}%</span>
+                  </div>
+                  <div style="height:9px;background:#8883;border-radius:8px;margin-top:7px;">
+                    <div style="height:9px;width:{pos}%;background:{'#dc2626' if pos < 30 else '#eab308' if pos < 70 else '#16a34a'};border-radius:8px;"></div>
+                  </div>
+                  <div style="display:flex;justify-content:space-between;font-size:12px;opacity:.8;margin-top:4px;">
+                    <span>LOW: {price_text(row['LOW'])}</span><span>HIGH: {price_text(row['HIGH'])}</span>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
-        else:
-            valid = valid.sort_values("Position %", ascending=True)
 
-            lowest = valid.iloc[0]
-            highest = valid.iloc[-1]
+        csv = valid.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "⬇️ Sonuçları CSV indir",
+            data=csv,
+            file_name="3000_mum_piyasa_tarama.csv",
+            mime="text/csv",
+        )
+    else:
+        st.warning("Başarılı veri alınamadı. Zaman dilimini değiştir veya biraz sonra tekrar dene.")
 
-            st.subheader("Market extremes")
+    if not errors.empty:
+        with st.expander(f"Veri alınamayan varlıklar ({len(errors)})"):
+            st.dataframe(errors[["Asset", "Symbol", "Status"]], use_container_width=True, hide_index=True)
 
-            left, right = st.columns(2)
-
-            with left:
-                show_extreme_card(
-                    lowest, "🔴 LOWEST POSITION", "#ef4444"
-                )
-
-            with right:
-                show_extreme_card(
-                    highest, "🟢 HIGHEST POSITION", "#22c55e"
-                )
-
-            st.subheader("All assets — bottom to top")
-
-            for _, row in valid.iterrows():
-                with st.container(border=True):
-                    st.markdown(f"**{row['Asset']}**")
-                    st.markdown(f"LOW: `{row['LOW']:.8g}`")
-                    st.markdown(f"HIGH: `{row['HIGH']:.8g}`")
-                    st.markdown(f"Latest: `{row['Latest']:.8g}`")
-                    st.progress(float(row["Position %"]) / 100)
-                    st.caption(
-                        f"Range position: {row['Position %']:.2f}%"
-                    )
-
-            st.subheader("Unavailable assets")
-            if not unavailable.empty:
-                st.dataframe(
-                    unavailable[["Asset", "Status"]],
-                    use_container_width=True,
-                    hide_index=True
-                )
-
-            st.download_button(
-                "Download CSV",
-                data=table.to_csv(index=False).encode("utf-8"),
-                file_name="market_extremes_400.csv",
-                mime="text/csv"
-            )
+    if mode == "Tek varlık":
+        matching = [item for item in results if item["Asset"] == selected_asset]
+        if matching and matching[0]["_data"] is not None:
+            one = matching[0]
+            st.subheader(f"{one['Asset']} — son {one['Candles']} tamamlanmış mum")
+            chart_df = one["_data"].set_index("Time")[["Close"]]
+            st.line_chart(chart_df, use_container_width=True)
+else:
+    st.info("Başlamak için sol menüden ayarları seç ve 'Taramayı başlat' düğmesine bas.")
 
 st.divider()
 st.caption(
-    "The ranking measures relative position within each asset's own "
-    "historical range. It does not guarantee a reversal or profitable trade."
+    "Uyarı: Bu tarayıcı yalnızca dış piyasa verilerini analiz eder. "
+    "Geçmiş aralıkta dibe yakınlık tek başına fiyatın yükseleceği, "
+    "tepeye yakınlık da düşeceği anlamına gelmez."
 )
