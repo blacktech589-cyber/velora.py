@@ -265,7 +265,14 @@ if start_scan:
 
 results = st.session_state.scan_results
 
-if results:
+# Backward compatibility: older app versions may have stored scan_results as a DataFrame.
+if isinstance(results, pd.DataFrame):
+    results = results.to_dict(orient="records")
+    for item in results:
+        item.setdefault("_data", None)
+    st.session_state.scan_results = results
+
+if results is not None and len(results) > 0:
     if st.session_state.scan_tf != tf_name or st.session_state.scan_lookback != lookback:
         st.info("Ayarları değiştirdin. Yeni ayarlarla sonuç almak için 'Taramayı başlat' düğmesine bas.")
     df_all = pd.DataFrame([
@@ -335,7 +342,7 @@ if results:
 
     if mode == "Tek varlık":
         matching = [item for item in results if item["Asset"] == selected_asset]
-        if matching and matching[0]["_data"] is not None:
+        if matching and matching[0].get("_data") is not None:
             one = matching[0]
             st.subheader(f"{one['Asset']} — son {one['Candles']} tamamlanmış mum")
             chart_df = one["_data"].set_index("Time")[["Close"]]
