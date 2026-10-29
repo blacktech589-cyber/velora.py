@@ -5,300 +5,371 @@ import urllib.request
 import urllib.parse
 import json
 import time
+from datetime import datetime, timezone
 
-st.set_page_config(page_title="400 Candle Lowest Scanner", layout="wide")
+st.set_page_config(
+    page_title="400 Candle High Low Scanner",
+    page_icon="📊",
+    layout="wide"
+)
 
+# Yahoo Finance symbols are external market proxies, not Binomo OTC feeds.
 ASSETS = {
     "Crypto IDX": None,
     "Booo": None,
     "Ghosty": None,
     "Dusky": None,
-    "Bitcoin (OTC)": "BTCUSDT",
-    "Ethereum (OTC)": "ETHUSDT",
-    "Solana (OTC)": "SOLUSDT",
-    "EUR/USD": None,
+
+    "Bitcoin (OTC)": "BTC-USD",
+    "Ethereum (OTC)": "ETH-USD",
+    "Solana (OTC)": "SOL-USD",
+    "EUR/USD": "EURUSD=X",
     "AUD/USD (OTC)": None,
-    "GBP/NOK": None,
-    "CAD/JPY": None,
+    "GBP/NOK": "GBPNOK=X",
+    "CAD/JPY": "CADJPY=X",
     "FC Barcelona Token (OTC)": None,
-    "AUD/ZAR": None,
-    "CAD/DKK": None,
-    "GBP/SGD": None,
-    "Cardano (OTC)": "ADAUSDT",
-    "EUR/ZAR": None,
-    "GBP/HKD": None,
-    "CAD/MXN": None,
-    "CHF/JPY": None,
-    "NZD/USD (OTC)": None,
-    "EUR/MXN": None,
-    "CAD/SEK": None,
-    "CAD/NOK": None,
-    "AUD/JPY": None,
-    "Chainlink (OTC)": "LINKUSDT",
-    "GBP/MXN": None,
-    "AUD/SGD": None,
-    "AUD/DKK": None,
-    "GBP/CZK": None,
-    "EUR/JPY": None,
-    "NZD/JPY": None,
-    "GBP/TRY": None,
-    "AUD/SEK": None,
-    "GBP/JPY (OTC)": None,
-    "NZD/CAD": None,
-    "NZD/DKK": None,
-    "EUR/GBP (OTC)": None,
-    "NZD/SEK": None,
-    "SGD/JPY": None,
-    "AUD/CAD": None,
-    "USD/NOK": None,
-    "USD/CAD (OTC)": None,
-    "Bitcoin Cash (OTC)": "BCHUSDT",
-    "Kusama (OTC)": "KSMUSDT",
-    "Aave (OTC)": "AAVEUSDT",
-    "Pancake Swap (OTC)": "CAKEUSDT",
-    "Uniswap (OTC)": "UNIUSDT",
-    "NZD/CHF": None,
-    "GBP/CAD": None,
-    "AUD/CHF": None,
-    "Microsoft": None,
-    "Boeing": None,
-    "US International Group": None,
-    "McDonalds": None,
-    "JD": None,
-    "PayPal": None,
-    "NASDAQ 100": None,
-    "Dow Jones IA": None,
-    "GBP/USD": None,
-    "VOO": None,
-    "iShares Russell 2000 ETF": None,
-    "Invesco Nasdaq 100 ETF": None,
-    "ProShares UltraPro QQQ": None,
-    "Google": None,
-    "IBM": None,
-    "ZAR/JPY": None,
-    "Litecoin": "LTCUSDT",
-    "USD/DKK": None,
-    "GBP/CHF": None,
-    "Yum Brands": None,
+    "AUD/ZAR": "AUDZAR=X",
+    "CAD/DKK": "CADDKK=X",
+    "GBP/SGD": "GBPSGD=X",
+    "Cardano (OTC)": "ADA-USD",
+    "EUR/ZAR": "EURZAR=X",
+    "GBP/HKD": "GBPHKD=X",
+    "CAD/MXN": "CADMXN=X",
+    "CHF/JPY": "CHFJPY=X",
+    "NZD/USD (OTC)": "NZDUSD=X",
+    "EUR/MXN": "EURMXN=X",
+    "CAD/SEK": "CADSEK=X",
+    "CAD/NOK": "CADNOK=X",
+    "AUD/JPY": "AUDJPY=X",
+    "Chainlink (OTC)": "LINK-USD",
+    "GBP/MXN": "GBPMXN=X",
+    "AUD/SGD": "AUDSGD=X",
+    "AUD/DKK": "AUDDKK=X",
+    "GBP/CZK": "GBPCZK=X",
+    "EUR/JPY": "EURJPY=X",
+    "NZD/JPY": "NZDJPY=X",
+    "GBP/TRY": "GBPTRY=X",
+    "AUD/SEK": "AUDSEK=X",
+    "GBP/JPY (OTC)": "GBPJPY=X",
+    "NZD/CAD": "NZDCAD=X",
+    "NZD/DKK": "NZDDKK=X",
+    "EUR/GBP (OTC)": "EURGBP=X",
+    "NZD/SEK": "NZDSEK=X",
+    "SGD/JPY": "SGDJPY=X",
+    "AUD/CAD": "AUDCAD=X",
+    "USD/NOK": "NOK=X",
+    "USD/CAD (OTC)": "CAD=X",
+    "Bitcoin Cash (OTC)": "BCH-USD",
+    "Kusama (OTC)": "KSM-USD",
+    "Aave (OTC)": "AAVE-USD",
+    "Pancake Swap (OTC)": "CAKE-USD",
+    "Uniswap (OTC)": "UNI-USD",
+    "NZD/CHF": "NZDCHF=X",
+    "GBP/CAD": "GBPCAD=X",
+    "AUD/CHF": "AUDCHF=X",
+
+    "Microsoft": "MSFT",
+    "Boeing": "BA",
+    "US International Group": "AIG",
+    "McDonalds": "MCD",
+    "JD": "JD",
+    "PayPal": "PYPL",
+    "NASDAQ 100": "^NDX",
+    "Dow Jones IA": "^DJI",
+    "GBP/USD": "GBPUSD=X",
+    "VOO": "VOO",
+    "iShares Russell 2000 ETF": "IWM",
+    "Invesco Nasdaq 100 ETF": "QQQ",
+    "ProShares UltraPro QQQ": "TQQQ",
+    "Google": "GOOGL",
+    "IBM": "IBM",
+    "ZAR/JPY": "ZARJPY=X",
+    "Litecoin": "LTC-USD",
+    "USD/DKK": "DKK=X",
+    "GBP/CHF": "GBPCHF=X",
+    "Yum Brands": "YUM",
 }
 
 INTERVALS = {
-    "1 minute": "1m",
-    "5 minutes": "5m",
-    "15 minutes": "15m",
-    "30 minutes": "30m",
-    "1 hour": "1h",
-    "4 hours": "4h",
-    "1 day": "1d",
+    "1 minute": ("1m", "1d"),
+    "5 minutes": ("5m", "5d"),
+    "15 minutes": ("15m", "60d"),
+    "30 minutes": ("30m", "60d"),
+    "1 hour": ("60m", "730d"),
+    "1 day": ("1d", "max"),
 }
 
-API_URL = "https://api.binance.com/api/v3/klines"
 
-
-def get_candles(symbol, interval, limit=400):
-    params = urllib.parse.urlencode({
-        "symbol": symbol,
-        "interval": interval,
-        "limit": min(limit + 2, 1000)
-    })
+@st.cache_data(ttl=60, show_spinner=False)
+def download_candles(symbol, interval, period, count):
+    """Fetch public Yahoo Finance chart data without yfinance."""
+    encoded = urllib.parse.quote(symbol, safe="^=")
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}"
+        f"?range={period}&interval={interval}"
+    )
 
     request = urllib.request.Request(
-        API_URL + "?" + params,
-        headers={"User-Agent": "Mozilla/5.0"}
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json"
+        }
     )
 
-    with urllib.request.urlopen(request, timeout=15) as response:
-        raw = json.loads(response.read().decode("utf-8"))
+    with urllib.request.urlopen(request, timeout=20) as response:
+        payload = json.loads(response.read().decode("utf-8"))
 
-    if not isinstance(raw, list) or len(raw) == 0:
+    chart = payload.get("chart", {})
+    if chart.get("error"):
+        raise ValueError(str(chart["error"]))
+
+    results = chart.get("result")
+    if not results:
         return pd.DataFrame()
 
-    columns = [
-        "OpenTime", "Open", "High", "Low", "Close",
-        "Volume", "CloseTime", "QuoteVolume", "Trades",
-        "BuyBase", "BuyQuote", "Ignore"
-    ]
+    result = results[0]
+    timestamps = result.get("timestamp", [])
+    quotes = result.get("indicators", {}).get("quote", [{}])[0]
 
-    df = pd.DataFrame(raw, columns=columns)
+    if not timestamps:
+        return pd.DataFrame()
 
-    for col in ["Open", "High", "Low", "Close"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = pd.DataFrame({
+        "Open": quotes.get("open", []),
+        "High": quotes.get("high", []),
+        "Low": quotes.get("low", []),
+        "Close": quotes.get("close", []),
+        "Volume": quotes.get("volume", [])
+    }, index=pd.to_datetime(timestamps, unit="s", utc=True))
 
-    df["Time"] = pd.to_datetime(
-        df["OpenTime"], unit="ms", utc=True
-    )
+    df.index.name = "Time"
+    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+    df = df[~df.index.duplicated(keep="last")].sort_index()
 
-    # Son mum henüz tamamlanmamış olabilir; onu çıkar.
-    df = df.iloc[:-1].copy()
-    df = df.dropna(subset=["Low", "High", "Close"])
-    df = df.set_index("Time")
+    # Exclude the current candle if its interval has not finished.
+    seconds = {
+        "1m": 60, "5m": 300, "15m": 900,
+        "30m": 1800, "60m": 3600, "1d": 86400
+    }[interval]
 
-    return df.tail(limit)
+    now = pd.Timestamp.now(tz="UTC")
+    df = df[(df.index + pd.to_timedelta(seconds, unit="s")) <= now]
+
+    return df.tail(int(count))
 
 
-def find_lowest(name, symbol, interval, lookback):
-    if symbol is None:
+def analyze_asset(name, symbol, interval, period, lookback):
+    if not symbol:
         return {
             "Asset": name,
-            "Lowest price": None,
-            "Lowest candle time": "-",
-            "Latest price": None,
-            "Distance from low (%)": None,
-            "Status": "External data unavailable"
-        }
+            "Highest": None,
+            "Highest time": "-",
+            "Lowest": None,
+            "Lowest time": "-",
+            "Latest": None,
+            "Distance from high %": None,
+            "Distance from low %": None,
+            "Candles": 0,
+            "Status": "No external symbol configured"
+        }, pd.DataFrame()
 
     try:
-        df = get_candles(symbol, interval, lookback)
+        df = download_candles(symbol, interval, period, lookback)
 
         if df.empty:
-            raise ValueError("No candles returned")
+            raise ValueError("No candle data returned")
 
-        lowest_time = df["Low"].idxmin()
-        lowest_price = float(df.loc[lowest_time, "Low"])
-        latest_price = float(df["Close"].iloc[-1])
+        high_time = df["High"].idxmax()
+        low_time = df["Low"].idxmin()
 
-        distance = (
-            (latest_price - lowest_price) / lowest_price * 100
-            if lowest_price else None
+        highest = float(df.loc[high_time, "High"])
+        lowest = float(df.loc[low_time, "Low"])
+        latest = float(df["Close"].iloc[-1])
+
+        high_distance = (
+            (highest - latest) / highest * 100 if highest else None
+        )
+        low_distance = (
+            (latest - lowest) / lowest * 100 if lowest else None
         )
 
-        return {
+        record = {
             "Asset": name,
-            "Lowest price": lowest_price,
-            "Lowest candle time": str(lowest_time),
-            "Latest price": latest_price,
-            "Distance from low (%)": round(distance, 3)
-                if distance is not None else None,
-            "Status": f"Scanned {len(df)} completed candles"
+            "Highest": highest,
+            "Highest time": str(high_time),
+            "Lowest": lowest,
+            "Lowest time": str(low_time),
+            "Latest": latest,
+            "Distance from high %": round(high_distance, 3)
+                if high_distance is not None else None,
+            "Distance from low %": round(low_distance, 3)
+                if low_distance is not None else None,
+            "Candles": len(df),
+            "Status": "OK"
         }
 
-    except Exception as e:
+        return record, df
+
+    except Exception as exc:
         return {
             "Asset": name,
-            "Lowest price": None,
-            "Lowest candle time": "-",
-            "Latest price": None,
-            "Distance from low (%)": None,
-            "Status": "Data error: " + str(e)[:100]
-        }
+            "Highest": None,
+            "Highest time": "-",
+            "Lowest": None,
+            "Lowest time": "-",
+            "Latest": None,
+            "Distance from high %": None,
+            "Distance from low %": None,
+            "Candles": 0,
+            "Status": "Data unavailable: " + str(exc)[:100]
+        }, pd.DataFrame()
 
 
-st.title("400 Candle Lowest Price Scanner")
+def draw_chart(df):
+    if df.empty:
+        return
+
+    chart = df[["Close"]].copy()
+    chart["Highest level"] = df["High"].max()
+    chart["Lowest level"] = df["Low"].min()
+
+    st.line_chart(chart, height=400)
+
+    st.caption(
+        f"Highest: {df['High'].max():.8g} | "
+        f"Lowest: {df['Low'].min():.8g}"
+    )
+
+    st.dataframe(
+        df.tail(30),
+        use_container_width=True
+    )
+
+
+st.title("400 Candle High / Low Scanner")
+
 st.write(
-    "Her varlığın seçilen zaman dilimindeki son 400 tamamlanmış "
-    "mumunun en düşük fiyatını ayrı ayrı hesaplar."
+    "Scan each configured asset and display its highest and lowest "
+    "prices over the latest completed candles."
 )
 
 st.warning(
-    "OTC fiyatları Binomo'ya özgüdür. Binance verisi Binomo OTC "
-    "fiyatıyla aynı olmak zorunda değildir. Verisi olmayan varlıklar "
-    "için tahmini fiyat üretilmez."
+    "External data is not Binomo's own OTC feed. A symbol marked OTC "
+    "uses an external market proxy where configured. Prices can differ."
 )
 
-c1, c2 = st.columns(2)
+col1, col2 = st.columns(2)
 
-with c1:
-    interval_label = st.selectbox(
+with col1:
+    timeframe_label = st.selectbox(
         "Timeframe", list(INTERVALS.keys()), index=2
     )
 
-with c2:
+with col2:
     lookback = st.selectbox(
         "Number of candles", [100, 200, 300, 400], index=3
     )
 
-interval = INTERVALS[interval_label]
+interval, period = INTERVALS[timeframe_label]
 
 mode = st.radio(
-    "Scan mode",
-    ["Scan one asset", "Scan all assets one by one"],
+    "Mode",
+    ["Single asset", "Scan all assets"],
     horizontal=True
 )
 
-if mode == "Scan one asset":
-    name = st.selectbox("Select asset", list(ASSETS.keys()))
+if mode == "Single asset":
+    selected = st.selectbox("Select asset", list(ASSETS.keys()))
 
-    if st.button("Find lowest price", type="primary"):
-        with st.spinner(f"Scanning {name}..."):
-            result = find_lowest(
-                name, ASSETS[name], interval, int(lookback)
+    if st.button("Analyze", type="primary"):
+        with st.spinner("Retrieving market data..."):
+            record, df = analyze_asset(
+                selected, ASSETS[selected], interval, period, int(lookback)
             )
 
-        if result["Lowest price"] is None:
-            st.error(
-                f"{name}: gerçek fiyat verisi alınamadı. "
-                f"{result['Status']}"
-            )
+        if record["Status"] != "OK":
+            st.error(record["Status"])
         else:
             a, b, c = st.columns(3)
-            a.metric("Lowest price", f"{result['Lowest price']:.8g}")
-            b.metric("Latest price", f"{result['Latest price']:.8g}")
-            c.metric(
-                "Above lowest (%)",
-                f"{result['Distance from low (%)']:.3f}%"
+            a.metric("Highest price", f"{record['Highest']:.8g}")
+            b.metric("Lowest price", f"{record['Lowest']:.8g}")
+            c.metric("Latest price", f"{record['Latest']:.8g}")
+
+            d, e = st.columns(2)
+            d.metric(
+                "Below high (%)",
+                f"{record['Distance from high %']:.3f}%"
+            )
+            e.metric(
+                "Above low (%)",
+                f"{record['Distance from low %']:.3f}%"
             )
 
-            st.write("Lowest candle time:", result["Lowest candle time"])
-            st.write("Data status:", result["Status"])
+            st.write("Highest candle time:", record["Highest time"])
+            st.write("Lowest candle time:", record["Lowest time"])
+            st.write("Completed candles:", record["Candles"])
 
-            st.subheader("Last completed candles")
-            df = get_candles(
-                ASSETS[name], interval, int(lookback)
-            )
-
-            st.line_chart(df[["Low", "High", "Close"]])
-            st.dataframe(df.tail(30), use_container_width=True)
+            draw_chart(df)
 
 else:
     if st.button("Start scanning all assets", type="primary"):
-        results = []
+        rows = []
         progress = st.progress(0)
         status = st.empty()
+
         total = len(ASSETS)
 
-        for i, (name, symbol) in enumerate(
-            ASSETS.items(), start=1
-        ):
-            result = find_lowest(
-                name, symbol, interval, int(lookback)
+        for i, (name, symbol) in enumerate(ASSETS.items(), start=1):
+            record, _ = analyze_asset(
+                name, symbol, interval, period, int(lookback)
             )
-            results.append(result)
-
+            rows.append(record)
             progress.progress(i / total)
-            status.write(f"{i}/{total} — {name}")
+            status.write(f"{i}/{total}: {name}")
+            time.sleep(0.05)
 
-            time.sleep(0.1)
+        st.session_state["results"] = pd.DataFrame(rows)
 
-        table = pd.DataFrame(results)
-        st.session_state["lowest_results"] = table
+    if "results" in st.session_state:
+        table = st.session_state["results"]
 
-    if "lowest_results" in st.session_state:
-        table = st.session_state["lowest_results"]
+        filter_choice = st.selectbox(
+            "Filter",
+            ["All", "Available only", "Unavailable only"]
+        )
 
-        st.subheader("Each asset's lowest price")
+        if filter_choice == "Available only":
+            shown = table[table["Status"] == "OK"]
+        elif filter_choice == "Unavailable only":
+            shown = table[table["Status"] != "OK"]
+        else:
+            shown = table
+
+        st.subheader("Highest and lowest prices per asset")
         st.dataframe(
-            table,
+            shown,
             use_container_width=True,
             hide_index=True
         )
 
-        valid = table.dropna(subset=["Lowest price"])
+        valid = table[table["Status"] == "OK"]
 
         if not valid.empty:
-            st.subheader("Lowest observed prices — comparison")
-
+            st.subheader("Compare each asset's extreme prices")
             st.bar_chart(
-                valid.set_index("Asset")[["Lowest price"]]
+                valid.set_index("Asset")[["Highest", "Lowest"]]
             )
 
-            st.download_button(
-                "Download results CSV",
-                data=table.to_csv(index=False).encode("utf-8"),
-                file_name="lowest_prices.csv",
-                mime="text/csv"
-            )
+        st.download_button(
+            "Download CSV",
+            data=table.to_csv(index=False).encode("utf-8"),
+            file_name="asset_high_low_400.csv",
+            mime="text/csv"
+        )
 
+st.divider()
 st.caption(
-    "The lowest price is the minimum Low value among the retrieved "
-    "completed candles. It is not a guarantee that the market cannot fall."
+    "The highest and lowest values are calculated from available "
+    "completed candles. They do not predict future price direction."
 )
