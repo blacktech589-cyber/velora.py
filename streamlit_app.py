@@ -7,7 +7,7 @@ import json
 import time
 
 st.set_page_config(
-    page_title="400 Candle LOW HIGH Scanner",
+    page_title="400 Candle Market Extremes",
     page_icon="📊",
     layout="wide"
 )
@@ -21,7 +21,7 @@ ASSETS = {
     "Ethereum (OTC)": "ETH-USD",
     "Solana (OTC)": "SOL-USD",
     "EUR/USD": "EURUSD=X",
-    "AUD/USD (OTC)": None,
+    "AUD/USD (OTC)": "AUDUSD=X",
     "GBP/NOK": "GBPNOK=X",
     "CAD/JPY": "CADJPY=X",
     "FC Barcelona Token (OTC)": None,
@@ -98,11 +98,10 @@ TIMEFRAMES = {
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_candles(symbol, interval, period, count):
-    encoded_symbol = urllib.parse.quote(symbol, safe="^=")
-
+    ticker = urllib.parse.quote(symbol, safe="^=")
     url = (
-        f"https://query1.finance.yahoo.com/v8/finance/chart/"
-        f"{encoded_symbol}?range={period}&interval={interval}"
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+        f"?range={period}&interval={interval}"
     )
 
     request = urllib.request.Request(
@@ -114,21 +113,16 @@ def fetch_candles(symbol, interval, period, count):
         payload = json.loads(response.read().decode("utf-8"))
 
     chart = payload.get("chart", {})
-
     if chart.get("error"):
         raise ValueError(str(chart["error"]))
 
     results = chart.get("result")
-
     if not results:
         return pd.DataFrame()
 
     result = results[0]
     timestamps = result.get("timestamp", [])
-
-    quote = result.get("indicators", {}).get(
-        "quote", [{}]
-    )[0]
+    quote = result.get("indicators", {}).get("quote", [{}])[0]
 
     if not timestamps:
         return pd.DataFrame()
@@ -158,8 +152,6 @@ def fetch_candles(symbol, interval, period, count):
     }[interval]
 
     now = pd.Timestamp.now(tz="UTC")
-
-    # Remove a candle that may still be forming.
     df = df[
         (df.index + pd.to_timedelta(seconds, unit="s")) <= now
     ]
@@ -167,8 +159,8 @@ def fetch_candles(symbol, interval, period, count):
     return df.tail(int(count))
 
 
-def scan_asset(name, symbol, interval, period, count):
-    if symbol is None:
+def scan_asset(name, symbol, interval, period, lookback):
+    if not symbol:
         return {
             "Asset": name,
             "LOW": None,
@@ -176,14 +168,15 @@ def scan_asset(name, symbol, interval, period, count):
             "HIGH": None,
             "HIGH time": "-",
             "Latest": None,
+            "Position %": None,
             "Status": "No external data symbol"
         }
 
     try:
-        df = fetch_candles(symbol, interval, period, count)
+        df = fetch_candles(symbol, interval, period, lookback)
 
-        if df.empty:
-            raise ValueError("No candles returned")
+        if len(df) < 2:
+            raise ValueError("Insufficient candle data")
 
         low_time = df["Low"].idxmin()
         high_time = df["High"].idxmax()
@@ -192,6 +185,12 @@ def scan_asset(name, symbol, interval, period, count):
         high = float(df.loc[high_time, "High"])
         latest = float(df["Close"].iloc[-1])
 
+        if high > low:
+            position = (latest - low) / (high - low) * 100
+            position = max(0.0, min(100.0, position))
+        else:
+            position = 50.0
+
         return {
             "Asset": name,
             "LOW": low,
@@ -199,6 +198,7 @@ def scan_asset(name, symbol, interval, period, count):
             "HIGH": high,
             "HIGH time": str(high_time),
             "Latest": latest,
+            "Position %": round(position, 2),
             "Status": f"OK — {len(df)} candles"
         }
 
@@ -210,176 +210,171 @@ def scan_asset(name, symbol, interval, period, count):
             "HIGH": None,
             "HIGH time": "-",
             "Latest": None,
-            "Status": "Data error: " + str(exc)[:100]
+            "Position %": None,
+            "Status": "Data unavailable: " + str(exc)[:100]
         }
 
 
-def show_asset_card(row):
-    with st.container(border=True):
-        st.markdown(f"### {row['Asset']}")
-
-        if row["Status"].startswith("OK"):
-            st.markdown(
-                f"<div style='color:#ff5c5c;font-size:23px;"
-                f"font-weight:700'>LOW: {row['LOW']:.8g}</div>",
-                unsafe_allow_html=True
-            )
-
-            st.caption("LOW time: " + row["LOW time"])
-
-            st.markdown(
-                f"<div style='color:#32d583;font-size:23px;"
-                f"font-weight:700'>HIGH: {row['HIGH']:.8g}</div>",
-                unsafe_allow_html=True
-            )
-
-            st.caption("HIGH time: " + row["HIGH time"])
-            st.write(f"Latest price: {row['Latest']:.8g}")
-            st.caption(row["Status"])
-        else:
-            st.write("LOW: Unavailable")
-            st.write("HIGH: Unavailable")
-            st.caption(row["Status"])
+def show_extreme_card(row, label, color):
+    st.markdown(
+        f"<div style='border:1px solid {color};padding:16px;"
+        f"border-radius:12px;margin-bottom:8px'>"
+        f"<div style='color:{color};font-size:14px'>{label}</div>"
+        f"<div style='font-size:25px;font-weight:bold'>"
+        f"{row['Asset']}</div>"
+        f"<div>Position in 400-candle range: "
+        f"{row['Position %']:.2f}%</div>"
+        f"<div>LOW: {row['LOW']:.8g}</div>"
+        f"<div>HIGH: {row['HIGH']:.8g}</div>"
+        f"<div>Latest: {row['Latest']:.8g}</div>"
+        f"</div>",
+        unsafe_allow_html=True
+    )
 
 
-st.title("400 Candle LOW / HIGH Scanner")
+st.title("400 Candle — Market Extremes")
 
 st.write(
-    "Her varlığın son tamamlanmış mumları içindeki en düşük "
-    "ve en yüksek fiyatları ayrı ayrı gösterilir."
+    "Compare each asset's latest price with its own 400-candle range. "
+    "Position 0% is the bottom of the range; 100% is the top."
 )
 
 st.warning(
-    "Yahoo Finance dış piyasa verisi kullanılır. Bu veriler "
-    "Binomo OTC fiyatlarıyla aynı olmak zorunda değildir. "
-    "Verisi olmayan varlıklarda tahmini fiyat gösterilmez."
+    "External Yahoo Finance prices are not Binomo OTC quotes. "
+    "Unavailable assets are excluded from the ranking."
 )
 
 col1, col2 = st.columns(2)
 
 with col1:
-    timeframe_name = st.selectbox(
-        "Timeframe",
-        list(TIMEFRAMES.keys()),
-        index=2
+    timeframe_label = st.selectbox(
+        "Timeframe", list(TIMEFRAMES.keys()), index=2
     )
 
 with col2:
-    candle_count = st.selectbox(
-        "Number of candles",
-        [100, 200, 300, 400],
-        index=3
+    lookback = st.selectbox(
+        "Lookback candles", [100, 200, 300, 400], index=3
     )
 
-interval, period = TIMEFRAMES[timeframe_name]
+interval, period = TIMEFRAMES[timeframe_label]
 
 mode = st.radio(
-    "Mode",
-    ["One asset", "All assets"],
+    "Scanning mode",
+    ["Scan all assets", "Single asset"],
     horizontal=True
 )
 
-if mode == "One asset":
-    selected = st.selectbox(
-        "Select asset",
-        list(ASSETS.keys())
-    )
+if mode == "Single asset":
+    selected = st.selectbox("Asset", list(ASSETS.keys()))
 
-    if st.button("Show LOW and HIGH", type="primary"):
+    if st.button("Analyze asset", type="primary"):
         with st.spinner("Loading candles..."):
             row = scan_asset(
                 selected,
                 ASSETS[selected],
                 interval,
                 period,
-                int(candle_count)
+                int(lookback)
             )
 
-        show_asset_card(row)
+        if row["Position %"] is None:
+            st.error(row["Status"])
+        else:
+            show_extreme_card(
+                row, "ASSET RANGE POSITION", "#64748b"
+            )
 
-        if row["Status"].startswith("OK"):
             df = fetch_candles(
-                ASSETS[selected],
-                interval,
-                period,
-                int(candle_count)
+                ASSETS[selected], interval, period, int(lookback)
             )
-
             st.subheader("Price history")
-            st.line_chart(df[["Close"]], height=300)
-
-            levels = pd.DataFrame(
-                {
-                    "LOW": [df["Low"].min()] * len(df),
-                    "HIGH": [df["High"].max()] * len(df),
-                    "Close": df["Close"]
-                },
-                index=df.index
-            )
-
-            st.subheader("LOW / HIGH levels")
-            st.line_chart(levels, height=300)
+            st.line_chart(df[["Close"]], height=350)
 
 else:
-    if st.button("Scan all assets", type="primary"):
+    if st.button("Start scan", type="primary"):
         results = []
         progress = st.progress(0)
-        status_text = st.empty()
+        status = st.empty()
         total = len(ASSETS)
 
-        for index, (name, symbol) in enumerate(
-            ASSETS.items(), start=1
-        ):
-            row = scan_asset(
-                name,
-                symbol,
-                interval,
-                period,
-                int(candle_count)
+        for i, (name, symbol) in enumerate(ASSETS.items(), start=1):
+            result = scan_asset(
+                name, symbol, interval, period, int(lookback)
             )
-
-            results.append(row)
-            progress.progress(index / total)
-            status_text.write(f"{index}/{total}: {name}")
-
+            results.append(result)
+            progress.progress(i / total)
+            status.write(f"Scanning {i}/{total}: {name}")
             time.sleep(0.05)
 
-        st.session_state["results"] = pd.DataFrame(results)
+        st.session_state["scan_results"] = pd.DataFrame(results)
 
-    if "results" in st.session_state:
-        table = st.session_state["results"]
+    if "scan_results" in st.session_state:
+        table = st.session_state["scan_results"]
 
-        filter_mode = st.selectbox(
-            "Filter assets",
-            ["All", "Available only", "Unavailable only"]
-        )
+        valid = table[
+            table["Position %"].notna()
+            & (table["Status"].str.startswith("OK"))
+        ].copy()
 
-        if filter_mode == "Available only":
-            displayed = table[
-                table["Status"].str.startswith("OK")
-            ]
-        elif filter_mode == "Unavailable only":
-            displayed = table[
-                ~table["Status"].str.startswith("OK")
-            ]
+        unavailable = table[
+            ~table.index.isin(valid.index)
+        ]
+
+        if valid.empty:
+            st.error(
+                "No usable market data was returned. "
+                "Check whether the data provider is accessible."
+            )
         else:
-            displayed = table
+            valid = valid.sort_values("Position %", ascending=True)
 
-        st.subheader("Each asset — LOW above HIGH")
+            lowest = valid.iloc[0]
+            highest = valid.iloc[-1]
 
-        # One card per asset, with LOW and HIGH stacked vertically.
-        for _, row in displayed.iterrows():
-            show_asset_card(row)
+            st.subheader("Market extremes")
 
-        st.download_button(
-            "Download all results CSV",
-            data=table.to_csv(index=False).encode("utf-8"),
-            file_name="low_high_400_candles.csv",
-            mime="text/csv"
-        )
+            left, right = st.columns(2)
+
+            with left:
+                show_extreme_card(
+                    lowest, "🔴 LOWEST POSITION", "#ef4444"
+                )
+
+            with right:
+                show_extreme_card(
+                    highest, "🟢 HIGHEST POSITION", "#22c55e"
+                )
+
+            st.subheader("All assets — bottom to top")
+
+            for _, row in valid.iterrows():
+                with st.container(border=True):
+                    st.markdown(f"**{row['Asset']}**")
+                    st.markdown(f"LOW: `{row['LOW']:.8g}`")
+                    st.markdown(f"HIGH: `{row['HIGH']:.8g}`")
+                    st.markdown(f"Latest: `{row['Latest']:.8g}`")
+                    st.progress(float(row["Position %"]) / 100)
+                    st.caption(
+                        f"Range position: {row['Position %']:.2f}%"
+                    )
+
+            st.subheader("Unavailable assets")
+            if not unavailable.empty:
+                st.dataframe(
+                    unavailable[["Asset", "Status"]],
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+            st.download_button(
+                "Download CSV",
+                data=table.to_csv(index=False).encode("utf-8"),
+                file_name="market_extremes_400.csv",
+                mime="text/csv"
+            )
 
 st.divider()
 st.caption(
-    "LOW and HIGH are historical extremes in the retrieved candles. "
-    "They do not predict the next market movement."
+    "The ranking measures relative position within each asset's own "
+    "historical range. It does not guarantee a reversal or profitable trade."
 )
