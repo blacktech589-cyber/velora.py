@@ -1,7 +1,6 @@
 
 import streamlit as st
 import pandas as pd
-import plotly.graph_objects as go
 import urllib.request
 import urllib.parse
 import json
@@ -13,6 +12,8 @@ st.set_page_config(
     layout="wide"
 )
 
+# Binance public market symbols.
+# None means no verified external market feed configured.
 ASSETS = {
     "Crypto IDX": None,
     "Booo": None,
@@ -87,8 +88,6 @@ ASSETS = {
     "Yum Brands": None,
 }
 
-BINANCE_URL = "https://api.binance.com/api/v3/klines"
-
 INTERVALS = {
     "1 minute": "1m",
     "5 minutes": "5m",
@@ -99,59 +98,32 @@ INTERVALS = {
     "1 day": "1d",
 }
 
-st.title("400 Candle Extreme Scanner")
-st.caption("BUY at lower extremes | SELL at upper extremes")
-
-st.warning(
-    "This application uses public Binance market data, not Binomo's "
-    "OTC price feed. OTC quotes may differ. No trades are executed."
-)
-
-c1, c2, c3 = st.columns(3)
-
-with c1:
-    interval_label = st.selectbox(
-        "Timeframe", list(INTERVALS.keys()), index=2
-    )
-
-with c2:
-    lookback = st.number_input(
-        "Lookback candles", min_value=50, max_value=400,
-        value=400, step=50
-    )
-
-with c3:
-    tolerance_pct = st.slider(
-        "Extreme zone (%)", 0.0, 2.0, 0.2, 0.1
-    )
-
-interval = INTERVALS[interval_label]
-tolerance = tolerance_pct / 100.0
+API_URL = "https://api.binance.com/api/v3/klines"
 
 
-def get_klines(symbol, interval, limit=400):
+@st.cache_data(ttl=30, show_spinner=False)
+def download_candles(symbol, interval, limit):
     params = urllib.parse.urlencode({
         "symbol": symbol,
         "interval": interval,
-        "limit": min(int(limit) + 5, 1000)
+        "limit": min(int(limit) + 2, 1000),
     })
-    url = BINANCE_URL + "?" + params
 
     request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0"}
+        API_URL + "?" + params,
+        headers={"User-Agent": "Mozilla/5.0"},
     )
 
-    with urllib.request.urlopen(request, timeout=12) as response:
+    with urllib.request.urlopen(request, timeout=15) as response:
         raw = json.loads(response.read().decode("utf-8"))
 
     if not isinstance(raw, list) or not raw:
         return pd.DataFrame()
 
     columns = [
-        "Open time", "Open", "High", "Low", "Close",
-        "Volume", "Close time", "Quote volume",
-        "Trades", "Taker buy base", "Taker buy quote", "Ignore"
+        "OpenTime", "Open", "High", "Low", "Close",
+        "Volume", "CloseTime", "QuoteVolume", "Trades",
+        "TakerBuyBase", "TakerBuyQuote", "Ignore",
     ]
 
     df = pd.DataFrame(raw, columns=columns)
@@ -159,38 +131,34 @@ def get_klines(symbol, interval, limit=400):
     for col in ["Open", "High", "Low", "Close", "Volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df["Open time"] = pd.to_datetime(
-        df["Open time"], unit="ms", utc=True
-    )
-
-    df = df.set_index("Open time")
+    df["Time"] = pd.to_datetime(df["OpenTime"], unit="ms", utc=True)
+    df = df.set_index("Time")
     df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
 
-    # Exclude the currently forming candle.
+    # The latest candle may still be forming.
     if len(df) > 1:
         df = df.iloc[:-1]
 
     return df.tail(int(limit))
 
 
-def analyze(symbol, interval, lookback, tolerance):
-    df = get_klines(symbol, interval, int(lookback) + 1)
-
-    if len(df) < int(lookback) + 1:
-        return None, df, "Not enough completed candles"
+def analyze_candles(df, lookback, tolerance):
+    if df.empty or len(df) < lookback + 1:
+        return df, None
 
     df = df.copy()
-    n = int(lookback)
 
-    # Previous N candles, excluding the current completed candle.
-    df["PriorLow"] = df["Low"].shift(1).rolling(n).min()
-    df["PriorHigh"] = df["High"].shift(1).rolling(n).max()
+    # Rolling levels from the preceding candles, excluding current candle.
+    df["PriorLow"] = df["Low"].shift(1).rolling(lookback).min()
+    df["PriorHigh"] = df["High"].shift(1).rolling(lookback).max()
 
+    # BUY near a low after a bullish candle.
     df["BUY"] = (
         (df["Low"] <= df["PriorLow"] * (1 + tolerance))
         & (df["Close"] > df["Open"])
     )
 
+    # SELL near a high after a bearish candle.
     df["SELL"] = (
         (df["High"] >= df["PriorHigh"] * (1 - tolerance))
         & (df["Close"] < df["Open"])
@@ -207,143 +175,168 @@ def analyze(symbol, interval, lookback, tolerance):
         "Signal": str(last["Signal"]),
         "Low": float(last["PriorLow"]),
         "High": float(last["PriorHigh"]),
-        "Candles": len(df),
         "Time": str(df.index[-1]),
+        "Candles": len(df),
     }
 
-    return result, df, ""
+    return df, result
 
 
-def render_chart(name, df):
-    fig = go.Figure()
+def show_chart(df):
+    if df.empty:
+        st.info("No chart data available.")
+        return
 
-    fig.add_trace(go.Candlestick(
-        x=df.index,
-        open=df["Open"],
-        high=df["High"],
-        low=df["Low"],
-        close=df["Close"],
-        name=name
-    ))
+    chart = df[["Open", "High", "Low", "Close"]].copy()
+    chart = chart.rename(columns={
+        "Open": "Open",
+        "High": "High",
+        "Low": "Low",
+        "Close": "Close",
+    })
 
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["PriorLow"],
-        name="Prior 400-candle low",
-        line=dict(color="red", width=1)
-    ))
+    st.subheader("Price chart")
+    st.caption("Streamlit native chart; OHLC values are shown below.")
 
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df["PriorHigh"],
-        name="Prior 400-candle high",
-        line=dict(color="green", width=1)
-    ))
+    st.line_chart(chart[["Close"]], height=350)
 
-    buys = df[df["BUY"]]
-    sells = df[df["SELL"]]
-
-    fig.add_trace(go.Scatter(
-        x=buys.index, y=buys["Low"],
-        mode="markers", name="BUY",
-        marker=dict(color="lime", size=10, symbol="triangle-up")
-    ))
-
-    fig.add_trace(go.Scatter(
-        x=sells.index, y=sells["High"],
-        mode="markers", name="SELL",
-        marker=dict(color="red", size=10, symbol="triangle-down")
-    ))
-
-    fig.update_layout(
-        height=600,
-        xaxis_rangeslider_visible=False,
-        title=f"{name} — {interval_label}",
-        legend=dict(orientation="h")
+    st.subheader("400-candle extreme levels")
+    st.line_chart(
+        df[["Close", "PriorLow", "PriorHigh"]].tail(200),
+        height=300,
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.subheader("Recent candles and signals")
+    recent = df.tail(30).copy()
+    recent.index = recent.index.strftime("%Y-%m-%d %H:%M UTC")
+    st.dataframe(recent, use_container_width=True)
 
+
+st.title("400 Candle Extreme Scanner")
+
+st.write(
+    "Analyzes the latest completed candles for potential BUY signals "
+    "near lower extremes and SELL signals near upper extremes."
+)
+
+st.warning(
+    "This app uses Binance public market data, not Binomo's own OTC feed. "
+    "Prices and signals can differ from Binomo. No trades are executed."
+)
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    timeframe_label = st.selectbox(
+        "Timeframe", list(INTERVALS.keys()), index=2
+    )
+
+with col2:
+    lookback = st.number_input(
+        "Lookback candles", min_value=50, max_value=400,
+        value=400, step=50
+    )
+
+with col3:
+    tolerance_pct = st.slider(
+        "Extreme zone (%)", 0.0, 2.0, 0.2, 0.1
+    )
+
+timeframe = INTERVALS[timeframe_label]
+tolerance = tolerance_pct / 100
 
 mode = st.radio(
-    "Mode",
-    ["Single asset", "Scan all supported crypto"],
-    horizontal=True
+    "Scanner mode",
+    ["Single asset", "Scan supported assets"],
+    horizontal=True,
 )
 
 if mode == "Single asset":
-    available_assets = [
-        name for name, symbol in ASSETS.items()
-        if symbol is not None
-    ]
+    names = list(ASSETS.keys())
+    selected = st.selectbox("Select asset", names)
+    symbol = ASSETS[selected]
 
-    selected = st.selectbox("Select asset", available_assets)
+    if symbol is None:
+        st.info(
+            f"{selected} has no external market symbol configured. "
+            "Real Binomo OTC candles are not available through this feed."
+        )
 
-    if st.button("Analyze", type="primary"):
-        try:
-            with st.spinner("Downloading market candles..."):
-                result, df, error = analyze(
-                    ASSETS[selected], interval, lookback, tolerance
+    if st.button("Analyze asset", type="primary"):
+        if symbol is None:
+            st.error("Cannot analyze this asset without real price data.")
+        else:
+            try:
+                with st.spinner("Downloading completed candles..."):
+                    df = download_candles(
+                        symbol, timeframe, int(lookback) + 1
+                    )
+                    df, result = analyze_candles(
+                        df, int(lookback), tolerance
+                    )
+
+                if result is None:
+                    st.error(
+                        "Not enough completed candles were returned "
+                        "to calculate the selected lookback."
+                    )
+                else:
+                    a, b, c = st.columns(3)
+                    a.metric("Latest price", f"{result['Price']:.8g}")
+                    b.metric("Signal", result["Signal"])
+                    c.metric("Candles", result["Candles"])
+
+                    if result["Signal"] == "BUY":
+                        st.success("Potential BUY reversal signal")
+                    elif result["Signal"] == "SELL":
+                        st.error("Potential SELL reversal signal")
+                    else:
+                        st.info("WAIT: no qualifying reversal on the latest candle")
+
+                    st.caption("Last completed candle: " + result["Time"])
+                    show_chart(df)
+
+            except Exception as exc:
+                st.error("Could not retrieve market data.")
+                st.caption(
+                    "Check internet access, symbol availability, "
+                    "or API rate limits. Details: " + str(exc)[:300]
                 )
 
-            if error:
-                st.error(error)
-            elif result:
-                a, b, c = st.columns(3)
-                a.metric("Price", f"{result['Price']:.8g}")
-                b.metric("Signal", result["Signal"])
-                c.metric("Candles", result["Candles"])
-
-                if result["Signal"] == "BUY":
-                    st.success("Potential BUY reversal signal")
-                elif result["Signal"] == "SELL":
-                    st.error("Potential SELL reversal signal")
-                else:
-                    st.info("WAIT: no qualifying extreme reversal")
-
-                st.caption(f"Last completed candle: {result['Time']}")
-                render_chart(selected, df)
-                st.dataframe(df.tail(30), use_container_width=True)
-
-        except Exception as exc:
-            st.error(
-                "Market data request failed. Check network access, "
-                "symbol availability, or API rate limits."
-            )
-            st.caption(str(exc))
-
-
 else:
-    crypto_assets = {
+    supported = {
         name: symbol
         for name, symbol in ASSETS.items()
         if symbol is not None
     }
 
     st.caption(
-        "Only symbols configured for Binance are scanned. "
-        "These are external-market proxies, not confirmed Binomo OTC feeds."
+        "Only assets with configured Binance symbols are scanned. "
+        "This does not scan Binomo's private OTC prices."
     )
 
-    if st.button("Start scan", type="primary"):
+    if st.button("Start full scan", type="primary"):
         results = []
         progress = st.progress(0)
         status = st.empty()
+        total = len(supported)
 
-        total = len(crypto_assets)
-
-        for i, (name, symbol) in enumerate(crypto_assets.items(), start=1):
+        for i, (name, symbol) in enumerate(supported.items(), start=1):
             try:
-                result, df, error = analyze(
-                    symbol, interval, lookback, tolerance
+                df = download_candles(
+                    symbol, timeframe, int(lookback) + 1
+                )
+                df, result = analyze_candles(
+                    df, int(lookback), tolerance
                 )
 
-                if error:
+                if result is None:
                     results.append({
                         "Asset": name,
                         "Symbol": symbol,
                         "Price": None,
                         "Signal": "No data",
                         "Candles": len(df),
-                        "Error": error
                     })
                 else:
                     results.append({
@@ -352,10 +345,9 @@ else:
                         "Price": result["Price"],
                         "Signal": result["Signal"],
                         "Candles": result["Candles"],
-                        "Low": result["Low"],
-                        "High": result["High"],
-                        "Time": result["Time"],
-                        "Error": ""
+                        "Prior low": result["Low"],
+                        "Prior high": result["High"],
+                        "Last candle": result["Time"],
                     })
 
             except Exception as exc:
@@ -365,59 +357,55 @@ else:
                     "Price": None,
                     "Signal": "Error",
                     "Candles": 0,
-                    "Error": str(exc)[:150]
+                    "Error": str(exc)[:150],
                 })
 
             progress.progress(i / total)
             status.write(f"Scanned {i}/{total}: {name}")
-
-            # Avoid sending too many requests too quickly.
             time.sleep(0.15)
 
         table = pd.DataFrame(results)
-        st.session_state["results"] = table
+        st.session_state["scan_results"] = table
 
-    if "results" in st.session_state:
-        table = st.session_state["results"]
+    if "scan_results" in st.session_state:
+        table = st.session_state["scan_results"]
 
-        filter_choice = st.selectbox(
-            "Filter",
-            ["All", "BUY", "SELL", "WAIT", "Unavailable"]
+        filter_option = st.selectbox(
+            "Filter results",
+            ["All", "BUY", "SELL", "WAIT", "No data / Error"],
         )
 
-        if filter_choice in ["BUY", "SELL", "WAIT"]:
-            shown = table[table["Signal"] == filter_choice]
-        elif filter_choice == "Unavailable":
-            shown = table[
+        if filter_option in ["BUY", "SELL", "WAIT"]:
+            displayed = table[table["Signal"] == filter_option]
+        elif filter_option == "No data / Error":
+            displayed = table[
                 table["Signal"].isin(["No data", "Error"])
             ]
         else:
-            shown = table
+            displayed = table
 
         st.dataframe(
-            shown,
-            use_container_width=True,
-            hide_index=True
+            displayed, use_container_width=True, hide_index=True
         )
 
-        buys = int((table["Signal"] == "BUY").sum())
-        sells = int((table["Signal"] == "SELL").sum())
-        waits = int((table["Signal"] == "WAIT").sum())
+        buy_count = int((table["Signal"] == "BUY").sum())
+        sell_count = int((table["Signal"] == "SELL").sum())
+        wait_count = int((table["Signal"] == "WAIT").sum())
 
         a, b, c = st.columns(3)
-        a.metric("BUY", buys)
-        b.metric("SELL", sells)
-        c.metric("WAIT", waits)
+        a.metric("BUY signals", buy_count)
+        b.metric("SELL signals", sell_count)
+        c.metric("WAIT signals", wait_count)
 
         st.download_button(
             "Download CSV",
             data=table.to_csv(index=False).encode("utf-8"),
             file_name="extreme_scanner.csv",
-            mime="text/csv"
+            mime="text/csv",
         )
 
 st.divider()
 st.caption(
-    "No order execution. Signals are analytical only and do not guarantee "
-    "a profitable trade. External market prices may differ from Binomo."
+    "Analysis only. No order execution. Extreme levels do not guarantee "
+    "reversals or profitable trades."
 )
