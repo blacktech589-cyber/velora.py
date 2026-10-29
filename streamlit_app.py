@@ -15,7 +15,7 @@ st.set_page_config(
     layout="wide",
 )
 
-LOOKBACK_DEFAULT = 3000
+LOOKBACK_DEFAULT = 15000
 
 # These are public-market Yahoo Finance symbols where available.
 # Binomo OTC instruments may not match these external data sources.
@@ -223,8 +223,8 @@ with st.sidebar:
     tf_name = st.selectbox("Zaman dilimi", list(TIMEFRAMES.keys()), index=2)
     lookback = st.selectbox(
         "Analiz edilecek tamamlanmış mum",
-        [500, 1000, 2000, 3000],
-        index=3,
+        [1000, 3000, 5000, 10000, 15000],
+        index=4,
     )
     mode = st.radio("Tarama modu", ["Tüm varlıklar", "Tek varlık"], index=0)
     if mode == "Tek varlık":
