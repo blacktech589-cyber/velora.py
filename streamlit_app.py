@@ -1,234 +1,198 @@
 
 import streamlit as st
 import pandas as pd
-import yfinance as yf
 import plotly.graph_objects as go
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib.request
+import urllib.parse
+import json
+import time
 
 st.set_page_config(
-    page_title="Binomo Extreme Scanner",
+    page_title="400 Candle Extreme Scanner",
     page_icon="📈",
     layout="wide"
 )
-
-# -------------------- ASSETS --------------------
 
 ASSETS = {
     "Crypto IDX": None,
     "Booo": None,
     "Ghosty": None,
     "Dusky": None,
-    "Bitcoin (OTC)": None,
-    "Ethereum (OTC)": None,
-    "Solana (OTC)": None,
-    "EUR/USD": "EURUSD=X",
+    "Bitcoin (OTC)": "BTCUSDT",
+    "Ethereum (OTC)": "ETHUSDT",
+    "Solana (OTC)": "SOLUSDT",
+    "EUR/USD": None,
     "AUD/USD (OTC)": None,
-    "GBP/NOK": "GBPNOK=X",
-    "CAD/JPY": "CADJPY=X",
+    "GBP/NOK": None,
+    "CAD/JPY": None,
     "FC Barcelona Token (OTC)": None,
-    "AUD/ZAR": "AUDZAR=X",
-    "CAD/DKK": "CADDKK=X",
-    "GBP/SGD": "GBPSGD=X",
-    "Cardano (OTC)": None,
-    "EUR/ZAR": "EURZAR=X",
-    "GBP/HKD": "GBPHKD=X",
-    "CAD/MXN": "CADMXN=X",
-    "CHF/JPY": "CHFJPY=X",
+    "AUD/ZAR": None,
+    "CAD/DKK": None,
+    "GBP/SGD": None,
+    "Cardano (OTC)": "ADAUSDT",
+    "EUR/ZAR": None,
+    "GBP/HKD": None,
+    "CAD/MXN": None,
+    "CHF/JPY": None,
     "NZD/USD (OTC)": None,
-    "EUR/MXN": "EURMXN=X",
-    "CAD/SEK": "CADSEK=X",
-    "CAD/NOK": "CADNOK=X",
-    "AUD/JPY": "AUDJPY=X",
-    "Chainlink (OTC)": None,
-    "GBP/MXN": "GBPMXN=X",
-    "AUD/SGD": "AUDSGD=X",
-    "AUD/DKK": "AUDDKK=X",
-    "GBP/CZK": "GBPCZK=X",
-    "EUR/JPY": "EURJPY=X",
-    "NZD/JPY": "NZDJPY=X",
-    "GBP/TRY": "GBPTRY=X",
-    "AUD/SEK": "AUDSEK=X",
+    "EUR/MXN": None,
+    "CAD/SEK": None,
+    "CAD/NOK": None,
+    "AUD/JPY": None,
+    "Chainlink (OTC)": "LINKUSDT",
+    "GBP/MXN": None,
+    "AUD/SGD": None,
+    "AUD/DKK": None,
+    "GBP/CZK": None,
+    "EUR/JPY": None,
+    "NZD/JPY": None,
+    "GBP/TRY": None,
+    "AUD/SEK": None,
     "GBP/JPY (OTC)": None,
-    "NZD/CAD": "NZDCAD=X",
-    "NZD/DKK": "NZDDKK=X",
+    "NZD/CAD": None,
+    "NZD/DKK": None,
     "EUR/GBP (OTC)": None,
-    "NZD/SEK": "NZDSEK=X",
-    "SGD/JPY": "SGDJPY=X",
-    "AUD/CAD": "AUDCAD=X",
-    "USD/NOK": "NOK=X",
+    "NZD/SEK": None,
+    "SGD/JPY": None,
+    "AUD/CAD": None,
+    "USD/NOK": None,
     "USD/CAD (OTC)": None,
-    "Bitcoin Cash (OTC)": None,
-    "Kusama (OTC)": None,
-    "Aave (OTC)": None,
-    "Pancake Swap (OTC)": None,
-    "Uniswap (OTC)": None,
-    "NZD/CHF": "NZDCHF=X",
-    "GBP/CAD": "GBPCAD=X",
-    "AUD/CHF": "AUDCHF=X",
-    "Microsoft": "MSFT",
-    "Boeing": "BA",
-    "US International Group": "AIG",
-    "McDonalds": "MCD",
-    "JD": "JD",
-    "PayPal": "PYPL",
-    "NASDAQ 100": "^NDX",
-    "Dow Jones IA": "^DJI",
-    "GBP/USD": "GBPUSD=X",
-    "VOO": "VOO",
-    "iShares Russell 2000 ETF": "IWM",
-    "Invesco Nasdaq 100 ETF": "QQQ",
-    "ProShares UltraPro QQQ": "TQQQ",
-    "Google": "GOOGL",
-    "IBM": "IBM",
-    "ZAR/JPY": "ZARJPY=X",
-    "Litecoin": "LTC-USD",
-    "USD/DKK": "DKK=X",
-    "GBP/CHF": "GBPCHF=X",
-    "Yum Brands": "YUM",
+    "Bitcoin Cash (OTC)": "BCHUSDT",
+    "Kusama (OTC)": "KSMUSDT",
+    "Aave (OTC)": "AAVEUSDT",
+    "Pancake Swap (OTC)": "CAKEUSDT",
+    "Uniswap (OTC)": "UNIUSDT",
+    "NZD/CHF": None,
+    "GBP/CAD": None,
+    "AUD/CHF": None,
+    "Microsoft": None,
+    "Boeing": None,
+    "US International Group": None,
+    "McDonalds": None,
+    "JD": None,
+    "PayPal": None,
+    "NASDAQ 100": None,
+    "Dow Jones IA": None,
+    "GBP/USD": None,
+    "VOO": None,
+    "iShares Russell 2000 ETF": None,
+    "Invesco Nasdaq 100 ETF": None,
+    "ProShares UltraPro QQQ": None,
+    "Google": None,
+    "IBM": None,
+    "ZAR/JPY": None,
+    "Litecoin": "LTCUSDT",
+    "USD/DKK": None,
+    "GBP/CHF": None,
+    "Yum Brands": None,
 }
 
-# -------------------- HEADER --------------------
+BINANCE_URL = "https://api.binance.com/api/v3/klines"
 
-st.title("📈 Binomo 400-Candle Extreme Scanner")
-st.write(
-    "Scans available market data for potential BUY-at-the-low "
-    "and SELL-at-the-high reversal signals."
-)
+INTERVALS = {
+    "1 minute": "1m",
+    "5 minutes": "5m",
+    "15 minutes": "15m",
+    "30 minutes": "30m",
+    "1 hour": "1h",
+    "4 hours": "4h",
+    "1 day": "1d",
+}
+
+st.title("400 Candle Extreme Scanner")
+st.caption("BUY at lower extremes | SELL at upper extremes")
 
 st.warning(
-    "This is an external market-data scanner, not a Binomo-connected "
-    "indicator. OTC prices may differ from external market prices. "
-    "Signals are not guarantees of future price movement."
+    "This application uses public Binance market data, not Binomo's "
+    "OTC price feed. OTC quotes may differ. No trades are executed."
 )
 
-# -------------------- SETTINGS --------------------
+c1, c2, c3 = st.columns(3)
 
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    timeframe = st.selectbox(
-        "Timeframe",
-        ["5m", "15m", "30m", "1h", "1d"],
-        index=1
+with c1:
+    interval_label = st.selectbox(
+        "Timeframe", list(INTERVALS.keys()), index=2
     )
 
-with col2:
+with c2:
     lookback = st.number_input(
-        "Lookback candles",
-        min_value=50,
-        max_value=400,
-        value=400,
-        step=50
+        "Lookback candles", min_value=50, max_value=400,
+        value=400, step=50
     )
 
-with col3:
-    tolerance = st.slider(
-        "Extreme tolerance (%)",
-        min_value=0.0,
-        max_value=2.0,
-        value=0.2,
-        step=0.1
-    ) / 100
+with c3:
+    tolerance_pct = st.slider(
+        "Extreme zone (%)", 0.0, 2.0, 0.2, 0.1
+    )
 
-asset_names = list(ASSETS.keys())
+interval = INTERVALS[interval_label]
+tolerance = tolerance_pct / 100.0
 
-mode = st.radio(
-    "Scanning mode",
-    ["Single asset", "Scan all supported assets"],
-    horizontal=True
-)
 
-selected_asset = None
+def get_klines(symbol, interval, limit=400):
+    params = urllib.parse.urlencode({
+        "symbol": symbol,
+        "interval": interval,
+        "limit": min(int(limit) + 5, 1000)
+    })
+    url = BINANCE_URL + "?" + params
 
-if mode == "Single asset":
-    selected_asset = st.selectbox("Select asset", asset_names)
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0"}
+    )
 
-# -------------------- DATA FUNCTIONS --------------------
+    with urllib.request.urlopen(request, timeout=12) as response:
+        raw = json.loads(response.read().decode("utf-8"))
 
-@st.cache_data(ttl=60, show_spinner=False)
-def download_data(symbol, interval):
-    if not symbol:
+    if not isinstance(raw, list) or not raw:
         return pd.DataFrame()
 
-    period_map = {
-        "5m": "60d",
-        "15m": "60d",
-        "30m": "60d",
-        "1h": "730d",
-        "1d": "max",
-    }
+    columns = [
+        "Open time", "Open", "High", "Low", "Close",
+        "Volume", "Close time", "Quote volume",
+        "Trades", "Taker buy base", "Taker buy quote", "Ignore"
+    ]
 
-    try:
-        df = yf.download(
-            symbol,
-            period=period_map[interval],
-            interval=interval,
-            progress=False,
-            auto_adjust=False,
-            threads=False
-        )
+    df = pd.DataFrame(raw, columns=columns)
 
-        if df is None or df.empty:
-            return pd.DataFrame()
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+    df["Open time"] = pd.to_datetime(
+        df["Open time"], unit="ms", utc=True
+    )
 
-        needed = ["Open", "High", "Low", "Close"]
-        if not all(c in df.columns for c in needed):
-            return pd.DataFrame()
+    df = df.set_index("Open time")
+    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
 
-        df = df[needed].copy()
+    # Exclude the currently forming candle.
+    if len(df) > 1:
+        df = df.iloc[:-1]
 
-        for col in needed:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        df = df.dropna()
-        return df
-
-    except Exception:
-        return pd.DataFrame()
+    return df.tail(int(limit))
 
 
-def analyze_asset(name, symbol, interval, lookback, tolerance):
-    if not symbol:
-        return {
-            "Asset": name,
-            "Price": None,
-            "Signal": "OTC / no external feed",
-            "Candles": 0,
-            "Error": "No external symbol configured"
-        }, pd.DataFrame()
+def analyze(symbol, interval, lookback, tolerance):
+    df = get_klines(symbol, interval, int(lookback) + 1)
 
-    df = download_data(symbol, interval)
-
-    if df.empty:
-        return {
-            "Asset": name,
-            "Price": None,
-            "Signal": "No data",
-            "Candles": 0,
-            "Error": "Data unavailable"
-        }, df
+    if len(df) < int(lookback) + 1:
+        return None, df, "Not enough completed candles"
 
     df = df.copy()
-
-    # Use the previous N completed bars to establish extremes.
     n = int(lookback)
-    df["PreviousLow"] = df["Low"].shift(1).rolling(n).min()
-    df["PreviousHigh"] = df["High"].shift(1).rolling(n).max()
 
-    # Potential reversal at the lower extreme:
-    # price approaches/breaks the prior low and candle closes bullish.
+    # Previous N candles, excluding the current completed candle.
+    df["PriorLow"] = df["Low"].shift(1).rolling(n).min()
+    df["PriorHigh"] = df["High"].shift(1).rolling(n).max()
+
     df["BUY"] = (
-        (df["Low"] <= df["PreviousLow"] * (1 + tolerance))
+        (df["Low"] <= df["PriorLow"] * (1 + tolerance))
         & (df["Close"] > df["Open"])
     )
 
-    # Potential reversal at the upper extreme:
-    # price approaches/breaks the prior high and candle closes bearish.
     df["SELL"] = (
-        (df["High"] >= df["PreviousHigh"] * (1 - tolerance))
+        (df["High"] >= df["PriorHigh"] * (1 - tolerance))
         & (df["Close"] < df["Open"])
     )
 
@@ -236,42 +200,21 @@ def analyze_asset(name, symbol, interval, lookback, tolerance):
     df.loc[df["BUY"], "Signal"] = "BUY"
     df.loc[df["SELL"], "Signal"] = "SELL"
 
-    valid = df.dropna(subset=["PreviousLow", "PreviousHigh"])
-
-    if valid.empty:
-        return {
-            "Asset": name,
-            "Price": float(df["Close"].iloc[-1]),
-            "Signal": "Need more candles",
-            "Candles": len(df),
-            "Error": "Insufficient history"
-        }, df
-
-    # Avoid acting on a candle that may still be forming.
-    # The most recent bar is displayed, but its signal is provisional
-    # until that candle has closed.
-    latest = valid.iloc[-1]
+    last = df.iloc[-1]
 
     result = {
-        "Asset": name,
-        "Price": round(float(latest["Close"]), 6),
-        "Signal": str(latest["Signal"]),
+        "Price": float(last["Close"]),
+        "Signal": str(last["Signal"]),
+        "Low": float(last["PriorLow"]),
+        "High": float(last["PriorHigh"]),
         "Candles": len(df),
-        "400-candle low": round(float(latest["PreviousLow"]), 6),
-        "400-candle high": round(float(latest["PreviousHigh"]), 6),
-        "Error": ""
+        "Time": str(df.index[-1]),
     }
 
-    return result, df
+    return result, df, ""
 
 
-# -------------------- SINGLE ASSET VIEW --------------------
-
-def show_chart(name, df):
-    if df.empty:
-        st.info("No chart data is available for this asset.")
-        return
-
+def render_chart(name, df):
     fig = go.Figure()
 
     fig.add_trace(go.Candlestick(
@@ -283,108 +226,101 @@ def show_chart(name, df):
         name=name
     ))
 
-    n = int(lookback)
-    df = df.copy()
-    df["LowLevel"] = df["Low"].shift(1).rolling(n).min()
-    df["HighLevel"] = df["High"].shift(1).rolling(n).max()
-
     fig.add_trace(go.Scatter(
-        x=df.index,
-        y=df["LowLevel"],
-        mode="lines",
-        name="Previous 400-candle low",
+        x=df.index, y=df["PriorLow"],
+        name="Prior 400-candle low",
         line=dict(color="red", width=1)
     ))
 
     fig.add_trace(go.Scatter(
-        x=df.index,
-        y=df["HighLevel"],
-        mode="lines",
-        name="Previous 400-candle high",
+        x=df.index, y=df["PriorHigh"],
+        name="Prior 400-candle high",
         line=dict(color="green", width=1)
     ))
 
-    valid = df.dropna(subset=["LowLevel", "HighLevel"])
-
-    buys = valid[
-        (valid["Low"] <= valid["LowLevel"] * (1 + tolerance))
-        & (valid["Close"] > valid["Open"])
-    ]
-
-    sells = valid[
-        (valid["High"] >= valid["HighLevel"] * (1 - tolerance))
-        & (valid["Close"] < valid["Open"])
-    ]
+    buys = df[df["BUY"]]
+    sells = df[df["SELL"]]
 
     fig.add_trace(go.Scatter(
-        x=buys.index,
-        y=buys["Low"],
-        mode="markers",
-        name="BUY",
-        marker=dict(color="lime", size=11, symbol="triangle-up")
+        x=buys.index, y=buys["Low"],
+        mode="markers", name="BUY",
+        marker=dict(color="lime", size=10, symbol="triangle-up")
     ))
 
     fig.add_trace(go.Scatter(
-        x=sells.index,
-        y=sells["High"],
-        mode="markers",
-        name="SELL",
-        marker=dict(color="red", size=11, symbol="triangle-down")
+        x=sells.index, y=sells["High"],
+        mode="markers", name="SELL",
+        marker=dict(color="red", size=10, symbol="triangle-down")
     ))
 
     fig.update_layout(
-        height=650,
+        height=600,
         xaxis_rangeslider_visible=False,
-        title=f"{name} | {timeframe} | {lookback} candles",
+        title=f"{name} — {interval_label}",
         legend=dict(orientation="h")
     )
 
     st.plotly_chart(fig, use_container_width=True)
 
 
+mode = st.radio(
+    "Mode",
+    ["Single asset", "Scan all supported crypto"],
+    horizontal=True
+)
+
 if mode == "Single asset":
-    symbol = ASSETS[selected_asset]
+    available_assets = [
+        name for name, symbol in ASSETS.items()
+        if symbol is not None
+    ]
 
-    if symbol is None:
-        st.error(
-            "This asset is an OTC or synthetic listing without a configured "
-            "external data feed. Its real Binomo candles cannot be retrieved "
-            "by this app."
-        )
-        st.stop()
+    selected = st.selectbox("Select asset", available_assets)
 
-    if st.button("Analyze asset", type="primary"):
-        with st.spinner(f"Loading {selected_asset}..."):
-            result, df = analyze_asset(
-                selected_asset, symbol, timeframe, lookback, tolerance
+    if st.button("Analyze", type="primary"):
+        try:
+            with st.spinner("Downloading market candles..."):
+                result, df, error = analyze(
+                    ASSETS[selected], interval, lookback, tolerance
+                )
+
+            if error:
+                st.error(error)
+            elif result:
+                a, b, c = st.columns(3)
+                a.metric("Price", f"{result['Price']:.8g}")
+                b.metric("Signal", result["Signal"])
+                c.metric("Candles", result["Candles"])
+
+                if result["Signal"] == "BUY":
+                    st.success("Potential BUY reversal signal")
+                elif result["Signal"] == "SELL":
+                    st.error("Potential SELL reversal signal")
+                else:
+                    st.info("WAIT: no qualifying extreme reversal")
+
+                st.caption(f"Last completed candle: {result['Time']}")
+                render_chart(selected, df)
+                st.dataframe(df.tail(30), use_container_width=True)
+
+        except Exception as exc:
+            st.error(
+                "Market data request failed. Check network access, "
+                "symbol availability, or API rate limits."
             )
+            st.caption(str(exc))
 
-        if result["Price"] is None:
-            st.error("Market data could not be retrieved. Try another asset.")
-        else:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Latest price", result["Price"])
-            c2.metric("Signal", result["Signal"])
-            c3.metric("Candles received", result["Candles"])
-
-            if result["Signal"] == "BUY":
-                st.success("Potential BUY reversal at the lower extreme.")
-            elif result["Signal"] == "SELL":
-                st.error("Potential SELL reversal at the upper extreme.")
-            else:
-                st.info("WAIT: no qualifying extreme reversal on the latest bar.")
-
-            show_chart(selected_asset, df)
-
-            st.subheader("Recent candles")
-            st.dataframe(df.tail(30), use_container_width=True)
-
-# -------------------- ALL ASSETS SCANNER --------------------
 
 else:
+    crypto_assets = {
+        name: symbol
+        for name, symbol in ASSETS.items()
+        if symbol is not None
+    }
+
     st.caption(
-        "Only assets with configured external symbols can be scanned. "
-        "OTC listings without external feeds are reported as unavailable."
+        "Only symbols configured for Binance are scanned. "
+        "These are external-market proxies, not confirmed Binomo OTC feeds."
     )
 
     if st.button("Start scan", type="primary"):
@@ -392,108 +328,96 @@ else:
         progress = st.progress(0)
         status = st.empty()
 
-        supported = [
-            (name, symbol)
-            for name, symbol in ASSETS.items()
-            if symbol is not None
-        ]
+        total = len(crypto_assets)
 
-        unsupported = [
-            {
-                "Asset": name,
-                "Price": None,
-                "Signal": "OTC / no external feed",
-                "Candles": 0,
-                "400-candle low": None,
-                "400-candle high": None,
-                "Error": "No external symbol configured"
-            }
-            for name, symbol in ASSETS.items()
-            if symbol is None
-        ]
+        for i, (name, symbol) in enumerate(crypto_assets.items(), start=1):
+            try:
+                result, df, error = analyze(
+                    symbol, interval, lookback, tolerance
+                )
 
-        results.extend(unsupported)
-
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = {
-                executor.submit(
-                    analyze_asset,
-                    name,
-                    symbol,
-                    timeframe,
-                    lookback,
-                    tolerance
-                ): name
-                for name, symbol in supported
-            }
-
-            total = len(futures)
-
-            for i, future in enumerate(as_completed(futures), start=1):
-                try:
-                    result, _ = future.result()
-                    results.append(result)
-                except Exception:
+                if error:
                     results.append({
-                        "Asset": futures[future],
+                        "Asset": name,
+                        "Symbol": symbol,
                         "Price": None,
-                        "Signal": "Error",
-                        "Candles": 0,
-                        "400-candle low": None,
-                        "400-candle high": None,
-                        "Error": "Scan failed"
+                        "Signal": "No data",
+                        "Candles": len(df),
+                        "Error": error
+                    })
+                else:
+                    results.append({
+                        "Asset": name,
+                        "Symbol": symbol,
+                        "Price": result["Price"],
+                        "Signal": result["Signal"],
+                        "Candles": result["Candles"],
+                        "Low": result["Low"],
+                        "High": result["High"],
+                        "Time": result["Time"],
+                        "Error": ""
                     })
 
-                progress.progress(i / total)
-                status.write(f"Scanned {i} of {total} supported assets")
+            except Exception as exc:
+                results.append({
+                    "Asset": name,
+                    "Symbol": symbol,
+                    "Price": None,
+                    "Signal": "Error",
+                    "Candles": 0,
+                    "Error": str(exc)[:150]
+                })
+
+            progress.progress(i / total)
+            status.write(f"Scanned {i}/{total}: {name}")
+
+            # Avoid sending too many requests too quickly.
+            time.sleep(0.15)
 
         table = pd.DataFrame(results)
+        st.session_state["results"] = table
 
-        st.session_state["scan_results"] = table
-
-    if "scan_results" in st.session_state:
-        table = st.session_state["scan_results"]
+    if "results" in st.session_state:
+        table = st.session_state["results"]
 
         filter_choice = st.selectbox(
-            "Filter results",
-            ["All", "BUY only", "SELL only", "WAIT only", "Unavailable"]
+            "Filter",
+            ["All", "BUY", "SELL", "WAIT", "Unavailable"]
         )
 
-        if filter_choice == "BUY only":
-            shown = table[table["Signal"] == "BUY"]
-        elif filter_choice == "SELL only":
-            shown = table[table["Signal"] == "SELL"]
-        elif filter_choice == "WAIT only":
-            shown = table[table["Signal"] == "WAIT"]
+        if filter_choice in ["BUY", "SELL", "WAIT"]:
+            shown = table[table["Signal"] == filter_choice]
         elif filter_choice == "Unavailable":
             shown = table[
-                table["Signal"].isin(
-                    ["OTC / no external feed", "No data", "Error"]
-                )
+                table["Signal"].isin(["No data", "Error"])
             ]
         else:
             shown = table
 
-        st.dataframe(shown, use_container_width=True, hide_index=True)
+        st.dataframe(
+            shown,
+            use_container_width=True,
+            hide_index=True
+        )
 
         buys = int((table["Signal"] == "BUY").sum())
         sells = int((table["Signal"] == "SELL").sum())
+        waits = int((table["Signal"] == "WAIT").sum())
 
         a, b, c = st.columns(3)
-        a.metric("BUY signals", buys)
-        b.metric("SELL signals", sells)
-        c.metric("Total listed assets", len(ASSETS))
+        a.metric("BUY", buys)
+        b.metric("SELL", sells)
+        c.metric("WAIT", waits)
 
-        csv = table.to_csv(index=False).encode("utf-8")
         st.download_button(
-            "Download scan results CSV",
-            data=csv,
-            file_name="binomo_extreme_scan.csv",
+            "Download CSV",
+            data=table.to_csv(index=False).encode("utf-8"),
+            file_name="extreme_scanner.csv",
             mime="text/csv"
         )
 
 st.divider()
 st.caption(
-    "External quotes can differ from Binomo OTC quotes. This app does not "
-    "place trades. A reversal signal is not a guarantee of profitability."
+    "No order execution. Signals are analytical only and do not guarantee "
+    "a profitable trade. External market prices may differ from Binomo."
 )
